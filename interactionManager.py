@@ -24,6 +24,7 @@ RPC:
 """
 
 import concurrent.futures
+import ctypes
 import json
 import re
 import os
@@ -122,10 +123,10 @@ class InteractionManagerModule(yarp.RFModule):
 
     # Target monitor
     MONITOR_HZ = 15.0
-    TARGET_LOST_TIMEOUT = 3.0  # seconds before declaring target lost
+    TARGET_LOST_TIMEOUT = 8.0  # seconds before declaring target lost
 
     # Responsive interactions
-    RESPONSIVE_GREET_REGEX = re.compile(r"^(hello|hi|hey|ciao|buongiorno|good\s+morning)(?:\s+(?:icub|there|robot|friend))?$")
+    RESPONSIVE_GREET_REGEX = re.compile(r"\b(hello|hi|hey|ciao|buongiorno|good\s+morning)\b")
     RESPONSIVE_GREET_COOLDOWN_SEC = 10.0
     RESPONSIVE_ALLOWED_ATTENTION = {"MUTUAL_GAZE", "NEAR_GAZE"}
 
@@ -150,6 +151,9 @@ class InteractionManagerModule(yarp.RFModule):
         # RPC clients (lazy)
         self._interaction_rpc: Optional[yarp.RpcClient] = None
         self._vision_rpc: Optional[yarp.RpcClient] = None
+
+        # YARP ports — speech_port is BufferedPortBottle so write() is non-blocking
+        self.speech_port: Optional[yarp.BufferedPortBottle] = None
 
         self._cached_starter: Optional[str] = None
 
@@ -223,7 +227,7 @@ class InteractionManagerModule(yarp.RFModule):
 
             self.landmarks_port = yarp.BufferedPortBottle()
             self.stt_port       = yarp.BufferedPortBottle()
-            self.speech_port    = yarp.Port()
+            self.speech_port    = yarp.BufferedPortBottle()  # non-blocking write
             self.cam_left_port  = yarp.BufferedPortImageRgb()
 
             ports = [
@@ -263,6 +267,7 @@ class InteractionManagerModule(yarp.RFModule):
 
             self.ensure_ollama_and_model()
             threading.Thread(target=self._generate_starter_background, daemon=True).start()
+            threading.Thread(target=self._prewarm_rpc_connections, daemon=True).start()
 
             self._log("INFO", "InteractionManagerModule ready")
             return True
@@ -791,6 +796,9 @@ class InteractionManagerModule(yarp.RFModule):
             if fed:
                 meals_eaten += 1
                 result["last_meal_payload"] = payload
+                with self.hunger._lock:
+                    lvl = self.hunger.level
+                self._log("INFO", f"Proactive feed: {payload} → meal #{meals_eaten}, stomach {lvl:.1f}")
                 self._speak_and_wait("Yummy, thank you so much.")
                 
                 new_hs = self.hunger.get_state()
@@ -870,20 +878,28 @@ class InteractionManagerModule(yarp.RFModule):
 
                 frame = None
                 try:
-                    img_bytes = yimg.toBytes()
-                    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                    expected = h * w * 3
-                    if len(arr) >= expected:
-                        frame = arr[:expected].reshape((h, w, 3)).copy()
-                except AttributeError:
+                    # Use getRawImage() + ctypes for a fast zero-copy numpy view.
+                    # toBytes() does not exist in YARP Python bindings.
+                    raw = yimg.getRawImage()
+                    sz = yimg.getRawImageSize()
+                    row_size = yimg.getRowSize()
+                    buf = (ctypes.c_uint8 * sz).from_address(int(raw))
+                    arr = np.frombuffer(buf, dtype=np.uint8).copy()
+                    if row_size == w * 3:
+                        frame = arr[:h * w * 3].reshape((h, w, 3))
+                    else:
+                        # Row padding present – extract each row individually
+                        frame = np.zeros((h, w, 3), dtype=np.uint8)
+                        for row_idx in range(h):
+                            rs = row_idx * row_size
+                            frame[row_idx] = arr[rs:rs + w * 3].reshape((w, 3))
+                except Exception:
                     pass
 
                 if frame is None:
-                    frame = np.zeros((h, w, 3), dtype=np.uint8)
-                    for y in range(h):
-                        for x in range(w):
-                            pixel = yimg.pixel(x, y)
-                            frame[y, x] = [pixel.r, pixel.g, pixel.b]
+                    self._log("WARNING", "QR: could not decode YARP image to numpy array")
+                    time.sleep(0.1)
+                    continue
                 
                 gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
                 raw_val, pts, _ = qr_detector.detectAndDecode(gray)
@@ -960,14 +976,19 @@ class InteractionManagerModule(yarp.RFModule):
                     continue
 
                 if not self._is_responsive_greeting(utterance):
+                    self._log("DEBUG", f"Responsive: STT '{utterance[:40]}' - not a greeting")
                     continue
+
+                self._log("INFO", f"Responsive: greeting detected '{utterance}'")
 
                 candidate = self._responsive_single_candidate()
                 if not candidate:
+                    self._log("DEBUG", "Responsive: no candidate found, skipping")
                     continue
 
                 track_id, name = candidate
                 if self._is_greet_in_responsive_cooldown(name):
+                    self._log("DEBUG", f"Responsive: '{name}' in cooldown, skipping")
                     continue
 
                 self._run_responsive_greeting(track_id, name)
@@ -986,7 +1007,7 @@ class InteractionManagerModule(yarp.RFModule):
         normalized = self._normalize_text_for_match(utterance)
         if not normalized:
             return False
-        return self.RESPONSIVE_GREET_REGEX.fullmatch(normalized) is not None
+        return self.RESPONSIVE_GREET_REGEX.search(normalized) is not None
 
     @staticmethod
     def _is_responsive_known_name(face_id: str) -> bool:
@@ -1000,27 +1021,46 @@ class InteractionManagerModule(yarp.RFModule):
         return True
 
     def _responsive_single_candidate(self) -> Optional[Tuple[int, str]]:
-        faces = self.parse_landmarks_latest()
-        candidates: List[Tuple[int, str]] = []
+        """Find the best candidate for responsive greeting.
+
+        Returns the biggest-bbox known face. Gaze/attention is NOT required —
+        the utterance itself is sufficient signal that the person is addressing
+        the robot.
+        """
+        with self._faces_lock:
+            age = time.time() - self._latest_faces_ts
+            cache_size = len(self._latest_faces)
+
+        faces = self.parse_landmarks_latest(staleness_sec=30.0)
+        if not faces:
+            self._log("DEBUG", f"Responsive: no faces in landmarks (cache age={age:.1f}s, cached={cache_size})")
+            return None
+
+        candidates: List[Tuple[int, str, float]] = []  # (track_id, name, area)
 
         for face in faces:
-            attention = str(face.get("attention", "")).upper()
-            if attention not in self.RESPONSIVE_ALLOWED_ATTENTION:
-                continue
-
             face_id = str(face.get("face_id", "")).strip()
+            track_id = face.get("track_id")
+            bbox = face.get("bbox", [0, 0, 0, 0])
+            area = bbox[2] * bbox[3] if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 else 0
+
             if not self._is_responsive_known_name(face_id):
+                self._log("DEBUG", f"Responsive: track={track_id} face_id='{face_id}' (not known)")
                 continue
 
-            track_id = face.get("track_id")
             if not isinstance(track_id, int):
                 continue
 
-            candidates.append((track_id, face_id))
+            candidates.append((track_id, face_id, area))
 
-        if len(candidates) != 1:
+        if not candidates:
+            self._log("DEBUG", f"Responsive: no known faces from {len(faces)} total")
             return None
-        return candidates[0]
+
+        # Pick biggest bbox among known faces
+        best = max(candidates, key=lambda c: c[2])
+        self._log("DEBUG", f"Responsive: selected {best[1]} (track={best[0]}, area={best[2]:.0f})")
+        return (best[0], best[1])
 
     def _is_greet_in_responsive_cooldown(self, name: str) -> bool:
         key = name.lower()
@@ -1041,8 +1081,10 @@ class InteractionManagerModule(yarp.RFModule):
             meal_payload = payload.get("payload")
             if meal_payload:
                 self._log("INFO", f"Responsive QR ack: {meal_payload}")
-            self._execute_behaviour("ao_start")
+            t = threading.Thread(target=self._execute_behaviour, args=("ao_start",), daemon=True)
+            t.start()
             self._responsive_speak_and_wait("yummy, thank you")
+            t.join(timeout=5.0)
             self._execute_behaviour("ao_stop")
             self._db_queue.put(("responsive", {
                 "type": "qr_feed",
@@ -1063,8 +1105,10 @@ class InteractionManagerModule(yarp.RFModule):
         self._responsive_active.set()
         try:
             self._log("INFO", f"Responsive greeting: '{name}' (track={track_id})")
-            self._execute_behaviour("ao_start")
+            t = threading.Thread(target=self._execute_behaviour, args=("ao_start",), daemon=True)
+            t.start()
             self._responsive_speak_and_wait(f"Hi {name}")
+            t.join(timeout=5.0)
             self._execute_behaviour("ao_stop")
             self._write_last_greeted(track_id, face_id=name, code=name, person_key=name)
             self._mark_greeted_today(name)
@@ -1168,13 +1212,16 @@ class InteractionManagerModule(yarp.RFModule):
             time.sleep(0.2)
         return face_id
 
-    def parse_landmarks_latest(self) -> List[Dict]:
+    def parse_landmarks_latest(self, staleness_sec: float = 2.0) -> List[Dict]:
         with self._faces_lock:
-            if time.time() - self._latest_faces_ts > 1.0:
+            if time.time() - self._latest_faces_ts > staleness_sec:
                 return []
             return list(self._latest_faces)
 
     def _landmarks_reader_loop(self):
+        # _latest_faces_ts is ONLY updated when real face data is stored.
+        # Empty bottles are silently ignored; the staleness check in
+        # parse_landmarks_latest() naturally expires stale data.
         while self._running and not self._landmarks_reader_stop.is_set():
             if not self.landmarks_port:
                 time.sleep(0.01)
@@ -1189,9 +1236,15 @@ class InteractionManagerModule(yarp.RFModule):
                             data = self._parse_face_bottle(face)
                             if data:
                                 landmarks.append(data)
-                    with self._faces_lock:
-                        self._latest_faces = landmarks
-                        self._latest_faces_ts = time.time()
+                    if landmarks:
+                        # Only timestamp the cache when we have real face data
+                        with self._faces_lock:
+                            self._latest_faces = landmarks
+                            self._latest_faces_ts = time.time()
+                    elif bottle.size() > 0:
+                        # Non-empty bottle but all faces failed to parse — log once to aid debugging
+                        self._log("DEBUG", f"Landmarks: bottle size={bottle.size()} but 0 faces parsed")
+                    # Empty bottle → leave cache untouched
                 else:
                     time.sleep(0.01)
             except Exception as e:
@@ -1199,22 +1252,40 @@ class InteractionManagerModule(yarp.RFModule):
                 time.sleep(0.05)
 
     def _parse_face_bottle(self, bottle: yarp.Bottle) -> Optional[Dict]:
+        """Parse a single face sub-bottle from the landmarks stream.
+
+        vision.py encodes most fields as flat key/value pairs:
+            ... "face_id" "Neem" "track_id" 86 "attention" "MUTUAL_GAZE" ...
+        but bbox and gaze_direction are encoded as nested lists:
+            (bbox x y w h)   (gaze_direction fx fy fz)
+        where the list's first element is the key name.
+        """
         data = {}
         try:
             i = 0
-            while i < bottle.size() - 1:
-                key = bottle.get(i).asString()
-                val = bottle.get(i + 1)
-                if key in ("face_id", "distance", "attention"):
-                    data[key] = val.asString()
-                elif key in ("track_id", "is_talking"):
-                    data[key] = val.asInt32()
-                elif key in ("time_in_view", "pitch", "yaw", "roll", "cos_angle"):
-                    data[key] = val.asFloat64()
-                elif key in ("bbox", "gaze_direction") and val.isList():
-                    lst = val.asList()
-                    data[key] = [lst.get(j).asFloat64() for j in range(lst.size())]
-                i += 2
+            while i < bottle.size():
+                item = bottle.get(i)
+                if item.isList():
+                    # Nested-list field: first element is the key name
+                    lst = item.asList()
+                    if lst and lst.size() >= 2:
+                        key = lst.get(0).asString()
+                        if key in ("bbox", "gaze_direction"):
+                            data[key] = [lst.get(j).asFloat64() for j in range(1, lst.size())]
+                    i += 1
+                else:
+                    # Flat key / value pair
+                    if i + 1 >= bottle.size():
+                        break
+                    key = item.asString()
+                    val = bottle.get(i + 1)
+                    if key in ("face_id", "distance", "attention", "zone"):
+                        data[key] = val.asString()
+                    elif key in ("track_id", "is_talking"):
+                        data[key] = val.asInt32()
+                    elif key in ("time_in_view", "pitch", "yaw", "roll", "cos_angle"):
+                        data[key] = val.asFloat64()
+                    i += 2
             return data if data else None
         except Exception as e:
             self._log("WARNING", f"Face bottle parse failed: {e}")
@@ -1265,10 +1336,12 @@ class InteractionManagerModule(yarp.RFModule):
         try:
             if not self.speech_port:
                 return False
-            b = yarp.Bottle()
+            # BufferedPortBottle.prepare() + write() is non-blocking:
+            # returns immediately after enqueuing under the YARP output thread.
+            b = self.speech_port.prepare()
             b.clear()
             b.addString(text)
-            self.speech_port.write(b)
+            self.speech_port.write()
             return True
         except Exception as e:
             self._log("ERROR", f"Speak failed: {e}")
@@ -1290,6 +1363,19 @@ class InteractionManagerModule(yarp.RFModule):
         return ok
 
     # ==================== YARP RPC Commands ====================
+
+    def _prewarm_rpc_connections(self):
+        """Eagerly open the interaction RPC connection so the first behaviour
+        command is sent without the TCP-setup delay."""
+        time.sleep(1.0)  # brief wait for interactionInterface to register
+        for attempt in range(5):
+            try:
+                self._get_interaction_rpc()
+                self._log("INFO", "Interaction RPC pre-warmed")
+                return
+            except Exception as e:
+                self._log("DEBUG", f"RPC pre-warm attempt {attempt + 1} failed: {e}")
+                time.sleep(2.0)
 
     def _get_interaction_rpc(self) -> yarp.RpcClient:
         if self._interaction_rpc is None:
@@ -1322,8 +1408,9 @@ class InteractionManagerModule(yarp.RFModule):
             cmd.addString("exe")
             cmd.addString(behaviour)
             reply = yarp.Bottle()
+            self._log("INFO", f"Behaviour '{behaviour}' sending...")
             rpc.write(cmd, reply)
-            self._log("INFO", f"Behaviour '{behaviour}' sent")
+            self._log("INFO", f"Behaviour '{behaviour}' ack'd")
             return True
         except Exception as e:
             self._log("ERROR", f"Behaviour failed: {e}")
