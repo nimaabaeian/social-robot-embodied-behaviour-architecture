@@ -167,8 +167,8 @@ is_known? ─── NO ──────────────────►
 
 | State | Description | Distance allowed | Attention required |
 |---|---|---|---|
-| `LS1` | Early — strict constraints | `SO_CLOSE`, `CLOSE` | `MUTUAL_GAZE` only |
-| `LS2` | Developing — relaxed | `SO_CLOSE`, `CLOSE`, `FAR` | `MUTUAL_GAZE`, `NEAR_GAZE` |
+| `LS1` | Early — strict constraints | `SO_CLOSE`, `CLOSE`, `FAR` | `MUTUAL_GAZE` only |
+| `LS2` | Developing — relaxed | `SO_CLOSE`, `CLOSE`, `FAR`, `VERY_FAR` | `MUTUAL_GAZE`, `NEAR_GAZE` |
 | `LS3` | Advanced — no constraints | Any | Any |
 
 LS values are **per-person** and stored in `learning.json`. They evolve via **reward shaping** after each interaction.
@@ -511,8 +511,8 @@ Abort reasons cascade: the monitor sets `abort_event`, which every STT wait loop
 The responsive path handles **user-initiated events** that arise independently of the proactive cycle:
 
 #### Responsive Greeting
-- **Trigger:** User says `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (matched by regex)
-- **Condition:** Exactly **one** face visible with `MUTUAL_GAZE` or `NEAR_GAZE`, known name
+- **Trigger:** User says `"hello"`, `"hi"`, `"ciao"`, `"good morning"` (matched by regex word boundary search)
+- **Condition:** Biggest-bbox known face (no gaze requirement—utterance itself is sufficient signal)
 - **Cooldown:** 10 seconds per name
 - **Action:** Say `"Hi <name>"` + write `last_greeted`
 
@@ -727,6 +727,7 @@ Main thread (updateModule @ 20Hz)
 ├── _io_thread           → JSON file saves (queue-driven)
 ├── _db_thread           → SQLite writes (queue-driven)
 ├── _lg_refresh_thread   → last_greeted.json re-read (5Hz loop)
+├── _prewarm_thread      → pre-warm RPC connections at startup (one-time)
 └── interaction_thread   → spawned per interaction
       └── (wait for interactionManager RPC, then process result)
 ```
@@ -800,7 +801,7 @@ All files under `modules/alwaysOn/memory/`:
 | `SS3_MAX_TIME` | 120.0s | Defined SS3 total-time cap (currently not enforced in loop) |
 | `LLM_TIMEOUT` | 60.0s | Maximum LLM wait |
 | `MONITOR_HZ` | 15.0 | Target monitor polling rate |
-| `TARGET_LOST_TIMEOUT` | 3.0s | Grace period before declaring target lost |
+| `TARGET_LOST_TIMEOUT` | 8.0s | Grace period before declaring target lost |
 | `RESPONSIVE_GREET_COOLDOWN_SEC` | 10.0s | Per-name cooldown for reactive greetings |
 | `TTS_WORDS_PER_SECOND` | 3.0 | Used to estimate speech duration |
 
