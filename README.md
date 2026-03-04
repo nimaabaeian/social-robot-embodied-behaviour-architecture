@@ -31,7 +31,7 @@
    - [Hunger / QR Feeding Tree](#47-hunger--qr-feeding-tree)
    - [Target Monitor](#48-target-monitor)
    - [Responsive Interaction Path](#49-responsive-interaction-path)
-   - [LLM Integration (Ollama)](#410-llm-integration-ollama)
+   - [LLM Integration (Azure OpenAI)](#410-llm-integration-azure-openai)
    - [Speech Output (TTS)](#411-speech-output-tts)
    - [STT (Speech-to-Text) Input](#412-stt-speech-to-text-input)
    - [HungerModel](#413-hungermodel)
@@ -340,7 +340,7 @@ Status overlay (top-left): `Status: BUSY | Faces: 2`
 `interactionManager` is the **dialogue and behavior execution layer**. It:
 - Receives RPC commands from `faceSelector` (`run <track_id> <face_id> <state>`)
 - Executes the appropriate **social state tree** (SS1/SS2/SS3)
-- Uses **Ollama LLM** for natural language generation and name extraction
+- Uses **Azure OpenAI (via LangChain)** for natural language generation and name extraction
 - Listens to **STT** for user responses
 - Sends **TTS speech** through YARP
 - Continuously monitors if the target face is still the biggest (abort if not)
@@ -402,8 +402,8 @@ The module supports 4 social states. Only SS1–SS3 have active trees:
 ```
 
 **Name extraction pipeline:**
-1. **Fast regex:** patterns like `"My name is X"`, `"I'm X"`, `"Call me X"`
-2. **LLM fallback:** structured JSON prompt to Ollama with schema validation
+1. **Fast regex:** patterns like `"My name is X"`, `"I'm X"`, `"Call me X"` (supports apostrophes/hyphens in names)
+2. **LLM fallback (Azure GPT-5 nano):** strict JSON extraction with schema validation and confidence clamped to `[0.0, 1.0]`
 
 ### 4.5 SS2 — Known, Not Greeted
 
@@ -473,12 +473,17 @@ Flow:
     ├─ Fed → say "Yummy, thank you so much."
     │        → if HS1 → break (satisfied)
     │        → else → say "I'm still hungry. Give me more."
-    └─ Timeout → execute timeout behaviour (e.g., "right_there")
+    └─ Timeout handling → prompt once, then abort on next consecutive timeout
   
   QR Mapping:
     SMALL_MEAL  → +10 hunger
     MEDIUM_MEAL → +25 hunger
     LARGE_MEAL  → +45 hunger
+
+  Timeout policy:
+    1st timeout → say "Take a look around, you will find some food for me."
+    2nd consecutive timeout → ABORT: no_food_qr
+    (timeout counter resets after any successful feed)
 
   Result: success if ≥1 meal eaten; final_state unchanged (no ss promotion)
 ```
@@ -523,29 +528,42 @@ The responsive path handles **user-initiated events** that arise independently o
 
 **Safety:** Responsive interactions are **dropped** (not deferred) if a proactive interaction is running. The `run_lock` and `_responsive_active` event prevent any concurrency conflicts.
 
-### 4.10 LLM Integration (Ollama)
+### 4.10 LLM Integration (Azure OpenAI)
 
-**Model:** `llama3.2:3b` (configurable via `LLM_MODEL`)  
-**Endpoint:** `http://localhost:11434/api/generate` (non-streaming)  
-**HTTP Timeout:** `min(LLM_TIMEOUT, 10.0)` = 10 seconds per request  
+**Backend:** Azure OpenAI via `langchain_openai.AzureChatOpenAI`  
+**Env loading order:** `load_dotenv()` then `memory/llm.env` (`override=False`)  
+**Request timeout:** `LLM_TIMEOUT = 60.0s`  
 **Retries:** 3 attempts with 1s delay
+
+**Required environment variables (validated at startup):**
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_KEY`
+- `OPENAI_API_VERSION` (or `AZURE_OPENAI_API_VERSION`)
+
+**Deployments (with defaults):**
+- `AZURE_DEPLOYMENT_GPT5_NANO` → `contact-Yogaexperiment_gpt5nano` (JSON/name extraction)
+- `AZURE_DEPLOYMENT_GPT5_MINI` → `contact-Yogaexperiment_gpt5mini` (conversation text generation)
+
+**Routing and options:**
+- `_llm_json(...)` requests route to the `gpt5-nano` client.
+- Conversational generation routes to the `gpt5-mini` client.
+- `options["num_predict"]` is mapped to `max_completion_tokens`.
+- Temperature is not passed (GPT-5 deployment constraint in code comments).
 
 | LLM Function | Purpose | Key params |
 |---|---|---|
-| `_llm_generate_convo_starter` | One short open question | temp=0.4, max_tokens=40 |
-| `_llm_generate_followup` | Natural follow-up response (1-2 sentences) | temp=0.5, max_tokens=80 |
-| `_llm_generate_closing_acknowledgment` | Warm closing (≤10 words) | temp=0.4, max_tokens=30 |
-| `_llm_extract_name` | JSON name extraction with schema | temp=0, max_tokens=80 |
+| `_llm_generate_convo_starter` | One short wellbeing/day question | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_generate_followup` | Short sentiment-aware follow-up (≤22 words) | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_generate_closing_acknowledgment` | Warm short closing (4–8 words, no question) | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_extract_name` | JSON name extraction with schema | `num_predict`→`max_completion_tokens` (2000), strict JSON system prompt |
 
 **LLM thread pool:** Single-worker `ThreadPoolExecutor` — one LLM call at a time.  
 Futures are polled with `_await_future_abortable()` which checks `abort_event` every 100ms and can cancel the future early.
 
 **Startup:** On `configure()`, the module:
-1. Checks if Ollama binary exists (falls back to auto-install)
-2. Starts/verifies the Ollama server
-3. Pulls `llama3.2:3b` if not present
-4. Pre-fetches a conversation starter in the background
-5. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
+1. Creates Azure clients via `setup_azure_llms()` (nano + mini)
+2. Pre-fetches a conversation starter in the background
+3. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
 
 ### 4.11 Speech Output (TTS)
 
