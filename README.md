@@ -28,15 +28,16 @@
    - [SS1 — Unknown Person](#44-ss1--unknown-person)
    - [SS2 — Known, Not Greeted](#45-ss2--known-not-greeted)
    - [SS3 — Known, Greeted, Not Talked](#46-ss3--known-greeted-not-talked)
-   - [Hunger / QR Feeding Tree](#47-hunger--qr-feeding-tree)
-   - [Target Monitor](#48-target-monitor)
-   - [Responsive Interaction Path](#49-responsive-interaction-path)
-   - [LLM Integration (Azure OpenAI)](#410-llm-integration-azure-openai)
-   - [Speech Output (TTS)](#411-speech-output-tts)
-   - [STT (Speech-to-Text) Input](#412-stt-speech-to-text-input)
-   - [HungerModel](#413-hungermodel)
-   - [RPC Interface](#414-rpc-interface)
-   - [Database](#415-database)
+   - [Telegram User Lookup & Personalization](#47-telegram-user-lookup--personalization)
+   - [Hunger / QR Feeding Tree](#48-hunger--qr-feeding-tree)
+   - [Target Monitor](#49-target-monitor)
+   - [Responsive Interaction Path](#410-responsive-interaction-path)
+   - [LLM Integration (Azure OpenAI)](#411-llm-integration-azure-openai)
+   - [Speech Output (TTS)](#412-speech-output-tts)
+   - [STT (Speech-to-Text) Input](#413-stt-speech-to-text-input)
+   - [HungerModel](#414-hungermodel)
+   - [RPC Interface](#415-rpc-interface)
+   - [Database](#416-database)
 5. [Cross-Module Data Flow](#5-cross-module-data-flow)
 6. [State Transition Diagrams](#6-state-transition-diagrams)
    - [Social State Machine](#61-social-state-machine)
@@ -341,6 +342,7 @@ Status overlay (top-left): `Status: BUSY | Faces: 2`
 - Receives RPC commands from `faceSelector` (`run <track_id> <face_id> <state>`)
 - Executes the appropriate **social state tree** (SS1/SS2/SS3)
 - Uses **Azure OpenAI (via LangChain)** for natural language generation and name extraction
+- **Personalizes SS3 conversations** by looking up the recognized face in the Telegram bot's `telegram_bot.db` user-memory table
 - Listens to **STT** for user responses
 - Sends **TTS speech** through YARP
 - Continuously monitors if the target face is still the biggest (abort if not)
@@ -433,17 +435,26 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 ┌─────────────────────────────────────────────────────┐
 │ SS3: Short Conversation (max 3 turns)               │
 │                                                     │
-│  ① Use cached LLM-generated starter question       │
-│     (pre-fetched in background, e.g. "How's your    │
-│      day going?")                                   │
-│  ② Say the starter                                 │
-│  ③ Schedule next background starter prefetch       │
+│  ① Telegram user lookup (best-effort)              │
+│     └─ Match found → build user_context string      │
+│     └─ No match   → user_context = ""              │
+│                                                     │
+│  ② Choose opening starter:                         │
+│     ├─ user_context set → generate personalised     │
+│     │    LLM starter using user profile             │
+│     └─ no context     → use cached generic starter  │
+│          (pre-fetched in background)                │
+│                                                     │
+│  ③ Say the starter                                 │
+│  ④ Schedule next background starter prefetch       │
 │                                                     │
 │  Loop (up to 3 turns):                              │
 │    ├─ Wait STT response (12s)                       │
 │    │    └─ No response → end loop                   │
 │    ├─ Turn 1 or 2: LLM generate follow-up           │
+│    │    (passes user_context for personalisation)   │
 │    ├─ Turn 3 (last): LLM generate closing ack       │
+│    │    (passes user_context for personalisation)   │
 │    └─ Say robot's reply                             │
 │                                                     │
 │  ≥1 response → talked=True, final_state=ss4         │
@@ -451,9 +462,45 @@ Validates `face_id` is a real name (not `"unknown"`, `"unmatched"`, or a digit).
 └─────────────────────────────────────────────────────┘
 ```
 
+**Personalization:** When a Telegram DB record is found for the current `face_id`, `result["telegram_user_matched"]` is set to `True`. The matched user's profile (name, age, interests, recent update, etc.) is injected into the LLM prompts for the opening question, follow-up turns, and closing acknowledgment.
+
 Note: `SS3_MAX_TIME = 120.0s` is defined in code but currently not enforced in the SS3 loop.
 
-### 4.7 Hunger / QR Feeding Tree
+### 4.7 Telegram User Lookup & Personalization
+
+Added in commit `721a58f`. Provides per-person context to the SS3 LLM calls by reading from the Telegram bot's local database.
+
+#### `_lookup_telegram_user(face_name) → Optional[Dict]`
+
+Looks up the recognized `face_id` in `memory/telegram_bot.db` (`user_memory` table).
+
+**Matching priority (case-insensitive):**
+1. Exact match on `name` field → immediate return
+2. Exact match on `nickname` field → immediate return
+3. Partial: `face_name` appears as a word in the DB `name` → candidate (keeps searching for exact)
+4. Partial: `face_name` appears as a word in the DB `nickname` → weaker candidate
+
+Returns `None` if the DB file is missing, unreadable, or no match is found. Never raises.
+
+#### `_build_face_user_context(record) → str`
+
+Converts a Telegram user record dict into a concise plain-text context string (max 500 chars) suitable for injection into LLM prompts. Includes:
+
+| Field extracted | Example output |
+|---|---|
+| `name` + `nickname` + `age` | `Their name is Alice. They go by Ali. They are 28 years old.` |
+| `favorite_topics` + `likes` (deduplicated, max 5) | `They like: robotics, music, cycling.` |
+| `dislikes` (max 3) | `They dislike: loud noise.` |
+| `relationship_style` | `Relationship style: playful.` |
+| `last_personal_update` (max 80 chars) | `Recent life update: starting a PhD next month.` |
+| `inside_jokes` (last one, max 3) | `Inside joke: the watermelon incident.` |
+| `trust_level == "close_friend"` | `They consider iCub a close friend.` |
+
+Returns an empty string if the record has no useful data (safe to pass to LLM as empty `user_context`).
+
+---
+
+### 4.8 Hunger / QR Feeding Tree
 
 Triggered when `HungerModel` reports the robot is hungry/starving. Overrides the social tree.
 
@@ -491,7 +538,7 @@ Flow:
 
 The **QR reader** runs in its own daemon thread (`_qr_reader_loop`), reading from `/interactionManager/camLeft:i` at ~50fps using `cv2.QRCodeDetector`.
 
-### 4.8 Target Monitor
+### 4.9 Target Monitor
 
 A dedicated thread runs **alongside every interaction** (at 15 Hz) checking that the interaction target remains:
 1. **Still visible** in the landmarks stream
@@ -513,7 +560,7 @@ _target_monitor_loop(track_id, result):
 
 Abort reasons cascade: the monitor sets `abort_event`, which every STT wait loop, speak-and-wait, and LLM future poll checks.
 
-### 4.9 Responsive Interaction Path
+### 4.10 Responsive Interaction Path
 
 The responsive path handles **user-initiated events** that arise independently of the proactive cycle:
 
@@ -529,7 +576,7 @@ The responsive path handles **user-initiated events** that arise independently o
 
 **Safety:** Responsive interactions are **dropped** (not deferred) if a proactive interaction is running. The `run_lock` and `_responsive_active` event prevent any concurrency conflicts.
 
-### 4.10 LLM Integration (Azure OpenAI)
+### 4.11 LLM Integration (Azure OpenAI)
 
 **Backend:** Azure OpenAI via `langchain_openai.AzureChatOpenAI`  
 **Env loading order:** `load_dotenv()` then `memory/llm.env` (`override=False`)  
@@ -543,8 +590,10 @@ The responsive path handles **user-initiated events** that arise independently o
 | `system_default` | Default LLM system prompt for conversational calls |
 | `system_json` | System prompt for JSON extraction calls |
 | `extract_name_prompt` | LLM name-extraction prompt template (`{utterance}`) |
-| `convo_starter_prompt` | LLM conversation-starter generation prompt |
+| `convo_starter_prompt` | LLM conversation-starter generation prompt (generic, no user context) |
+| `convo_starter_personalized_prompt` | LLM conversation-starter prompt when Telegram user context is available (`{user_context}`) |
 | `followup_prompt` | LLM follow-up reply prompt template (`{last_utterance}`) |
+| `followup_personalized_prompt` | LLM follow-up prompt when Telegram user context is available (`{user_context}`, `{last_utterance}`) |
 | `closing_ack_prompt` | LLM closing acknowledgment prompt template (`{last_utterance}`) |
 | `convo_starter_fallback` | Fallback starter when LLM fails |
 | `followup_fallback` | Fallback follow-up text |
@@ -578,9 +627,9 @@ The responsive path handles **user-initiated events** that arise independently o
 
 | LLM Function | Purpose | Key params |
 |---|---|---|
-| `_llm_generate_convo_starter` | One short wellbeing/day question | `num_predict`→`max_completion_tokens` (2000) |
-| `_llm_generate_followup` | Short sentiment-aware follow-up (≤22 words) | `num_predict`→`max_completion_tokens` (2000) |
-| `_llm_generate_closing_acknowledgment` | Warm short closing (4–8 words, no question) | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_generate_convo_starter(user_context="")` | One short wellbeing/day question; personalised if `user_context` set | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_generate_followup(last_utterance, history, user_context="")` | Short sentiment-aware follow-up (≤22 words); personalised if `user_context` set | `num_predict`→`max_completion_tokens` (2000) |
+| `_llm_generate_closing_acknowledgment(last_utterance, user_context="")` | Warm short closing (4–8 words, no question); personalised if `user_context` set | `num_predict`→`max_completion_tokens` (2000) |
 | `_llm_extract_name` | JSON name extraction with schema | `num_predict`→`max_completion_tokens` (2000), strict JSON system prompt |
 
 **LLM thread pool:** Single-worker `ThreadPoolExecutor` — one LLM call at a time.  
@@ -592,7 +641,7 @@ Futures are polled with `_await_future_abortable()` which checks `abort_event` e
 3. Pre-fetches a conversation starter in the background
 4. Pre-warms RPC connections (background thread sends `status` pings to avoid TCP setup latency on first interaction)
 
-### 4.11 Speech Output (TTS)
+### 4.12 Speech Output (TTS)
 
 ```python
 _speak(text)          → writes Bottle to /interactionManager/speech:o
@@ -607,7 +656,7 @@ wait = clamp(wait, 1.0, 8.0)
 
 During `speak_and_wait`, the abort event is checked every 100ms so the robot can be interrupted mid-speech.
 
-### 4.12 STT (Speech-to-Text) Input
+### 4.13 STT (Speech-to-Text) Input
 
 Reads from `/interactionManager/stt:i` (connected to `/speech2text/text:o`).
 
@@ -624,7 +673,7 @@ _wait_user_utterance_abortable(timeout):
 
 **Buffer clearing** (`_clear_stt_buffer`): Done before each expected utterance to discard stale transcripts.
 
-### 4.13 HungerModel
+### 4.14 HungerModel
 
 Simulates the robot's "hunger" as a level from 0–100:
 
@@ -640,7 +689,7 @@ Thread-safe via internal `_lock`. Updated every `updateModule()` cycle (1 Hz).
 
 **Hunger broadcast port:** Each `updateModule()` cycle also writes the current hunger state string to `/interactionManager/hunger:o` (`BufferedPortBottle`). Any external module (e.g. a Telegram bot) can connect and read the hunger level in real time.
 
-### 4.14 RPC Interface
+### 4.15 RPC Interface
 
 The module exposes an RPC handle at `/interactionManager`.
 
@@ -669,15 +718,18 @@ The module exposes an RPC handle at `/interactionManager`.
   "hunger_state_start": "HS1",
   "hunger_state_end": "HS1",
   "stomach_level_start": 85.2,
-  "stomach_level_end": 85.1
+  "stomach_level_end": 85.1,
+  "telegram_user_matched": true
 }
 ```
+
+`telegram_user_matched` is set to `true` only when an SS3 interaction successfully looked up and used a Telegram user profile for personalization.
 
 **Abort reason compaction:**
 - `target_lost` / `target_not_biggest` / `target_monitor_abort` → `"face_disappeared"`
 - Anything else → `"not_responded"`
 
-### 4.15 Database
+### 4.16 Database
 
 **File:** `data_collection/interaction_manager.db`
 
@@ -824,6 +876,7 @@ All files under `modules/alwaysOn/memory/` (plus `prompts.json` at the module ro
 | `talked_today.json` | R+W | faceSelector | ISO timestamps of today's talks |
 | `last_greeted.json` | R+W | interactionManager (write) / faceSelector (read) | Last greeting record per person |
 | `prompts.json` | R | interactionManager | All speech strings and LLM prompt templates; loaded once at `configure()`. Section key: `"interactionManager"`. Falls back to hardcoded defaults if absent. |
+| `memory/telegram_bot.db` | R | interactionManager | Telegram bot's SQLite user-memory DB. Read-only by interactionManager; queried during SS3 for personalization. Optional — interaction continues normally if absent. |
 
 ---
 
