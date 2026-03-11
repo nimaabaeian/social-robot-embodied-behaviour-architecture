@@ -56,7 +56,7 @@ except ImportError:
 
 
 class HungerModel:
-    def __init__(self, drain_hours: float = 6.0, hungry_threshold: float = 60.0, starving_threshold: float = 25.0):
+    def __init__(self, drain_hours: float = 6.0, hungry_threshold: float = 60.0, starving_threshold: float = 25.0, log_callback=None):
         self.level: float = 100.0
         self.drain_hours = drain_hours
         self.hungry_threshold = hungry_threshold
@@ -65,6 +65,8 @@ class HungerModel:
         self.last_feed_ts: float = 0.0
         self.last_feed_payload: Optional[str] = None
         self._lock = threading.Lock()
+        self.last_logged_level: int = 100
+        self.log_callback = log_callback
 
     def update(self, now: Optional[float] = None) -> None:
         if now is None:
@@ -82,6 +84,13 @@ class HungerModel:
                 self.level = 0.0
             elif self.level > 100.0:
                 self.level = 100.0
+            
+            # Log when hunger drops by 1%
+            current_pct = int(self.level)
+            if current_pct < self.last_logged_level:
+                self.last_logged_level = current_pct
+                if self.log_callback:
+                    self.log_callback("DEBUG", f"Hunger: {current_pct}%")
 
     def feed(self, delta: float, payload: str, now: Optional[float] = None) -> None:
         if now is None:
@@ -256,7 +265,8 @@ class InteractionManagerModule(yarp.RFModule):
             starving_th  = rf.find("starving_threshold").asFloat64() if rf.check("starving_threshold") else 25.0
             self.hunger  = HungerModel(drain_hours=drain_hours,
                                        hungry_threshold=hungry_th,
-                                       starving_threshold=starving_th)
+                                       starving_threshold=starving_th,
+                                       log_callback=self._log)
 
             if rf.check("qr_cooldown_sec"):       self._qr_cooldown_sec       = rf.find("qr_cooldown_sec").asFloat64()
             if rf.check("feed_wait_timeout_sec"): self._feed_wait_timeout_sec = rf.find("feed_wait_timeout_sec").asFloat64()
