@@ -56,7 +56,7 @@ except ImportError:
 
 
 class HungerModel:
-    def __init__(self, drain_hours: float = 6.0, hungry_threshold: float = 60.0, starving_threshold: float = 25.0, log_callback=None):
+    def __init__(self, drain_hours: float = 5.0, hungry_threshold: float = 60.0, starving_threshold: float = 25.0, log_callback=None):
         self.level: float = 100.0
         self.drain_hours = drain_hours
         self.hungry_threshold = hungry_threshold
@@ -167,7 +167,7 @@ class InteractionManagerModule(yarp.RFModule):
 
     # Target monitor
     MONITOR_HZ = 15.0
-    TARGET_LOST_TIMEOUT = 8.0  # seconds before declaring target lost
+    TARGET_LOST_TIMEOUT = 12.0  # seconds track_id must be absent before declaring target lost
 
     # Responsive interactions
     RESPONSIVE_GREET_REGEX = re.compile(r"\b(hello|hi|hey|ciao|buongiorno|good\s+morning)\b")
@@ -260,7 +260,7 @@ class InteractionManagerModule(yarp.RFModule):
                 self.module_name = rf.find("name").asString()
             self.setName(self.module_name)
 
-            drain_hours  = rf.find("drain_hours").asFloat64()        if rf.check("drain_hours")        else 6.0
+            drain_hours  = rf.find("drain_hours").asFloat64()        if rf.check("drain_hours")        else 5.0
             hungry_th    = rf.find("hungry_threshold").asFloat64()   if rf.check("hungry_threshold")   else 60.0
             starving_th  = rf.find("starving_threshold").asFloat64() if rf.check("starving_threshold") else 25.0
             self.hunger  = HungerModel(drain_hours=drain_hours,
@@ -404,14 +404,14 @@ class InteractionManagerModule(yarp.RFModule):
                 })
 
             if command == "help":
-                return self._reply_ok(reply, {
-                    "success": True,
-                    "commands": [
-                        "run <track_id> <face_id> <ss1|ss2|ss3|ss4>",
-                        "hunger <hs1|hs2|hs3>  – set hunger level (hs1=100%, hs2=59%, hs3=24%)",
-                        "status", "help", "quit",
-                    ],
-                })
+                reply.clear()
+                reply.addString(
+                    "run <track_id> <face_id> <ss1|ss2|ss3|ss4>  -- start interaction\n"
+                    "hunger <hs1|hs2|hs3>                         -- set hunger (hs1=full, hs2=hungry, hs3=starving)\n"
+                    "status                                        -- check if busy\n"
+                    "quit                                          -- shut down"
+                )
+                return True
 
             if command == "quit":
                 self._running = False
@@ -474,11 +474,19 @@ class InteractionManagerModule(yarp.RFModule):
                 compact_abort_reason = None
                 if ar:
                     if ar in ("target_lost", "target_not_biggest", "target_monitor_abort"):
-                        compact_abort_reason = "face_disappeared"
+                        # If the user responded at least once in SS3, target loss is not
+                        # a failure — negative reward is reserved for no response at all.
+                        if not result.get("talked"):
+                            compact_abort_reason = "face_disappeared"
                     else:
-                        compact_abort_reason = "not_responded"
+                        # Only apply not_responded penalty when user never spoke at all
+                        if not result.get("talked"):
+                            compact_abort_reason = "not_responded"
 
-                compact_success = bool(result.get("success", False)) and compact_abort_reason is None
+                # Success if explicitly succeeded, or if user talked (even if aborted after)
+                compact_success = bool(result.get("success", False)) or (
+                    result.get("talked", False) and compact_abort_reason is None
+                )
 
                 compact = {
                     "success": compact_success,
@@ -612,9 +620,13 @@ class InteractionManagerModule(yarp.RFModule):
     # ==================== Target Monitor ====================
 
     def _target_monitor_loop(self, track_id: int, result: Dict):
-        """Abort if target is no longer biggest bbox or disappears."""
-        last_seen     = time.time()
-        last_iter_ts  = time.time()
+        """Abort only when track_id has been absent from landmarks for TARGET_LOST_TIMEOUT seconds.
+
+        No displacement logic — the only criterion is whether the face with
+        this track_id is present in the landmark stream.
+        """
+        last_seen    = time.time()
+        last_iter_ts = time.time()
 
         while not self.abort_event.is_set():
             now = time.time()
@@ -624,30 +636,16 @@ class InteractionManagerModule(yarp.RFModule):
             last_iter_ts = now
 
             try:
-                faces = self.parse_landmarks_latest()
-                found = False
-                biggest_tid = None
-
-                if faces:
-                    biggest     = max(faces, key=lambda f: self._face_area(f))
-                    biggest_tid = biggest.get("track_id")
-                    for f in faces:
-                        if f.get("track_id") == track_id:
-                            found = True
-                            break
+                # 5 s staleness: brief landmark port hiccups don't count as absence
+                faces = self.parse_landmarks_latest(staleness_sec=5.0)
+                found = any(f.get("track_id") == track_id for f in faces)
 
                 if found:
                     last_seen = time.time()
-                    if biggest_tid is not None and biggest_tid != track_id:
-                        self._log("WARNING", f"Monitor: target {track_id} displaced by {biggest_tid}")
-                        result["target_stayed_biggest"] = False
-                        result["abort_reason"] = "target_not_biggest"
-                        self.abort_event.set()
-                        return
                 else:
                     elapsed = time.time() - last_seen
                     if elapsed > self.TARGET_LOST_TIMEOUT:
-                        self._log("WARNING", f"Monitor: target {track_id} lost for {elapsed:.1f}s")
+                        self._log("WARNING", f"Monitor: track_id {track_id} absent for {elapsed:.1f}s")
                         result["target_stayed_biggest"] = False
                         result["abort_reason"] = "target_lost"
                         self.abort_event.set()
@@ -1371,6 +1369,62 @@ class InteractionManagerModule(yarp.RFModule):
             _greet_tpl = self._im_prompts.get("responsive_greeting", "Hi {name}")
             self._responsive_speak_and_wait(_greet_tpl.format(name=name))
             t.join(timeout=5.0)
+
+            # --- Wait to see if the person continues talking ---
+            # abort_event may be set from a previous proactive interaction's monitor thread.
+            # Clear it here so _wait_user_utterance_abortable actually waits the full timeout.
+            self.abort_event.clear()
+            self._clear_stt_buffer()
+            utterance = self._wait_user_utterance_abortable(self.SS3_STT_TIMEOUT)
+
+            if utterance:
+                self._log("INFO", f"Responsive greeting: follow-up utterance received, entering SS3 conversation")
+
+                # Best-effort Telegram user lookup for personalisation
+                user_context = ""
+                try:
+                    tg_record = self._lookup_telegram_user(name)
+                    if tg_record:
+                        user_context = self._build_face_user_context(tg_record)
+                        if user_context:
+                            self._log("INFO", f"Responsive SS3: personalised context ({len(user_context)} chars)")
+                except Exception as e:
+                    self._log("DEBUG", f"Responsive SS3: telegram lookup skipped: {e}")
+
+                # SS3-style follow-up loop: the greeting was the opener,
+                # utterance is already the user's first response (turn 1).
+                turns = 0
+                while utterance:
+                    turns += 1
+                    self._log("INFO", f"Responsive SS3 turn {turns}: '{utterance}'")
+                    is_last = turns >= self.SS3_MAX_TURNS
+
+                    if is_last:
+                        future = self._llm_pool.submit(
+                            self._llm_generate_closing_acknowledgment, utterance,
+                            user_context=user_context)
+                        default = self._im_prompts.get("closing_ack_fallback", "That's nice!")
+                    else:
+                        future = self._llm_pool.submit(
+                            self._llm_generate_followup, utterance, [],
+                            user_context=user_context)
+                        default = self._im_prompts.get("ss3_mid_turn_fallback", "I see.")
+
+                    reply_text = self._await_future_abortable(future, default, self.LLM_TIMEOUT) or default
+                    self._responsive_speak_and_wait(reply_text)
+
+                    if is_last:
+                        break
+
+                    # Wait for next user utterance
+                    utterance = self._wait_user_utterance_abortable(self.SS3_STT_TIMEOUT)
+                    if not utterance:
+                        self._log("INFO", "Responsive SS3: no further response – ending conversation")
+
+                self._log("INFO", f"Responsive SS3: complete ({turns} turn(s))")
+            else:
+                self._log("INFO", "Responsive greeting: no follow-up – stopping")
+
             self._execute_behaviour("ao_stop")
             self._write_last_greeted(track_id, face_id=name, code=name, person_key=name)
             self._mark_greeted_today(name)
@@ -1915,26 +1969,23 @@ class InteractionManagerModule(yarp.RFModule):
         )
 
     def setup_azure_llms(self) -> None:
-        """Create the two Azure ChatOpenAI clients."""
+        """Create Azure ChatOpenAI clients – all tasks use gpt5-nano."""
         dep_nano = os.getenv("AZURE_DEPLOYMENT_GPT5_NANO", "contact-Yogaexperiment_gpt5nano")
-        dep_mini = os.getenv("AZURE_DEPLOYMENT_GPT5_MINI", "contact-Yogaexperiment_gpt5mini")
 
-        # nano: deterministic JSON / name extraction
+        # nano for all tasks: JSON extraction, name extraction, and conversation
         self.llm_extract: AzureChatOpenAI = self.setup_llm(dep_nano, max_completion_tokens=2000)
-        # mini: user-facing conversational responses
-        self.llm_chat: AzureChatOpenAI    = self.setup_llm(dep_mini, max_completion_tokens=2000)
+        self.llm_chat: AzureChatOpenAI    = self.setup_llm(dep_nano, max_completion_tokens=2000)
 
-        self._log("INFO", f"Azure LLMs ready \u2013 nano={dep_nano}, mini={dep_mini}")
+        self._log("INFO", f"Azure LLMs ready – all tasks using nano={dep_nano}")
 
     def _llm_request(self, prompt: str, json_format: bool = False, system: Optional[str] = None,
                      options: Optional[dict] = None, format_obj: Optional[object] = None) -> str:
-        """Send a prompt to the appropriate Azure deployment.
+        """Send a prompt to the Azure gpt5-nano deployment.
 
-        Routing: nano (llm_extract) is used when *any* of these hold:
-          - json_format is True
-          - format_obj is not None (used only for routing; JSON validated by _llm_json)
-          - the system prompt contains 'json' (case-insensitive)
-        Otherwise mini (llm_chat) is used.
+        Both llm_extract and llm_chat point to the same nano model.
+        Routing logic is preserved for forward-compatibility:
+          - json_format / format_obj → llm_extract (nano)
+          - conversational responses  → llm_chat   (nano)
         """
         # --- Route: only explicit extraction calls go to nano ---
         is_json_task = json_format or (format_obj is not None)
