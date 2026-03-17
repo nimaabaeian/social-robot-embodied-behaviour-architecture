@@ -396,10 +396,13 @@ These handle user-initiated events that arise while no proactive interaction is 
 
 ### 5.7 LLM Integration
 
-**Backend:** Azure OpenAI via LangChain (`AzureChatOpenAI`)  
+**Backend:** Azure OpenAI via the direct OpenAI SDK (`openai.AzureOpenAI`)  
 **Deployment:** `gpt5-nano` for all tasks (name extraction + conversation)  
 **Timeout:** 60 s · **Retries:** 3 × 1 s delay  
 **Concurrency:** Single-worker `ThreadPoolExecutor`; futures polled with abort-awareness (100 ms checks)
+
+`setup_azure_llms()` creates one shared Azure client and keeps the logical split
+between `llm_extract` and `llm_chat` only for routing/forward-compatibility.
 
 All prompt templates and fixed speech strings live in `prompts.json` under `"interactionManager"`. Hardcoded fallbacks apply if the file or key is absent.
 
@@ -583,7 +586,10 @@ All persistent state lives in `memory/` and `data_collection/`.
 
 ### JSON Memory Files
 
-Written atomically via `os.replace()` on a temp file.
+Written atomically via `os.replace()` on a temp file. `memory/greeted_today.json`
+also uses a shared companion lock file (`greeted_today.json.lock`) so
+cross-process read-modify-write updates from `faceSelector` and
+`interactionManager` serialize correctly.
 
 | File | Owner | Content |
 |---|---|---|
@@ -664,7 +670,7 @@ _tg_poll_loop (daemon)         →  long-polls Telegram getUpdates every 20 s
 | `cooldown_default` | 5.0 s | Cooldown for STM label = −1 (unknown) |
 | `DISAPPEAR_WINDOW_SEC` | 30 s | Window for counting face_disappeared events |
 | `DISAPPEAR_THRESHOLD` | 2 | Events before harsh −2 penalty |
-| `LS_MIN_TIME_IN_VIEW (LS1)` | 3.0 s | Min dwell time for LS1 gate |
+| `LS_MIN_TIME_IN_VIEW (LS1)` | 2.0 s | Min dwell time for LS1 gate |
 | `LS_MIN_TIME_IN_VIEW (LS2)` | 1.0 s | Min dwell time for LS2 gate |
 
 ### `interactionManager`

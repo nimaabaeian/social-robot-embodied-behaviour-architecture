@@ -16,6 +16,7 @@ YARP Connections:
     yarp connect /icub/camcalib/left/out    /faceSelector/img:i
 """
 
+import fcntl
 import json
 import os
 import queue
@@ -1215,9 +1216,20 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("ERROR", f"Failed to save {path}: {e}")
 
     def _save_greeted_json(self):
+        # Snapshot in-process state first (no I/O under _memory_lock).
         with self._memory_lock:
-            data = dict(self.greeted_today)
-        self._save_json_atomic(self.greeted_path, data)
+            in_memory = dict(self.greeted_today)
+        # Cross-process exclusive lock: read → merge → write atomically so that
+        # entries written by interactionManager's responsive path are never lost.
+        lock_path = str(self.greeted_path) + ".lock"
+        with open(lock_path, "w") as _lf:
+            fcntl.flock(_lf, fcntl.LOCK_EX)
+            try:
+                on_disk = self._load_json(self.greeted_path, {})
+                merged = {**(on_disk if isinstance(on_disk, dict) else {}), **in_memory}
+                self._save_json_atomic(self.greeted_path, merged)
+            finally:
+                fcntl.flock(_lf, fcntl.LOCK_UN)
 
     def _save_talked_json(self):
         with self._memory_lock:

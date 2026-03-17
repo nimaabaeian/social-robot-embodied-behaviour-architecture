@@ -1,10 +1,9 @@
 """
 interactionManager.py – YARP RFModule for Social Interaction State Trees
 
-Uses Azure OpenAI (via LangChain) for natural language understanding
+Uses Azure OpenAI (direct SDK) for natural language understanding
 and generation.
-  • gpt5-nano → JSON / name extraction (deterministic)
-  • gpt5-mini → user-facing conversation responses
+  • gpt5-nano → all tasks: JSON / name extraction and conversation
 
 Social States:
   ss1: unknown                 → greet, ask name, register
@@ -27,6 +26,7 @@ RPC:
 
 import concurrent.futures
 import ctypes
+import fcntl
 import json
 import re
 import os
@@ -43,8 +43,7 @@ from dotenv import load_dotenv
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(__file__), "memory", "llm.env"), override=False)
 
-from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from openai import AzureOpenAI
 
 import yarp
 
@@ -217,8 +216,10 @@ class InteractionManagerModule(yarp.RFModule):
         self._current_track_id: Optional[int] = None
 
         # Azure LLM clients (initialised in configure via setup_azure_llms)
-        self.llm_extract: Optional[AzureChatOpenAI] = None
-        self.llm_chat:    Optional[AzureChatOpenAI] = None
+        self.llm_extract: Optional[AzureOpenAI] = None
+        self.llm_chat:    Optional[AzureOpenAI] = None
+        self._llm_deployment: str = ""
+        self._llm_max_tokens: int = 2000
 
         # Error recovery
         self.llm_retry_attempts = 3
@@ -1976,19 +1977,28 @@ class InteractionManagerModule(yarp.RFModule):
             if not key:
                 return
             path = self.GREETED_TODAY_FILE
-            raw = self._load_json(path, {})
-            entries = raw if isinstance(raw, dict) else {}
-            entries[key] = datetime.now().astimezone().isoformat()
-            self._save_json_atomic(path, entries)
+            # Cross-process exclusive lock so this read-modify-write is atomic
+            # relative to faceSelector's concurrent snapshot writes.
+            lock_path = path + ".lock"
+            with open(lock_path, "w") as _lf:
+                fcntl.flock(_lf, fcntl.LOCK_EX)
+                try:
+                    raw = self._load_json(path, {})
+                    entries = raw if isinstance(raw, dict) else {}
+                    entries[key] = datetime.now().astimezone().isoformat()
+                    self._save_json_atomic(path, entries)
+                finally:
+                    fcntl.flock(_lf, fcntl.LOCK_UN)
         except Exception as e:
             self._log("WARNING", f"Write greeted_today failed: {e}")
 
     # ==================== LLM Integration ====================
 
-    def setup_llm(self, deployment_name: str, max_completion_tokens: int) -> AzureChatOpenAI:
-        """Instantiate an AzureChatOpenAI client for a given deployment.
+    def setup_llm(self, deployment_name: str, max_completion_tokens: int) -> AzureOpenAI:
+        """Instantiate an AzureOpenAI client for a given deployment.
 
-        Raises RuntimeError if required env vars are missing or empty.
+        Stores deployment_name and max_completion_tokens on self for use in
+        _llm_request().  Raises RuntimeError if required env vars are missing.
         Note: GPT-5 models only support temperature=1 (the default) — it is not passed.
         """
         # --- Read and validate env ---
@@ -2015,60 +2025,65 @@ class InteractionManagerModule(yarp.RFModule):
         if not deployment_name:
             raise RuntimeError("deployment_name must not be empty")
 
-        return AzureChatOpenAI(
+        self._llm_deployment = deployment_name
+        self._llm_max_tokens = max_completion_tokens
+
+        return AzureOpenAI(
             azure_endpoint=endpoint,
             api_key=api_key,
             api_version=api_version,
-            azure_deployment=deployment_name,
-            max_completion_tokens=max_completion_tokens,
-            request_timeout=self.LLM_TIMEOUT,
+            timeout=self.LLM_TIMEOUT,
         )
 
     def setup_azure_llms(self) -> None:
-        """Create Azure ChatOpenAI clients – all tasks use gpt5-nano."""
+        """Create Azure OpenAI client – all tasks use gpt5-nano."""
         dep_nano = os.getenv("AZURE_DEPLOYMENT_GPT5_NANO", "contact-Yogaexperiment_gpt5nano")
 
-        # nano for all tasks: JSON extraction, name extraction, and conversation
-        self.llm_extract: AzureChatOpenAI = self.setup_llm(dep_nano, max_completion_tokens=2000)
-        self.llm_chat: AzureChatOpenAI    = self.setup_llm(dep_nano, max_completion_tokens=2000)
+        # Both clients share the same AzureOpenAI instance; routing preserved for
+        # forward-compatibility (llm_extract for JSON tasks, llm_chat for conversation).
+        client: AzureOpenAI = self.setup_llm(dep_nano, max_completion_tokens=2000)
+        self.llm_extract = client
+        self.llm_chat    = client
 
         self._log("INFO", f"Azure LLMs ready – all tasks using nano={dep_nano}")
 
     def _llm_request(self, prompt: str, json_format: bool = False, system: Optional[str] = None,
                      options: Optional[dict] = None, format_obj: Optional[object] = None) -> str:
-        """Send a prompt to the Azure gpt5-nano deployment.
+        """Send a prompt to the Azure gpt5-nano deployment via the direct OpenAI SDK.
 
-        Both llm_extract and llm_chat point to the same nano model.
+        Both llm_extract and llm_chat point to the same AzureOpenAI client.
         Routing logic is preserved for forward-compatibility:
           - json_format / format_obj → llm_extract (nano)
           - conversational responses  → llm_chat   (nano)
         """
-        # --- Route: only explicit extraction calls go to nano ---
+        # --- Route ---
         is_json_task = json_format or (format_obj is not None)
-        base_llm = self.llm_extract if is_json_task else self.llm_chat
+        client = self.llm_extract if is_json_task else self.llm_chat
 
-        if base_llm is None:
-            self._log("ERROR", "LLM client not initialised \u2013 call setup_azure_llms() first")
+        if client is None:
+            self._log("ERROR", "LLM client not initialised – call setup_azure_llms() first")
             return ""
 
-        # --- Per-call overrides (max_completion_tokens only; GPT-5 doesn't accept temperature) ---
-        overrides: Dict[str, Any] = {}
-        if options:
-            if "num_predict" in options:
-                overrides["max_completion_tokens"] = options["num_predict"]
-        runnable = base_llm.bind(**overrides) if overrides else base_llm
+        # --- Per-call max_completion_tokens override ---
+        max_tokens = self._llm_max_tokens
+        if options and "num_predict" in options:
+            max_tokens = options["num_predict"]
 
         # --- Build messages ---
-        messages = []
+        messages: List[Dict[str, str]] = []
         if system:
-            messages.append(SystemMessage(content=system))
-        messages.append(HumanMessage(content=prompt))
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
 
         last_error = None
         for attempt in range(self.llm_retry_attempts):
             try:
-                resp = runnable.invoke(messages)
-                text = (resp.content or "").strip()
+                resp = client.chat.completions.create(
+                    model=self._llm_deployment,
+                    messages=messages,
+                    max_completion_tokens=max_tokens,
+                )
+                text = (resp.choices[0].message.content or "").strip()
                 if text:
                     return text
                 last_error = "Empty response"
