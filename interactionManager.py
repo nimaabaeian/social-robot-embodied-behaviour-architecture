@@ -12,7 +12,7 @@ Social States:
   ss4: known, talked           → no-op (ultimate state)
 
 Target Monitor: continuously checks that the interaction target is still the
-biggest-bbox face; sets abort_event if target is lost or displaced.
+biggest-bbox face; sets abort_event if target has been absent for TARGET_LOST_TIMEOUT seconds.
 
 YARP Connections:
     yarp connect /alwayson/vision/landmarks:o /interactionManager/landmarks:i
