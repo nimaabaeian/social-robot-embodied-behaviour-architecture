@@ -1,40 +1,20 @@
-"""
-faceSelector.py – YARP RFModule for Real-Time Face Selection
-
-Continuously reads face landmarks, computes social/spatial/learning states,
-selects the biggest-bbox face as target candidate, and triggers interactions
-via /interactionManager RPC.
-
-Social States:
-  ss1: unknown
-  ss2: known, not greeted today
-  ss3: known, greeted today, not talked
-  ss4: known, greeted today, talked (ultimate)
-
-YARP Connections:
-    yarp connect /alwayson/vision/landmarks:o /faceSelector/landmarks:i
-    yarp connect /icub/camcalib/left/out    /faceSelector/img:i
-"""
+"""salienceNetwork.py - real-time face selection and interaction gating."""
 
 import fcntl
 import json
 import os
 import queue
 import sqlite3
+from dataclasses import asdict, dataclass
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    import cv2
-    import numpy as np
-except ImportError:
-    print("[ERROR] OpenCV/NumPy required:  pip install opencv-python numpy")
-    sys.exit(1)
+import math
 
 try:
     import yarp
@@ -48,56 +28,90 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 
-class FaceSelectorModule(yarp.RFModule):
-    """
-    Real-time face selection module that:
-    - Reads face landmarks from vision system
-    - Computes social states (ss1-ss4) and spatial states
-    - Maintains learning states (LS1-LS3) per person
-    - Selects biggest-bbox face as target candidate
-    - Gates interaction start on LS eligibility
-    - Triggers interactions via /interactionManager RPC
-    - Publishes annotated image with face boxes and states
-    - Logs selections and state changes to face_selector.db
+class SalienceNetworkModule(yarp.RFModule):
+    """Selects faces by IPS and triggers executive interactions.
+
+    Pipeline:
+      Input       -> vision landmarks + STM context + memory files
+      Decision    -> social state + IPS + arbitration (override/interaction/cooldown)
+      Output      -> targetCmd to vision + run/status RPC to executive
+      Persistence -> JSON memories + SQLite event logs
     """
 
-    # ==================== Constants ====================
+    @dataclass(frozen=True)
+    class FaceSnapshot:
+        face_id: str = "unknown"
+        track_id: int = -1
+        bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        distance: str = "UNKNOWN"
+        gaze_direction: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+        pitch: float = 0.0
+        yaw: float = 0.0
+        roll: float = 0.0
+        cos_angle: float = 0.0
+        attention: str = "AWAY"
+        is_talking: int = 0
+        time_in_view: float = 0.0
 
-    # Social State string IDs
+    @dataclass(frozen=True)
+    class InteractionAttempt:
+        attempt_id: str
+        track_id: int
+        face_id: str
+        person_id: str
+        start_ss: str
+        success: int
+        final_state: Optional[str]
+        abort_reason: Optional[str]
+        exec_interaction_id: Optional[str]
+        duration_sec: float
+
+    @dataclass(frozen=True)
+    class LearningDelta:
+        person_id: str
+        reward_delta: float
+        outcome: str
+        reason: str
+        success: int
+        abort_reason: Optional[str]
+        name_extracted: int
+        exec_interaction_id: Optional[str]
+        old_prox: Optional[float]
+        old_cent: Optional[float]
+        old_vel: Optional[float]
+        old_gaze: Optional[float]
+        new_prox: Optional[float]
+        new_cent: Optional[float]
+        new_vel: Optional[float]
+        new_gaze: Optional[float]
+
+    # ==================== Adaptive IPS Constants ====================
+    # Baseline IPS weights
+    BASELINE_WEIGHTS = {"prox": 0.5, "cent": 0.15, "vel": 0.3, "gaze": 0.5}
+
+    # Minimum IPS by social state
+    SS_THRESHOLDS = {
+        "ss1": 1.0,  # Stranger: standard hurdle
+        "ss2": 0.8,  # Friend (ungreeted): eager to initiate
+        "ss3": 1.2,  # Friend (greeted): needs strong intent to bother again
+        "ss4": 99.0,  # Ultimate: never proactive
+    }
+
+    IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
+    HABITUATION_LAMBDA = 0.05  # Habituation decay
+    WEIGHT_SHIFT_RATE = 0.05  # How much weights drift per interaction (+/-)
+    TARGET_LOG_MIN_PERIOD_SEC = 1.0
+    TARGET_LOG_IPS_DELTA = 0.15
+    DB_QUEUE_MAXSIZE = 1024
+    IO_QUEUE_MAXSIZE = 256
+
+    # Social-state labels
     SS_DESCRIPTIONS = {
         "ss1": "Unknown",
         "ss2": "Known, Not Greeted",
         "ss3": "Known, Greeted, No Talk",
         "ss4": "Known, Greeted, Talked",
     }
-
-    # Learning State definitions
-    LS1 = 1
-    LS2 = 2
-    LS3 = 3
-
-    LS_NAMES = {1: "LS1", 2: "LS2", 3: "LS3"}
-
-    LS_VALID_DISTANCES = {
-        1: {"SO_CLOSE", "CLOSE"},
-        2: {"SO_CLOSE", "CLOSE", "FAR"},
-    }
-    LS_VALID_ATTENTIONS = {
-        1: {"MUTUAL_GAZE"},
-        2: {"MUTUAL_GAZE", "NEAR_GAZE"}
-    }
-
-    LS_MIN_TIME_IN_VIEW = {
-        1: 2.0,
-        2: 1.0,
-    }
-
-    # Colors for drawing (BGR format)
-    COLOR_GREEN = (0, 255, 0)
-    COLOR_YELLOW = (0, 255, 255)
-    COLOR_WHITE = (255, 255, 255)
-    COLOR_RED = (0, 0, 255)
-
     TIMEZONE = ZoneInfo("Europe/Rome")
 
     # ==================== Lifecycle ====================
@@ -105,35 +119,40 @@ class FaceSelectorModule(yarp.RFModule):
     def __init__(self):
         super().__init__()
 
-        self.module_name = "faceSelector"
+        self.module_name = "salienceNetwork"
         self.period = 0.05  # 20 Hz
         self._running = True
 
         self._consecutive_errors = 0
         self._max_consecutive_errors = 10
 
-        self.interaction_manager_rpc_name = "/interactionManager"
-        self.interaction_interface_rpc_name = "/interactionInterface"
+        self.executive_control_rpc_name = "/executiveControl"
 
-        self.learning_path = Path("/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/learning.json")
-        self.greeted_path = Path("/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json")
-        self.talked_path = Path("/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/talked_today.json")
-        self.last_greeted_path = Path("/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json")
+        self.learning_path = Path(
+            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/learning.json"
+        )
+        self.greeted_path = Path(
+            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/greeted_today.json"
+        )
+        self.talked_path = Path(
+            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/talked_today.json"
+        )
+        self.last_greeted_path = Path(
+            "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/memory/last_greeted.json"
+        )
 
         # YARP ports
         self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
-        self.img_in_port: Optional[yarp.BufferedPortImageRgb] = None
-        self.img_out_port: Optional[yarp.BufferedPortImageRgb] = None
         self.debug_port: Optional[yarp.Port] = None
-        self.interaction_manager_rpc: Optional[yarp.RpcClient] = None
-        self.interaction_interface_rpc: Optional[yarp.RpcClient] = None
-        self.stm_context_port: Optional[yarp.BufferedPortBottle] = None  # /alwayson/stm/context:o
+        self.vision_cmd_port: Optional[yarp.BufferedPortBottle] = None
+        self.executive_control_rpc: Optional[yarp.RpcClient] = None
+        self.facetracker_rpc: Optional[yarp.RpcClient] = None
+        self.stm_context_port: Optional[yarp.BufferedPortBottle] = None
 
-        # Image handling
-        self.img_width = 640
-        self.img_height = 480
-        self.last_annotated_frame: Optional[np.ndarray] = None
-
+        # RPC input (set_track_id from executiveControl)
+        self.handle_port = yarp.Port()
+        self.attach(self.handle_port)
+        self.rpc_override_track_id: int = -1  # -1 = no override (normal IPS)
         # State tracking (thread-safe)
         self.state_lock = threading.Lock()
         self.current_faces: List[Dict[str, Any]] = []
@@ -142,57 +161,66 @@ class FaceSelectorModule(yarp.RFModule):
         self.interaction_busy = False
         self.interaction_thread: Optional[threading.Thread] = None
 
-        # Lock guarding in-memory memory dicts and their file I/O
+        self.area_history: Dict[int, float] = {}  # Maps track_id to previous bbox area
+        self.current_target_track_id: int = -1  # For applying Hysteresis
+
+        # Guards memory dicts and file I/O
         self._memory_lock = threading.Lock()
-        # Lock guarding interaction_busy transitions and spawn decisions
+        # Guards interaction_busy transitions and spawn decisions
         self._interaction_lock = threading.Lock()
 
-        # Cooldown — base value and context-driven overrides
+        # Cooldown config
         self.last_interaction_time: Dict[str, float] = {}
-        self.interaction_cooldown = 5.0   # fallback (kept for back-compat)
-        self.cooldown_lively: float = 3.0   # label == 1 : active/lively scene → shorter
-        self.cooldown_calm:   float = 15.0  # label == 0 : calm/quiet scene  → longer
-        self.cooldown_default: float = 5.0  # label == -1 or unknown
+        self.cooldown_lively: float = 3.0
+        self.cooldown_calm: float = 15.0
+        self.cooldown_default: float = 5.0
+        self.min_track_ips: float = 0.6
+        self.exec_rpc_retry_sec: float = 1.0
 
-        # STM context (cluster label from /alwayson/stm/context:o)
-        self.current_context_label: int = -1  # -1 = not yet received
-
-        # Image frame skip
+        self.current_context_label: int = -1
         self.frame_skip_counter = 0
         self.frame_skip_rate = 0
 
-        # Memory caches
+        # Cache recent landmarks for sparse upstream publishing.
+        self._latest_landmarks: List[Dict[str, Any]] = []
+        self._latest_landmarks_ts: float = 0.0
+        self.landmarks_stale_sec: float = 0.30
+
         self.greeted_today: Dict[str, str] = {}
         self.talked_today: Dict[str, str] = {}
         self.learning_data: Dict[str, Dict] = {}
 
-        # Last-greeted snapshot (refreshed by background thread)
         self._last_greeted_snapshot: Dict[str, Dict[str, Any]] = {}
         self._last_greeted_lock = threading.Lock()
 
-        # Session tracking
         self.track_to_person: Dict[int, str] = {}
-
-        # Day tracking
         self._current_day: Optional[date] = None
 
-        # Config flags
         self.verbose_debug = False
         self.ports_connected_logged = False
+        self.status_log_period_sec: float = 1.0
+        self._last_status_log_ts: float = 0.0
+        self._last_status_line: str = ""
+        self._last_target_key: Tuple[int, str, str] = (-2, "", "")
+        self._last_sent_track_id: int = -99999
+        self._last_sent_ips: float = -1.0
+        self._next_exec_rpc_try_ts: float = 0.0
+        self._exec_rpc_offline_logged: bool = False
+        self._last_target_log_key: Tuple[int, str, str, int] = (-2, "", "", -1)
+        self._last_target_log_ips: float = -1.0
+        self._last_target_log_ts: float = 0.0
 
-        # Tracking for face_disappeared penalty
         self.DISAPPEAR_WINDOW_SEC = 30.0
         self.DISAPPEAR_THRESHOLD = 2
         self._disappear_events: Dict[str, List[float]] = {}
 
-        # --- Background I/O ---
-        self._io_queue: queue.Queue = queue.Queue()
+        self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
 
-        # --- DB logging ---
-        self.db_path = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/face_selector.db"
-        self._db_queue: queue.Queue = queue.Queue()
+        self.db_path = "/usr/local/src/robot/cognitiveInteraction/developmental-cognitive-architecture/modules/alwaysOn/data_collection/salience_network.db"
+        self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAXSIZE)
         self._db_thread: Optional[threading.Thread] = None
+        self._context_connected_logged = False
 
     # ------------------------------------------------------------------ configure
     def configure(self, rf: yarp.ResourceFinder) -> bool:
@@ -204,10 +232,10 @@ class FaceSelectorModule(yarp.RFModule):
             except Exception:
                 pass
 
-            if rf.check("interaction_manager_rpc"):
-                self.interaction_manager_rpc_name = rf.find("interaction_manager_rpc").asString()
-            if rf.check("interaction_interface_rpc"):
-                self.interaction_interface_rpc_name = rf.find("interaction_interface_rpc").asString()
+            if rf.check("executive_control_rpc"):
+                self.executive_control_rpc_name = rf.find(
+                    "executive_control_rpc"
+                ).asString()
             if rf.check("learning_path"):
                 self.learning_path = Path(rf.find("learning_path").asString())
             if rf.check("greeted_path"):
@@ -218,88 +246,174 @@ class FaceSelectorModule(yarp.RFModule):
                 self.period = rf.find("rate").asFloat64()
             if rf.check("verbose"):
                 self.verbose_debug = rf.find("verbose").asBool()
+            if rf.check("landmarks_stale_sec"):
+                self.landmarks_stale_sec = rf.find("landmarks_stale_sec").asFloat64()
+            if rf.check("status_log_period_sec"):
+                self.status_log_period_sec = max(
+                    0.1, rf.find("status_log_period_sec").asFloat64()
+                )
+            if rf.check("min_track_ips"):
+                self.min_track_ips = max(0.0, rf.find("min_track_ips").asFloat64())
+            if rf.check("exec_rpc_retry_sec"):
+                self.exec_rpc_retry_sec = max(
+                    0.1, rf.find("exec_rpc_retry_sec").asFloat64()
+                )
 
             # --- Open ports ---
-            port_specs = [
-                ("landmarks_port", yarp.BufferedPortBottle,   f"/{self.module_name}/landmarks:i"),
-                ("img_in_port",    yarp.BufferedPortImageRgb, f"/{self.module_name}/img:i"),
-                ("img_out_port",   yarp.BufferedPortImageRgb, f"/{self.module_name}/img:o"),
-            ]
-            for attr, cls, name in port_specs:
+            def _open_port(attr: str, cls, name: str) -> bool:
                 port = cls()
-                if not port.open(name):
-                    self._log("ERROR", f"Failed to open port: {name}")
-                    return False
+                next_log_ts = 0.0
+                while not port.open(name):
+                    now = time.time()
+                    if now >= next_log_ts:
+                        self._log("INFO", f"Waiting local port availability: {name}")
+                        next_log_ts = now + 2.0
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
                 setattr(self, attr, port)
+                return True
 
-            self.debug_port = yarp.Port()
-            if not self.debug_port.open(f"/{self.module_name}/debug:o"):
-                self._log("ERROR", f"Failed to open debug port")
+            if not _open_port(
+                "landmarks_port",
+                yarp.BufferedPortBottle,
+                f"/alwayson/{self.module_name}/landmarks:i",
+            ):
                 return False
+
+            if not _open_port(
+                "vision_cmd_port",
+                yarp.BufferedPortBottle,
+                f"/alwayson/{self.module_name}/targetCmd:o",
+            ):
+                return False
+
+            if not _open_port(
+                "debug_port", yarp.Port, f"/alwayson/{self.module_name}/debug:o"
+            ):
+                return False
+
+            handle_name = f"/{self.module_name}"
+            handle_next_log_ts = 0.0
+            while not self.handle_port.open(handle_name):
+                now = time.time()
+                if now >= handle_next_log_ts:
+                    self._log("INFO", f"Waiting local port availability: {handle_name}")
+                    handle_next_log_ts = now + 2.0
+                time.sleep(0.5)
 
             self.stm_context_port = yarp.BufferedPortBottle()
-            if not self.stm_context_port.open(f"/{self.module_name}/context:i"):
-                self._log("ERROR", "Failed to open STM context port")
+            _ctx_local = f"/alwayson/{self.module_name}/context:i"
+            ctx_next_log_ts = 0.0
+            while not self.stm_context_port.open(_ctx_local):
+                now = time.time()
+                if now >= ctx_next_log_ts:
+                    self._log("INFO", f"Waiting local port availability: {_ctx_local}")
+                    ctx_next_log_ts = now + 2.0
+                time.sleep(0.5)
+
+            self.executive_control_rpc = yarp.RpcClient()
+            exec_rpc_local = f"/{self.module_name}/executiveControl:rpc"
+            if not self.executive_control_rpc.open(exec_rpc_local):
+                self._log("ERROR", f"Failed to open port: {exec_rpc_local}")
                 return False
-            # Non-critical: try to auto-connect; continue even if STM is not yet running
-            _ctx_remote = "/alwayson/stm/context:o"
-            _ctx_local  = f"/{self.module_name}/context:i"
-            if yarp.Network.connect(_ctx_remote, _ctx_local):
-                self._log("INFO", f"STM context port connected: {_ctx_remote} → {_ctx_local}")
-            else:
-                self._log("WARNING", f"STM context port not yet available – will work without context (cooldown={self.cooldown_default}s)")
+            if yarp.Network.connect(exec_rpc_local, self.executive_control_rpc_name):
+                self._log("INFO", f"RPC connected → {self.executive_control_rpc_name}")
 
-            self.interaction_manager_rpc = yarp.RpcClient()
-            if not self.interaction_manager_rpc.open(f"/{self.module_name}/interactionManager:rpc"):
-                self._log("ERROR", "Failed to open interactionManager RPC port")
+            # --- Connect to FaceTracker RPC and send 'run' ---
+            self.facetracker_rpc = yarp.RpcClient()
+            face_rpc_local = f"/{self.module_name}/faceTracker:rpc"
+            if not self.facetracker_rpc.open(face_rpc_local):
+                self._log("ERROR", f"Failed to open port: {face_rpc_local}")
                 return False
+            yarp.Network.connect(face_rpc_local, "/faceTracker/rpc")
 
-            self.interaction_interface_rpc = yarp.RpcClient()
-            if not self.interaction_interface_rpc.open(f"/{self.module_name}/interactionInterface:rpc"):
-                self._log("ERROR", "Failed to open interactionInterface RPC port")
-                return False
+            manual_connections = [
+                f"yarp connect /alwayson/vision/landmarks:o /alwayson/{self.module_name}/landmarks:i",
+                f"yarp connect /alwayson/{self.module_name}/targetCmd:o /alwayson/vision/targetCmd:i",
+            ]
+            if self.stm_context_port is not None:
+                manual_connections.append(
+                    f"yarp connect /alwayson/stm/context:o /alwayson/{self.module_name}/context:i"
+                )
 
-            # --- Auto-connect RPC ---
-            for local, remote in [
-                (f"/{self.module_name}/interactionManager:rpc",  self.interaction_manager_rpc_name),
-                (f"/{self.module_name}/interactionInterface:rpc", self.interaction_interface_rpc_name),
-            ]:
-                if yarp.Network.connect(local, remote):
-                    self._log("INFO", f"RPC connected → {remote}")
-                else:
-                    self._log("ERROR", f"RPC connect failed → {remote}")
+            self._log("INFO", "Connect these ports:")
+            for cmd in manual_connections:
+                self._log("INFO", f"  {cmd}")
 
-            # --- Load persistent data ---
+            self._wait_for_manual_connections()
+            self._send_facetracker_cmd("run", retries=1)
+
             self._load_all_json_files()
             self._refresh_last_greeted_snapshot()
             self._current_day = self._get_today_date()
 
-            # --- Start background workers ---
             self._init_db()
             for target, name in [
-                (self._io_worker,                  "_io_thread"),
-                (self._db_worker,                  "_db_thread"),
-                (self._last_greeted_refresh_loop,  "_lg_refresh_thread"),
+                (self._io_worker, "_io_thread"),
+                (self._db_worker, "_db_thread"),
+                (self._last_greeted_refresh_loop, "_lg_refresh_thread"),
             ]:
                 t = threading.Thread(target=target, daemon=True)
                 t.start()
                 setattr(self, name, t)
 
-            self._log("INFO", f"FaceSelectorModule ready @ {1.0/self.period:.0f} Hz")
+            self._log("INFO", f"SalienceNetworkModule ready @ {1.0/self.period:.0f} Hz")
             threading.Thread(target=self._prewarm_rpc_connections, daemon=True).start()
             return True
 
         except Exception as e:
             self._log("ERROR", f"configure() failed: {e}")
-            import traceback; traceback.print_exc()
             return False
+
+    def _wait_for_manual_connections(self):
+        """Log current connection status once without blocking startup.
+
+        Required streams are handled in updateModule() as data arrives.
+        STM context is optional and can be connected at any time.
+        """
+        checks = [
+            (
+                f"/alwayson/vision/landmarks:o -> /alwayson/{self.module_name}/landmarks:i",
+                lambda: self.landmarks_port is not None
+                and self.landmarks_port.getInputCount() > 0,
+            ),
+            (
+                f"/alwayson/{self.module_name}/targetCmd:o -> /alwayson/vision/targetCmd:i",
+                lambda: self.vision_cmd_port is not None
+                and self.vision_cmd_port.getOutputCount() > 0,
+            ),
+        ]
+
+        pending = [name for name, ok in checks if not ok()]
+        if pending:
+            pending_labels = ", ".join(
+                item.split(" -> ")[0].split("/")[-1] for item in pending
+            )
+            self._log(
+                "INFO",
+                f"Startup without blocking; pending required ports: {pending_labels}",
+            )
+        else:
+            self._log("INFO", "Required ports already connected.")
+
+        if self.stm_context_port is not None and self.stm_context_port.getInputCount() == 0:
+            self._log("INFO", "STM context port is optional; can connect later.")
 
     def interruptModule(self) -> bool:
         self._log("INFO", "Interrupting...")
         self._running = False
-        for port in [self.landmarks_port, self.img_in_port, self.img_out_port,
-                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc,
-                     self.stm_context_port]:
+        for port in [
+            self.landmarks_port,
+            self.debug_port,
+            self.executive_control_rpc,
+            self.vision_cmd_port,
+            self.stm_context_port,
+            self.handle_port,
+            self.facetracker_rpc,
+        ]:
             if port:
                 port.interrupt()
         return True
@@ -308,27 +422,104 @@ class FaceSelectorModule(yarp.RFModule):
         self._log("INFO", "Closing...")
         if self.interaction_thread and self.interaction_thread.is_alive():
             self.interaction_thread.join(timeout=5.0)
-        # Enqueue final saves (async via IO worker)
         self._enqueue_save("greeted")
         self._enqueue_save("talked")
         self._enqueue_save("learning")
-        # Signal IO worker to stop, then drain/join
-        self._io_queue.put(None)
+        self._queue_put_drop_oldest(self._io_queue, None, "IO queue close")
         if self._io_thread:
             self._io_thread.join(timeout=5.0)
-            if self._io_thread.is_alive():
-                self._log("WARNING", "IO worker did not finish in time – proceeding with shutdown")
-        self._db_queue.put(None)
+        self._queue_put_drop_oldest(self._db_queue, None, "DB queue close")
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
-            if self._db_thread.is_alive():
-                self._log("WARNING", "DB worker did not finish in time – proceeding with shutdown")
-        for port in [self.landmarks_port, self.img_in_port, self.img_out_port,
-                     self.debug_port, self.interaction_manager_rpc, self.interaction_interface_rpc,
-                     self.stm_context_port]:
+        if self.facetracker_rpc:
+            # Send 'sus' before shutting down, only try once so we don't delay close()
+            self._send_facetracker_cmd("sus", retries=1)
+            self.facetracker_rpc.close()
+
+        for port in [
+            self.landmarks_port,
+            self.debug_port,
+            self.executive_control_rpc,
+            self.vision_cmd_port,
+            self.stm_context_port,
+            self.handle_port,
+        ]:
             if port:
                 port.close()
         return True
+
+    def respond(self, cmd: yarp.Bottle, reply: yarp.Bottle) -> bool:
+        """Handle RPC commands (e.g. set_track_id from executiveControl)."""
+        reply.clear()
+        if cmd.size() < 1:
+            reply.addString("error")
+            reply.addString("empty command")
+            return True
+        command = cmd.get(0).asString()
+        if command == "set_track_id":
+            if cmd.size() < 2:
+                reply.addString("error")
+                reply.addString("usage: set_track_id <int>")
+                return True
+            tid = cmd.get(1).asInt32()
+            self.rpc_override_track_id = tid
+            self._log("INFO", f"RPC override track_id set to {tid}")
+            reply.addString("ok")
+            return True
+
+        if command == "reset_cooldown":
+            if cmd.size() < 3:
+                reply.addString("error")
+                return True
+            fid = cmd.get(1).asString()
+            tid = cmd.get(2).asInt32()
+            cd_key = self._cooldown_key(fid, tid)
+            self.last_interaction_time[cd_key] = time.time()
+            reply.addString("ok")
+            return True
+
+        reply.addString("error")
+        reply.addString(f"unknown command: {command}")
+        return True
+
+    def _send_facetracker_cmd(self, command: str, retries: int = 1):
+        """Send a command (run/sus) to faceTracker, retrying if it's not up yet."""
+        if not self.facetracker_rpc:
+            return
+
+        for attempt in range(retries):
+            # Check if connected. If not, try to connect.
+            if self.facetracker_rpc.getOutputCount() == 0:
+                yarp.Network.connect(
+                    f"/{self.module_name}/faceTracker:rpc", "/faceTracker"
+                )
+
+            if self.facetracker_rpc.getOutputCount() > 0:
+                cmd = yarp.Bottle()
+                cmd.addString(command)
+                reply = yarp.Bottle()
+                self.facetracker_rpc.write(cmd, reply)
+
+                # FaceTracker.cpp replies with VOCAB_OK or VOCAB_FAILED
+                if reply.size() > 0 and reply.get(0).asVocab32() == yarp.Vocab32_encode(
+                    "ok"
+                ):
+                    self._log("INFO", f"Sent '{command}' to /faceTracker successfully")
+                    return
+                else:
+                    self._log(
+                        "WARNING",
+                        f"'/faceTracker' replied unexpectedly to '{command}': {reply.toString()}",
+                    )
+                    return
+            else:
+                if attempt < retries - 1:
+                    time.sleep(1.0)
+                else:
+                    self._log(
+                        "WARNING",
+                        f"Could not connect to /faceTracker to send '{command}'",
+                    )
 
     def getPeriod(self) -> float:
         return self.period
@@ -340,152 +531,319 @@ class FaceSelectorModule(yarp.RFModule):
 
         try:
             landmarks_connected = self.landmarks_port.getInputCount() > 0
-            img_connected = self.img_in_port.getInputCount() > 0
 
-            if not landmarks_connected or not img_connected:
+            if not landmarks_connected:
                 if not self.ports_connected_logged:
-                    lm = "OK" if landmarks_connected else "waiting"
-                    img = "OK" if img_connected else "waiting"
-                    self._log("INFO", f"Waiting for ports  landmarks:{lm}  img:{img}")
+                    self._log("INFO", "wait: landmarks")
                     self.ports_connected_logged = True
                 return True
 
             if self.ports_connected_logged:
-                self._log("INFO", "✓ Input ports connected – starting processing")
+                self._log("INFO", "stream: on")
                 self.ports_connected_logged = False
 
-            # Day-change check
             today = self._get_today_date()
             if self._current_day != today:
-                self._log("INFO", f"Day change: {self._current_day} → {today}")
                 self._reload_memory_from_disk_and_prune_today()
                 self._enqueue_save("greeted")
                 self._enqueue_save("talked")
                 self._current_day = today
 
-            # 0. Read STM context (non-blocking – best-effort)
             if self.stm_context_port is not None:
+                if (
+                    not self._context_connected_logged
+                    and self.stm_context_port.getInputCount() > 0
+                ):
+                    self._log("INFO", "context: connected")
+                    self._context_connected_logged = True
                 ctx_btl = self.stm_context_port.read(False)
                 if ctx_btl is not None:
                     self.current_context_label = ctx_btl.get(2).asInt8()
-                    self._log("DEBUG", f"STM context updated → label={self.current_context_label}")
 
-            # 1. Read landmarks
             faces = self._read_landmarks()
 
-            # 2. Read image
-            frame = None
-            self.frame_skip_counter += 1
-            if self.frame_skip_counter >= self.frame_skip_rate:
-                self.frame_skip_counter = 0
-                frame = self._read_image()
-
-            # 3. Compute states
             with self.state_lock:
                 self.current_faces = self._compute_face_states(faces)
 
-            # 4. Select target (biggest bbox → wait resolve → LS gate → interact)
-            #    Policy: ALWAYS pick biggest bbox. If unresolved, wait (don't switch
-            #    to smaller resolved faces). Only interact once the biggest resolves.
             current_time = time.time()
+            pending_exec_check = None
+            command_target_for_io = None
             with self._interaction_lock:
                 with self.state_lock:
-                    if not self.interaction_busy:
-                        candidate = self._select_biggest_face(self.current_faces)
-                        if candidate:
-                            face_id = candidate.get("face_id", "unknown")
-                            track_id = candidate.get("track_id", -1)
-                            person_id = candidate.get("person_id", face_id)
-                            bbox = candidate.get("bbox", (0, 0, 0, 0))
-                            area = bbox[2] * bbox[3]
-                            resolved = self._is_face_id_resolved(face_id)
+                    # State invariants:
+                    # - interaction_busy transitions are serialized by interaction_lock.
+                    # - current_faces/selected_target snapshots are protected by state_lock.
+                    # - rpc_override_track_id has priority over IPS arbitration.
+                    # - while interaction_busy, target lock follows selected track when visible.
 
-                            # If face_id not yet resolved → skip this cycle (don't fall back)
-                            if not resolved:
-                                if self.verbose_debug:
-                                    self._log("DEBUG",
-                                        f"Biggest face track={track_id} still resolving "
-                                        f"(face_id='{face_id}', area={area:.0f}), waiting...")
-                            else:
-                                # Face is resolved — proceed with interaction checks
-                                cd_key = str(person_id) if self._is_face_known(str(person_id)) else f"unknown:{track_id}"
-                                last_int = self.last_interaction_time.get(cd_key, 0)
+                    # --- A. ATTENTION LAYER (Who to look at) ---
+                    best_face = self._select_best_face(self.current_faces)
 
-                                if current_time - last_int < self._effective_cooldown():
-                                    if self.verbose_debug:
-                                        self._log("DEBUG", f"{person_id} in cooldown (label={self.current_context_label}, cd={self._effective_cooldown():.1f}s)")
-                                else:
-                                    ss = candidate.get("social_state", "ss1")
-                                    ls = candidate.get("learning_state", self.LS1)
-                                    eligible = candidate.get("eligible", False)
-                                    lg_ts = candidate.get("last_greeted_ts")
+                    # RPC override: executiveControl can force gaze via set_track_id
+                    override_tid = self.rpc_override_track_id
+                    if override_tid >= 0:
+                        override_face = next(
+                            (
+                                f
+                                for f in self.current_faces
+                                if f.get("track_id") == override_tid
+                            ),
+                            None,
+                        )
+                        if override_face is not None:
+                            target_to_look_at = override_face
+                        else:
+                            target_to_look_at = {
+                                "track_id": override_tid,
+                                "ips": 0.0,
+                            }
+                    elif self.interaction_busy and self.selected_target:
+                        active_track_id = self.selected_target.get("track_id")
+                        active_face = next(
+                            (
+                                f
+                                for f in self.current_faces
+                                if f.get("track_id") == active_track_id
+                            ),
+                            None,
+                        )
+                        if active_face is not None:
+                            self.selected_target = active_face
+                            target_to_look_at = active_face
+                        else:
+                            target_to_look_at = dict(self.selected_target)
+                    else:
+                        target_to_look_at = best_face
 
-                                    # Log selection to DB
-                                    self._db_log("target_selection", {
-                                        "track_id": track_id,
-                                        "face_id": face_id,
-                                        "person_id": person_id,
-                                        "bbox_area": area,
-                                        "ss": ss, "ls": ls, "eligible": eligible,
-                                        "last_greeted_ts": lg_ts,
-                                    })
+                    should_track = False
+                    if target_to_look_at is not None:
+                        if override_tid >= 0:
+                            should_track = True
+                        elif self.interaction_busy:
+                            should_track = True
+                        else:
+                            target_ips = float(target_to_look_at.get("ips", 0.0))
+                            should_track = target_ips >= self.min_track_ips
 
-                                    if eligible:
-                                        if ss == "ss4":
-                                            if self.verbose_debug:
-                                                self._log("DEBUG", f"{person_id} is ss4 – skipping")
-                                        else:
-                                            # Pre-spawn busy check (cooldown applied regardless)
-                                            self.last_interaction_time[cd_key] = current_time
+                    command_target = target_to_look_at if should_track else None
 
-                                            im_status = self._interaction_manager_status()
-                                            if isinstance(im_status, dict) and not im_status.get("busy", False):
-                                                # Status confirmed not busy — spawn
-                                                self.selected_target = candidate
-                                                self.selected_bbox_last = candidate["bbox"]
-                                                self.interaction_busy = True
+                    # Send I/O outside locks.
+                    command_target_for_io = (
+                        dict(command_target)
+                        if isinstance(command_target, dict)
+                        else None
+                    )
 
-                                                self._log("INFO",
-                                                    f">>> TARGET: {person_id} "
-                                                    f"(track={track_id}, {ss}, LS{ls}, area={area:.0f})")
+                    # --- B. DIALOGUE LAYER (Who to interact with) ---
+                    if (
+                        not self.interaction_busy
+                        and override_tid < 0
+                        and target_to_look_at
+                    ):
 
-                                                self.interaction_thread = threading.Thread(
-                                                    target=self._run_interaction_thread,
-                                                    args=(candidate,), daemon=True)
-                                                self.interaction_thread.start()
-                                            else:
-                                                # Status is None (RPC error/not connected) or busy — skip spawn
-                                                if im_status is None:
-                                                    self._log("WARNING", "InteractionManager status unavailable – skipping")
-                                                else:
-                                                    self._log("INFO", "InteractionManager busy (pre-spawn) – skipping")
-                                                # interaction_busy stays False; cooldown already applied
-                                    elif self.verbose_debug:
-                                        self._log("DEBUG", f"{person_id} not eligible (LS{ls})")
+                        candidate = target_to_look_at
+                        face_id = candidate.get("face_id", "unknown")
+                        track_id = candidate.get("track_id", -1)
+                        person_id = candidate.get("person_id", face_id)
 
-            # 5. Annotate & publish image
-            if frame is not None:
-                with self.state_lock:
-                    annotated = self._annotate_image(frame, self.current_faces, self.selected_target)
-                self.last_annotated_frame = annotated
-                self._publish_image(annotated)
-            elif self.last_annotated_frame is not None:
-                self._publish_image(self.last_annotated_frame)
+                        resolved = self._is_face_id_resolved(face_id)
 
-            # 6. Debug
+                        if resolved:
+                            exec_face_id = (
+                                str(person_id)
+                                if self._is_face_known(str(person_id))
+                                else str(face_id)
+                            )
+
+                            if not self._is_face_known(exec_face_id):
+                                candidate["social_state"] = "ss1"
+                                candidate["eligible"] = (
+                                    float(candidate.get("ips", 0.0))
+                                    >= self.SS_THRESHOLDS["ss1"]
+                                )
+
+                            cd_key = self._cooldown_key(exec_face_id, track_id)
+                            last_int = self.last_interaction_time.get(cd_key, 0)
+
+                            if current_time - last_int >= self._effective_cooldown():
+
+                                eligible = candidate.get("eligible", False)
+                                ss = candidate.get("social_state", "ss1")
+                                area = self._bbox_area(candidate)
+
+                                if self._should_log_target_selection(candidate):
+                                    self._db_log(
+                                        "target_selection",
+                                        {
+                                            "track_id": track_id,
+                                            "face_id": face_id,
+                                            "person_id": person_id,
+                                            "bbox_area": area,
+                                            "ips": float(candidate.get("ips", 0.0)),
+                                            "ss": ss,
+                                            "eligible": eligible,
+                                            "context_label": self.current_context_label,
+                                            "reason": "candidate_ready",
+                                            "last_greeted_ts": candidate.get(
+                                                "last_greeted_ts"
+                                            ),
+                                        },
+                                    )
+
+                                if eligible and ss != "ss4":
+                                    can_try_exec = True
+
+                                    if current_time < self._next_exec_rpc_try_ts:
+                                        can_try_exec = False
+                                    elif (
+                                        self.executive_control_rpc is None
+                                        or self.executive_control_rpc.getOutputCount() == 0
+                                    ):
+                                        self._next_exec_rpc_try_ts = current_time + self.exec_rpc_retry_sec
+                                        if not self._exec_rpc_offline_logged:
+                                            self._log("INFO", "exec: offline, skip")
+                                            self._exec_rpc_offline_logged = True
+                                        can_try_exec = False
+                                    elif self._exec_rpc_offline_logged:
+                                        self._log("INFO", "exec: online")
+                                        self._exec_rpc_offline_logged = False
+
+                                    if can_try_exec:
+                                        pending_exec_check = {
+                                            "track_id": track_id,
+                                            "person_id": person_id,
+                                            "cd_key": cd_key,
+                                            "exec_face_id": exec_face_id,
+                                        }
+
+            self._send_target_to_facetracker(command_target_for_io)
+            self._log_status_tick(command_target_for_io)
+
+            if pending_exec_check is not None:
+                im_status = self._executive_control_status()
+                if not isinstance(im_status, dict):
+                    self._next_exec_rpc_try_ts = current_time + self.exec_rpc_retry_sec
+                elif not im_status.get("busy", False):
+                    with self._interaction_lock:
+                        with self.state_lock:
+                            if not self.interaction_busy:
+                                track_id = pending_exec_check["track_id"]
+                                person_id = pending_exec_check["person_id"]
+                                cd_key = pending_exec_check["cd_key"]
+                                candidate = next(
+                                    (
+                                        f
+                                        for f in self.current_faces
+                                        if f.get("track_id") == track_id
+                                    ),
+                                    None,
+                                )
+                                if candidate is not None:
+                                    now2 = time.time()
+                                    last_int = self.last_interaction_time.get(cd_key, 0)
+                                    if (
+                                        now2 - last_int >= self._effective_cooldown()
+                                        and candidate.get("eligible", False)
+                                        and candidate.get("social_state", "ss1") != "ss4"
+                                    ):
+                                        exec_face_id = pending_exec_check.get(
+                                            "exec_face_id",
+                                            str(
+                                                candidate.get(
+                                                    "person_id",
+                                                    candidate.get("face_id", "unknown"),
+                                                )
+                                            ),
+                                        )
+                                        if not self._is_face_known(exec_face_id):
+                                            candidate["social_state"] = "ss1"
+                                        candidate["exec_face_id"] = exec_face_id
+
+                                        self.selected_target = candidate
+                                        self.selected_bbox_last = candidate["bbox"]
+                                        self.interaction_busy = True
+
+                                        ss = candidate.get("social_state", "ss1")
+                                        ips_val = float(candidate.get("ips", 0.0))
+                                        self._log(
+                                            "INFO",
+                                            f"try: rpc t{track_id} {person_id} {ss} ips={ips_val:.2f}",
+                                        )
+                                        self._log(
+                                            "INFO",
+                                            f"pick: t{track_id} {person_id} {ss} ips={ips_val:.2f}",
+                                        )
+
+                                        self.interaction_thread = threading.Thread(
+                                            target=self._run_interaction_thread,
+                                            args=(dict(candidate),),
+                                            daemon=True,
+                                        )
+                                        self.interaction_thread.start()
+
+
+
             self._publish_debug()
-
             self._consecutive_errors = 0
             return True
 
         except Exception as e:
             self._consecutive_errors += 1
-            self._log("ERROR", f"Error in updateModule: {e}")
-            import traceback; traceback.print_exc()
+            self._log("ERROR", f"loop err: {e}")
             if self._consecutive_errors >= self._max_consecutive_errors:
-                self._log("CRITICAL", "Too many consecutive errors, stopping")
                 return False
             return True
+
+    def _log_status_tick(self, target_face: Optional[Dict[str, Any]]):
+        target_tid = target_face.get("track_id", -1) if target_face else -1
+        target_id = (
+            target_face.get("person_id", target_face.get("face_id", "-"))
+            if target_face
+            else "-"
+        )
+        target_ss = target_face.get("social_state", "-") if target_face else "-"
+
+        key = (int(target_tid), str(target_id), str(target_ss))
+        if key == self._last_target_key:
+            return
+
+        face_count = len(self.current_faces)
+        busy = "busy" if self.interaction_busy else "idle"
+        ips = float(target_face.get("ips", 0.0)) if target_face else 0.0
+        ov = self.rpc_override_track_id
+        override_str = f" ov=t{ov}" if ov >= 0 else ""
+
+        line = f"state: {busy} faces={face_count} look=t{target_tid} id={target_id} {target_ss} ips={ips:.2f}{override_str}"
+        self._log("INFO", line)
+        self._last_status_line = line
+        self._last_target_key = key
+
+    def _should_log_target_selection(self, face: Dict[str, Any]) -> bool:
+        now = time.time()
+        track_id = int(face.get("track_id", -1))
+        person_id = str(face.get("person_id", face.get("face_id", "unknown")))
+        ss = str(face.get("social_state", "ss1"))
+        eligible = 1 if bool(face.get("eligible", False)) else 0
+        ips = float(face.get("ips", 0.0))
+
+        key = (track_id, person_id, ss, eligible)
+        if key != self._last_target_log_key:
+            self._last_target_log_key = key
+            self._last_target_log_ips = ips
+            self._last_target_log_ts = now
+            return True
+
+        if abs(ips - self._last_target_log_ips) >= self.TARGET_LOG_IPS_DELTA:
+            self._last_target_log_ips = ips
+            self._last_target_log_ts = now
+            return True
+
+        if now - self._last_target_log_ts >= self.TARGET_LOG_MIN_PERIOD_SEC:
+            self._last_target_log_ips = ips
+            self._last_target_log_ts = now
+            return True
+
+        return False
 
     # ==================== Context-Aware Cooldown ====================
 
@@ -508,6 +866,11 @@ class FaceSelectorModule(yarp.RFModule):
         faces = []
         bottle = self.landmarks_port.read(False)
         if not bottle:
+            if (
+                self._latest_landmarks_ts > 0
+                and (time.time() - self._latest_landmarks_ts) <= self.landmarks_stale_sec
+            ):
+                return list(self._latest_landmarks)
             return faces
         for i in range(bottle.size()):
             face_btl = bottle.get(i)
@@ -516,18 +879,16 @@ class FaceSelectorModule(yarp.RFModule):
             face_data = self._parse_face_bottle(face_btl.asList())
             if face_data:
                 faces.append(face_data)
+
+        # Cache even empty parsed frames so real "no-face" observations can propagate.
+        self._latest_landmarks = list(faces)
+        self._latest_landmarks_ts = time.time()
         return faces
 
     def _parse_face_bottle(self, bottle: yarp.Bottle) -> Optional[Dict[str, Any]]:
         if not bottle:
             return None
-        data = {
-            "face_id": "unknown", "track_id": -1,
-            "bbox": (0.0, 0.0, 0.0, 0.0),
-            "distance": "UNKNOWN", "gaze_direction": (0.0, 0.0, 1.0),
-            "pitch": 0.0, "yaw": 0.0, "roll": 0.0, "cos_angle": 0.0,
-            "attention": "AWAY", "is_talking": 0, "time_in_view": 0.0,
-        }
+        data = asdict(self.FaceSnapshot())
         try:
             i = 0
             while i < bottle.size():
@@ -537,15 +898,23 @@ class FaceSelectorModule(yarp.RFModule):
                     if i + 1 < bottle.size():
                         nxt = bottle.get(i + 1)
                         if key == "face_id" and nxt.isString():
-                            data["face_id"] = nxt.asString(); i += 2
+                            data["face_id"] = nxt.asString()
+                            i += 2
                         elif key == "track_id" and (nxt.isInt32() or nxt.isInt64()):
-                            data["track_id"] = nxt.asInt32(); i += 2
+                            data["track_id"] = nxt.asInt32()
+                            i += 2
                         elif key in ("distance", "attention") and nxt.isString():
-                            data[key] = nxt.asString(); i += 2
-                        elif key in ("pitch", "yaw", "roll", "cos_angle", "time_in_view") and nxt.isFloat64():
-                            data[key] = nxt.asFloat64(); i += 2
+                            data[key] = nxt.asString()
+                            i += 2
+                        elif (
+                            key in ("pitch", "yaw", "roll", "cos_angle", "time_in_view")
+                            and nxt.isFloat64()
+                        ):
+                            data[key] = nxt.asFloat64()
+                            i += 2
                         elif key == "is_talking" and (nxt.isInt32() or nxt.isInt64()):
-                            data["is_talking"] = nxt.asInt32(); i += 2
+                            data["is_talking"] = nxt.asInt32()
+                            i += 2
                         else:
                             i += 1
                     else:
@@ -553,14 +922,22 @@ class FaceSelectorModule(yarp.RFModule):
                 elif item.isList():
                     nested = item.asList()
                     if nested.size() >= 2:
-                        key = nested.get(0).asString() if nested.get(0).isString() else ""
+                        key = (
+                            nested.get(0).asString() if nested.get(0).isString() else ""
+                        )
                         if key == "bbox" and nested.size() >= 5:
-                            data["bbox"] = (nested.get(1).asFloat64(), nested.get(2).asFloat64(),
-                                            nested.get(3).asFloat64(), nested.get(4).asFloat64())
+                            data["bbox"] = (
+                                nested.get(1).asFloat64(),
+                                nested.get(2).asFloat64(),
+                                nested.get(3).asFloat64(),
+                                nested.get(4).asFloat64(),
+                            )
                         elif key == "gaze_direction" and nested.size() >= 4:
-                            data["gaze_direction"] = (nested.get(1).asFloat64(),
-                                                      nested.get(2).asFloat64(),
-                                                      nested.get(3).asFloat64())
+                            data["gaze_direction"] = (
+                                nested.get(1).asFloat64(),
+                                nested.get(2).asFloat64(),
+                                nested.get(3).asFloat64(),
+                            )
                     i += 1
                 else:
                     i += 1
@@ -569,131 +946,14 @@ class FaceSelectorModule(yarp.RFModule):
             self._log("WARNING", f"Failed to parse face bottle: {e}")
             return None
 
-    # ==================== Image Handling ====================
 
-    def _read_image(self) -> Optional[np.ndarray]:
-        yimg = self.img_in_port.read(False)
-        if not yimg:
-            return None
-        w, h = yimg.width(), yimg.height()
-        if w <= 0 or h <= 0:
-            return None
-        self.img_width, self.img_height = w, h
-        try:
-            try:
-                img_bytes = yimg.toBytes()
-                arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                expected = h * w * 3
-                if len(arr) >= expected:
-                    return arr[:expected].reshape((h, w, 3)).copy()
-            except AttributeError:
-                pass
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            for y in range(h):
-                for x in range(w):
-                    pixel = yimg.pixel(x, y)
-                    rgb[y, x] = [pixel.r, pixel.g, pixel.b]
-            return rgb
-        except Exception as e:
-            self._log("WARNING", f"Failed to convert image: {e}")
-            return None
-
-    def _publish_image(self, frame_rgb: np.ndarray):
-        if self.img_out_port.getOutputCount() == 0:
-            return
-        try:
-            h, w, _ = frame_rgb.shape
-            out = self.img_out_port.prepare()
-            out.resize(w, h)
-            try:
-                out.fromBytes(frame_rgb.tobytes())
-            except AttributeError:
-                for y in range(h):
-                    for x in range(w):
-                        pixel = out.pixel(x, y)
-                        r, g, b = frame_rgb[y, x]
-                        pixel.r, pixel.g, pixel.b = int(r), int(g), int(b)
-            self.img_out_port.write()
-        except Exception as e:
-            self._log("WARNING", f"Failed to publish image: {e}")
-
-    def _annotate_image(self, frame_rgb: np.ndarray, faces: List[Dict],
-                        selected: Optional[Dict]) -> np.ndarray:
-        annotated = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        selected_track_id = selected["track_id"] if selected else None
-        selected_found = False
-
-        for face in faces:
-            x, y, w, h = face["bbox"]
-            x, y, w, h = int(x), int(y), int(w), int(h)
-            x = max(0, min(x, self.img_width - 1))
-            y = max(0, min(y, self.img_height - 1))
-            w = max(0, min(w, self.img_width - x))
-            h = max(0, min(h, self.img_height - y))
-
-            track_id = face["track_id"]
-            if track_id == selected_track_id and self.interaction_busy:
-                color = self.COLOR_GREEN
-                selected_found = True
-                self.selected_bbox_last = face["bbox"]
-            elif face.get("eligible", False):
-                color = self.COLOR_YELLOW
-            else:
-                color = self.COLOR_WHITE
-
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-
-            ss = face.get("social_state", "ss1")
-            ls = face.get("learning_state", 1)
-            person_id = face.get("person_id", face.get("face_id", "?"))
-            display_id = person_id if person_id != "unknown" else face.get("face_id", "?")
-
-            label1 = f"{display_id} (T:{track_id})"
-            lg_ts = face.get("last_greeted_ts")
-            lg_short = lg_ts[11:16] if lg_ts else "never"  # HH:MM or "never"
-            label2 = f"{ss} | LS{ls} | LG:{lg_short}"
-            label3 = f"{face.get('distance','?')}/{face.get('attention','?')[:3]}"
-            area = face["bbox"][2] * face["bbox"][3]
-            label4 = f"area={area:.0f}"
-
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            fs, th = 0.45, 1
-            self._draw_label(annotated, label1, (x, y - 58), font, fs, color, th)
-            self._draw_label(annotated, label2, (x, y - 41), font, fs, color, th)
-            self._draw_label(annotated, label3, (x, y - 24), font, fs, color, th)
-            self._draw_label(annotated, label4, (x, y - 7), font, fs, color, th)
-
-            if track_id == selected_track_id and self.interaction_busy:
-                cv2.putText(annotated, "ACTIVE", (x + w - 55, y + 15),
-                            font, 0.5, self.COLOR_GREEN, 2)
-
-        if self.interaction_busy and not selected_found and self.selected_bbox_last:
-            x, y, w, h = [int(v) for v in self.selected_bbox_last]
-            x = max(0, min(x, self.img_width - 1))
-            y = max(0, min(y, self.img_height - 1))
-            w = max(0, min(w, self.img_width - x))
-            h = max(0, min(h, self.img_height - y))
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), self.COLOR_GREEN, 2)
-            cv2.putText(annotated, "ACTIVE (LOST)", (x, y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.COLOR_GREEN, 2)
-
-        status = "BUSY" if self.interaction_busy else "IDLE"
-        status_color = self.COLOR_GREEN if self.interaction_busy else self.COLOR_WHITE
-        cv2.putText(annotated, f"Status: {status} | Faces: {len(faces)}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-
-        return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
-    def _draw_label(self, img, text, pos, font, scale, color, thickness):
-        x, y = pos
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-        cv2.rectangle(img, (x, y - th - 2), (x + tw + 2, y + 2), (0, 0, 0), -1)
-        cv2.putText(img, text, (x + 1, y), font, scale, color, thickness)
 
     # ==================== State Computation ====================
 
     def _compute_face_states(self, faces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         today = self._get_today_date()
+        new_area_history = {}
+
         for face in faces:
             face_id = face["face_id"]
             track_id = face["track_id"]
@@ -703,29 +963,49 @@ class FaceSelectorModule(yarp.RFModule):
             is_known = self._is_face_known(face_id) or self._is_face_known(person_id)
             face["is_known"] = is_known
 
-            # Read last_greeted info from background-refreshed snapshot
             lg_entry = self.get_last_greeted_entry(str(person_id), track_id=track_id)
-            face["last_greeted_info"] = lg_entry  # None if never greeted
+            face["last_greeted_info"] = lg_entry
             face["last_greeted_ts"] = lg_entry.get("timestamp") if lg_entry else None
 
-            greeted_today = self._was_greeted_today(person_id, today) if is_known else False
-            talked_today = self._was_talked_today(person_id, today) if is_known else False
+            greeted_today = (
+                self._was_greeted_today(person_id, today) if is_known else False
+            )
+            talked_today = (
+                self._was_talked_today(person_id, today) if is_known else False
+            )
             face["greeted_today"] = greeted_today
             face["talked_today"] = talked_today
 
-            face["social_state"] = self._compute_social_state(is_known, greeted_today, talked_today)
-            face["learning_state"] = self._get_learning_state(person_id)
+            face["social_state"] = self._compute_social_state(
+                is_known, greeted_today, talked_today
+            )
+            face["ips"] = self._calculate_ips(face, person_id)
             face["eligible"] = self._is_eligible(face)
 
-        # Prune stale track mappings
+            new_area_history[track_id] = self._bbox_area(face)
+
         active = {f["track_id"] for f in faces if f.get("track_id", -1) >= 0}
-        self.track_to_person = {t: p for t, p in self.track_to_person.items() if t in active}
+        self.track_to_person = {
+            t: p for t, p in self.track_to_person.items() if t in active
+        }
+        self.area_history = new_area_history
         return faces
 
     def _is_face_known(self, face_id: str) -> bool:
-        if not face_id or face_id.lower() in ("unknown", "unmatched", "recognizing"):
+        if not face_id:
+            return False
+        norm = str(face_id).strip().lower()
+        if norm in ("unknown", "unmatched", "recognizing", ""):
+            return False
+        if norm.startswith("unknown:"):
+            return False
+        if norm.isdigit():
             return False
         return True
+
+    def _cooldown_key(self, person_id: str, track_id: int) -> str:
+        pid = str(person_id or "").strip()
+        return pid if self._is_face_known(pid) else f"unknown:{track_id}"
 
     def _was_greeted_today(self, person_id: str, today: date) -> bool:
         if person_id not in self.greeted_today:
@@ -745,7 +1025,9 @@ class FaceSelectorModule(yarp.RFModule):
         except Exception:
             return False
 
-    def _compute_social_state(self, is_known: bool, greeted_today: bool, talked_today: bool) -> str:
+    def _compute_social_state(
+        self, is_known: bool, greeted_today: bool, talked_today: bool
+    ) -> str:
         """New 4-state model. Unknown people are always ss1."""
         if not is_known:
             return "ss1"
@@ -755,35 +1037,93 @@ class FaceSelectorModule(yarp.RFModule):
             return "ss3"
         return "ss4"
 
-    def _get_learning_state(self, person_id: str) -> int:
-        if person_id in self.learning_data:
-            return self.learning_data[person_id].get("ls", self.LS1)
-        return self.LS1
-
     def _is_eligible(self, face: Dict[str, Any]) -> bool:
         ss = face.get("social_state", "ss1")
-        ls = face.get("learning_state", self.LS1)
-        # ss4 already at ultimate - not eligible for new interaction
+        ips = face.get("ips", 0.0)
+
         if ss == "ss4":
             return False
 
-        if ls == self.LS3:
-            return True
+        threshold = self.SS_THRESHOLDS.get(ss, 1.0)
+        return ips >= threshold
 
-        distance = face.get("distance", "UNKNOWN")
-        attention = face.get("attention", "AWAY")
+    # ==================== IPS & Habituation Math ====================
+
+    def _get_person_weights(self, person_id: str) -> Dict[str, float]:
+        """Fetch personalized weights, or fallback to baseline for strangers."""
+        if (
+            person_id in self.learning_data
+            and "weights" in self.learning_data[person_id]
+        ):
+            return self.learning_data[person_id]["weights"]
+        return self.BASELINE_WEIGHTS.copy()
+
+    def _calculate_ips_variables(self, face: Dict[str, Any]) -> Dict[str, float]:
+        """Converts raw landmark data into normalized 0.0-1.0 scoring variables."""
+        IMG_W, IMG_H = 640.0, 480.0
+        MAX_AREA = IMG_W * IMG_H
+        MAX_DIST = math.hypot(IMG_W / 2, IMG_H / 2)
+        VEL_SENSITIVITY = 10.0
+
+        x, y, w, h = face.get("bbox", (0, 0, 0, 0))
+        track_id = face.get("track_id", -1)
+        cos_angle = face.get("cos_angle", 0.0)
+
+        # 1. Proximity (Face Height Ratio)
+        s_prox = min(1.0, h / IMG_H) if IMG_H > 0 else 0.0
+
+        # 2. Centricity (Distance to center)
+        cx, cy = x + (w / 2), y + (h / 2)
+        dist_to_center = math.hypot(cx - (IMG_W / 2), cy - (IMG_H / 2))
+        s_cent = max(0.0, 1.0 - (dist_to_center / MAX_DIST)) if MAX_DIST > 0 else 0.0
+
+        # 3. Approach Velocity (Change in area)
+        current_area = w * h
+        prev_area = self.area_history.get(track_id, current_area)
+        raw_vel = (current_area - prev_area) / MAX_AREA if MAX_AREA > 0 else 0.0
+        s_vel = min(1.0, max(0.0, raw_vel * VEL_SENSITIVITY))
+
+        # 4. Gaze
+        s_gaze = max(0.0, cos_angle)
+
+        return {"prox": s_prox, "cent": s_cent, "vel": s_vel, "gaze": s_gaze}
+
+    def _calculate_ips(self, face: Dict[str, Any], person_id: str) -> float:
+        """Calculates final IPS using personal weights and Habituation Decay."""
+        vars_norm = self._calculate_ips_variables(face)
+        weights = self._get_person_weights(person_id)
+
+        # Base Formula
+        base_ips = (
+            weights["prox"] * vars_norm["prox"]
+            + weights["cent"] * vars_norm["cent"]
+            + weights["vel"] * vars_norm["vel"]
+            + weights["gaze"] * vars_norm["gaze"]
+        )
+
+        # Habituation (e^-lambda * t_idle)
         time_in_view = face.get("time_in_view", 0.0)
+        cd_key = self._cooldown_key(person_id, face.get("track_id", -1))
+        last_int_time = self.last_interaction_time.get(cd_key, 0)
 
-        if distance not in self.LS_VALID_DISTANCES.get(ls, set()):
-            return False
-        if attention not in self.LS_VALID_ATTENTIONS.get(ls, set()):
-            return False
-        min_tiv = self.LS_MIN_TIME_IN_VIEW.get(ls, 0.0)
-        if time_in_view < min_tiv:
-            return False
-        return True
+        time_since_int = (
+            time.time() - last_int_time if last_int_time > 0 else float("inf")
+        )
+        t_idle = min(time_in_view, time_since_int)
 
-    # ==================== Face Selection (BIGGEST BBOX) ====================
+        habituation_multiplier = math.exp(-self.HABITUATION_LAMBDA * t_idle)
+        ips = base_ips * habituation_multiplier
+
+        # Hysteresis Bonus
+        if (
+            face.get("track_id", -1) != -1
+            and face.get("track_id") == self.current_target_track_id
+        ):
+            ips += self.IPS_HYSTERESIS_BONUS
+
+        return ips
+
+    # ==================== Face Selection (Best IPS) ====================
 
     @staticmethod
     def _is_face_id_resolved(face_id: str) -> bool:
@@ -797,121 +1137,140 @@ class FaceSelectorModule(yarp.RFModule):
         _, _, w, h = face.get("bbox", (0, 0, 0, 0))
         return w * h
 
-    def _select_biggest_face(self, faces: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Select face with biggest bbox area.
-
-        POLICY: Always returns the biggest-bbox face regardless of face_id
-        resolution status. The caller must check face_id resolution separately.
-        Never filters by face_id. Returns None only if faces is empty or all
-        have zero-area bboxes.
-        """
+    def _select_best_face(
+        self, faces: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Select face with highest IPS score."""
         if not faces:
+            self.current_target_track_id = -1
             return None
-        biggest = max(faces, key=self._bbox_area)
-        if self._bbox_area(biggest) <= 0:
+
+        best = max(faces, key=lambda f: f.get("ips", 0.0))
+        if self._bbox_area(best) <= 0:
+            self.current_target_track_id = -1
             return None
-        return biggest
+
+        self.current_target_track_id = best.get("track_id", -1)
+        return best
+
+    # ==================== Target Command Streaming ====================
+
+    def _send_target_to_facetracker(self, face: Optional[Dict[str, Any]]):
+        """Send target command [track_id, ips] to vision."""
+        if self.vision_cmd_port.getOutputCount() == 0:
+            return
+
+        if face is None:
+            track_id = -1
+            ips = 0.0
+        else:
+            track_id = int(face.get("track_id", -1))
+            ips = float(face.get("ips", 0.0))
+
+        # Event-driven output: only on start/stop/switch.
+        if track_id == self._last_sent_track_id:
+            return
+
+        bottle = self.vision_cmd_port.prepare()
+        bottle.clear()
+        bottle.addInt32(track_id)
+        bottle.addFloat64(ips)
+        self.vision_cmd_port.write()
+
+        self._last_sent_track_id = track_id
+        self._last_sent_ips = ips
+
+        if track_id >= 0:
+            self._log("INFO", f"track: start t{track_id} ips={ips:.2f}")
+        else:
+            self._log("INFO", "track: stop")
 
     # ==================== Interaction Execution ====================
 
     def _run_interaction_thread(self, target: Dict[str, Any]):
         did_run_interaction = False
+        started_at = time.time()
+        attempt_id = uuid.uuid4().hex
+        result: Optional[Dict] = None
+        track_id = target.get("track_id", -1)
+        raw_face_id = str(target.get("face_id", "unknown"))
+        face_id = str(
+            target.get(
+                "exec_face_id",
+                target.get("person_id", target.get("face_id", "unknown")),
+            )
+        )
+        ss = target.get("social_state", "ss1")
         try:
-            track_id = target["track_id"]
-            face_id  = str(target.get("person_id", target["face_id"]))
-            ss       = target.get("social_state", "ss1")
+            self._log("INFO", f"talk: start t{track_id} {face_id} {ss}")
 
-            status = self._interaction_manager_status()
-            if not isinstance(status, dict) or status.get("busy", False):
-                self._log("INFO", "InteractionManager unavailable or busy – skipping proactive")
-                return
-
-            if ss == "ss4":
-                self._log("INFO", f"{face_id} is ss4 – skipping")
-                return
-
-            self._log("INFO", f"--- START: {face_id} (track={track_id}, {ss}) ---")
-
-            did_run_interaction = True
-            self._execute_interaction_interface("ao_start")
-
-            try:
-                result = self._run_interaction_manager(track_id, face_id, ss)
-                if result:
-                    self._log("INFO", f"Result: success={result.get('success')}")
-                    self._process_interaction_result(result, target)
-                else:
-                    self._log("WARNING", "No result from interactionManager")
-            finally:
-                self._execute_interaction_interface("ao_stop")
+            result = self._run_executive_control(track_id, face_id, ss)
+            did_run_interaction = isinstance(result, dict)
+            if result:
+                self._log("INFO", f"talk: done ok={bool(result.get('success'))}")
+                self._process_interaction_result(result, target)
+            else:
+                self._log("WARNING", "talk: no result")
 
         except Exception as e:
-            self._log("ERROR", f"Interaction thread error: {e}")
-            import traceback; traceback.print_exc()
+            self._log("ERROR", f"talk err: {e}")
         finally:
+            duration_sec = max(0.0, time.time() - started_at)
+            final_state = result.get("final_state") if isinstance(result, dict) else None
+            abort_reason = result.get("abort_reason") if isinstance(result, dict) else None
+            exec_interaction_id = (
+                result.get("interaction_id") if isinstance(result, dict) else None
+            )
+            attempt = self.InteractionAttempt(
+                attempt_id=attempt_id,
+                track_id=track_id,
+                face_id=raw_face_id,
+                person_id=face_id,
+                start_ss=ss,
+                success=int(bool(result and result.get("success"))),
+                final_state=final_state,
+                abort_reason=abort_reason,
+                exec_interaction_id=exec_interaction_id,
+                duration_sec=duration_sec,
+            )
+            self._db_log("interaction_attempt", asdict(attempt))
             with self._interaction_lock:
                 with self.state_lock:
                     self.interaction_busy = False
                     self.selected_target = None
                     self.selected_bbox_last = None
-                    final_id = str(self.track_to_person.get(
-                        target.get("track_id", -1),
-                        target.get("face_id", "unknown")))
-                    cd_key = final_id if self._is_face_known(final_id) else f"unknown:{target.get('track_id', -1)}"
+                    final_id = str(
+                        self.track_to_person.get(
+                            target.get("track_id", -1), target.get("face_id", "unknown")
+                        )
+                    )
+                    cd_key = self._cooldown_key(final_id, target.get("track_id", -1))
                     if did_run_interaction:
                         self.last_interaction_time[cd_key] = time.time()
-            self._log("INFO", "--- INTERACTION COMPLETE ---")
+            self._log("INFO", "talk: end")
 
     def _prewarm_rpc_connections(self):
-        """Send a no-op ping to both RPC servers so TCP setup happens at startup
-        rather than on the first real interaction command."""
-        time.sleep(1.0)  # brief wait for servers to register
+        time.sleep(1.0)
         for attempt in range(5):
             try:
-                if (self.interaction_manager_rpc and
-                        self.interaction_manager_rpc.getOutputCount() > 0):
+                if (
+                    self.executive_control_rpc
+                    and self.executive_control_rpc.getOutputCount() > 0
+                ):
                     cmd = yarp.Bottle()
                     cmd.addString("status")
                     reply = yarp.Bottle()
-                    self.interaction_manager_rpc.write(cmd, reply)
-                    self._log("INFO", "InteractionManager RPC pre-warmed")
+                    self.executive_control_rpc.write(cmd, reply)
                     break
-            except Exception as e:
-                self._log("DEBUG", f"IM RPC pre-warm attempt {attempt + 1} failed: {e}")
+            except Exception:
                 time.sleep(2.0)
 
-        for attempt in range(5):
-            try:
-                if (self.interaction_interface_rpc and
-                        self.interaction_interface_rpc.getOutputCount() > 0):
-                    # interactionInterface doesn't have a status command — just open
-                    # the connection by calling getOutputCount(); TCP is established
-                    # when addOutput() was called, so the loop above already covers it.
-                    self._log("INFO", "InteractionInterface RPC pre-warmed")
-                    break
-            except Exception as e:
-                self._log("DEBUG", f"IF RPC pre-warm attempt {attempt + 1} failed: {e}")
-                time.sleep(2.0)
-
-    def _execute_interaction_interface(self, command: str) -> bool:
+    def _run_executive_control(
+        self, track_id: int, face_id: str, start_state: str
+    ) -> Optional[Dict]:
         try:
-            if self.interaction_interface_rpc.getOutputCount() == 0:
-                self._log("WARNING", "interactionInterface not connected")
-                return False
-            cmd = yarp.Bottle()
-            cmd.addString("exe")
-            cmd.addString(command)
-            reply = yarp.Bottle()
-            self.interaction_interface_rpc.write(cmd, reply)
-            return True
-        except Exception as e:
-            self._log("ERROR", f"interactionInterface exception: {e}")
-            return False
-
-    def _run_interaction_manager(self, track_id: int, face_id: str, start_state: str) -> Optional[Dict]:
-        try:
-            if self.interaction_manager_rpc.getOutputCount() == 0:
-                self._log("WARNING", "interactionManager not connected")
+            if self.executive_control_rpc.getOutputCount() == 0:
+                self._log("WARNING", "exec: not connected")
                 return None
             cmd = yarp.Bottle()
             cmd.addString("run")
@@ -919,33 +1278,40 @@ class FaceSelectorModule(yarp.RFModule):
             cmd.addString(face_id)
             cmd.addString(start_state)
             reply = yarp.Bottle()
-            self._log("INFO", "RPC → interactionManager (waiting...)")
-            if self.interaction_manager_rpc.write(cmd, reply):
+            self._log("INFO", "exec: run")
+            if self.executive_control_rpc.write(cmd, reply):
                 if reply.size() >= 2:
-                    status   = reply.get(0).asString()
+                    status = reply.get(0).asString()
                     json_str = reply.get(1).asString()
                     if status == "ok":
                         try:
                             parsed = json.loads(json_str)
-                            if isinstance(parsed, dict) and parsed.get("error") == "responsive_interaction_running":
-                                self._log("INFO", "interactionManager busy with responsive – skipping")
+                            if (
+                                isinstance(parsed, dict)
+                                and parsed.get("error")
+                                == "responsive_interaction_running"
+                            ):
+                                self._log(
+                                    "INFO",
+                                    "exec: busy, skip",
+                                )
                                 return None
                             return parsed
                         except json.JSONDecodeError as e:
-                            self._log("ERROR", f"RPC JSON parse failed: {e}")
+                            self._log("ERROR", f"exec json err: {e}")
             return None
         except Exception as e:
-            self._log("ERROR", f"interactionManager RPC error: {e}")
+            self._log("ERROR", f"exec rpc err: {e}")
             return None
 
-    def _interaction_manager_status(self) -> Optional[Dict]:
+    def _executive_control_status(self) -> Optional[Dict]:
         try:
-            if self.interaction_manager_rpc.getOutputCount() == 0:
+            if self.executive_control_rpc.getOutputCount() == 0:
                 return None
             cmd = yarp.Bottle()
             cmd.addString("status")
             reply = yarp.Bottle()
-            if not self.interaction_manager_rpc.write(cmd, reply):
+            if not self.executive_control_rpc.write(cmd, reply):
                 return None
             if reply.size() < 2:
                 return None
@@ -961,27 +1327,30 @@ class FaceSelectorModule(yarp.RFModule):
                 return data
             return None
         except Exception as e:
-            self._log("WARNING", f"interactionManager status check failed: {e}")
+            self._log("WARNING", f"executiveControl status check failed: {e}")
             return None
 
     def _process_interaction_result(self, result: Dict, target: Dict):
-        """Update greeted/talked state, LS, and cooldown from interaction result."""
         try:
-            extracted_name = result.get("name") if result.get("name_extracted") else None
+            extracted_name = (
+                result.get("name") if result.get("name_extracted") else None
+            )
             initial_ss = result.get("initial_state", "ss1")
-            final_ss   = result.get("final_state", initial_ss)
+            final_ss = result.get("final_state", initial_ss)
 
             greeted = final_ss in ("ss3", "ss4") and initial_ss != "ss4"
-            talked  = final_ss == "ss4"            and initial_ss != "ss4"
+            talked = final_ss == "ss4" and initial_ss != "ss4"
 
-            track_id  = target["track_id"]
-            person_id = str(target.get("person_id") or target.get("face_id") or "unknown")
+            track_id = target["track_id"]
+            person_id = str(
+                target.get("person_id") or target.get("face_id") or "unknown"
+            )
 
             if extracted_name:
                 person_id = str(extracted_name)
                 with self.state_lock:
                     self.last_interaction_time[f"unknown:{track_id}"] = time.time()
-                    self.last_interaction_time[person_id]               = time.time()
+                    self.last_interaction_time[person_id] = time.time()
 
             now_iso = datetime.now(self.TIMEZONE).isoformat()
 
@@ -996,85 +1365,83 @@ class FaceSelectorModule(yarp.RFModule):
 
             if greeted:
                 self._enqueue_save("greeted")
-                self._log("INFO", f"Greeted: '{person_id}'")
             if talked:
                 self._enqueue_save("talked")
-                self._log("INFO", f"Talked:  '{person_id}'")
 
-            delta = self._compute_reward(result, person_id)
-            self._log("INFO", f"Reward delta = {delta:+d}  ({person_id})")
-            self._update_learning_state(person_id, delta)
+            self._update_learning_weights(result, person_id)
 
             if initial_ss != final_ss:
-                self._db_log("ss_change", {
-                    "person_id": person_id, "old_ss": initial_ss, "new_ss": final_ss,
-                })
+                self._db_log(
+                    "ss_change",
+                    {
+                        "person_id": person_id,
+                        "old_ss": initial_ss,
+                        "new_ss": final_ss,
+                    },
+                )
 
         except Exception as e:
             self._log("ERROR", f"process_interaction_result failed: {e}")
-            import traceback; traceback.print_exc()
 
-    def _face_disappear_penalty(self, person_id: str) -> int:
-        now = time.time()
-        with self.state_lock:
-            events = self._disappear_events.get(person_id, [])
-            # Prune old events outside window
-            events = [ts for ts in events if now - ts <= self.DISAPPEAR_WINDOW_SEC]
-            events.append(now)
-            self._disappear_events[person_id] = events
+    def _update_learning_weights(self, result: Dict, person_id: str):
+        """Continuously shifts a person's personality weights based on success."""
+        if not self._is_face_known(person_id):
+            return
 
-            if len(events) >= self.DISAPPEAR_THRESHOLD:
-                return -2
-            return -1
-
-    def _compute_reward(self, result: Dict, person_id: Optional[str] = None) -> int:
-        """Compute reward delta from new compact format."""
         success = result.get("success", False)
         name_extracted = result.get("name_extracted", False)
         abort_reason = result.get("abort_reason")
 
+        weights = self._get_person_weights(person_id)
+        old_weights = dict(weights)
+        lr = self.WEIGHT_SHIFT_RATE
+
         if success:
-            return 2 if name_extracted else 1
-        
-        if abort_reason == "not_responded":
-            return -1
-        elif abort_reason == "face_disappeared":
-            if person_id:
-                return self._face_disappear_penalty(person_id)
-            else:
-                return -1
-            
-        return -1 # Default failure penalty
-
-    def _update_learning_state(self, person_id: str, delta: int):
-        if delta == 0:
-            return
-
-        with self._memory_lock:
-            current_ls = self.learning_data.get(person_id, {}).get("ls", self.LS1)
-
-        old_ls = current_ls
-        if delta > 0:
-            new_ls = min(3, current_ls + 1)
-        elif delta < 0:
-            new_ls = max(1, current_ls - 1)
+            shift = lr * (2.0 if name_extracted else 1.0)
+            weights["prox"] = min(1.0, weights["prox"] + shift)
+            weights["vel"] = min(1.0, weights["vel"] + shift)
+            weights["gaze"] = max(0.0, weights["gaze"] - (shift * 0.5))
+            outcome = "success"
+            reason = "name_extracted" if name_extracted else "success"
+            self._log(
+                "INFO", f"Success! '{person_id}' weights shifted towards Proactive."
+            )
         else:
-            new_ls = current_ls
+            shift = lr * (2.0 if abort_reason == "face_disappeared" else 1.0)
+            weights["prox"] = max(0.0, weights["prox"] - shift)
+            weights["vel"] = max(0.0, weights["vel"] - shift)
+            weights["gaze"] = min(1.0, weights["gaze"] + shift)
+            outcome = "failure"
+            reason = abort_reason or "failure"
+            self._log(
+                "INFO", f"Failure! '{person_id}' weights shifted towards Reactive."
+            )
 
         now_iso = datetime.now(self.TIMEZONE).isoformat()
         with self._memory_lock:
-            self.learning_data[person_id] = {"ls": new_ls, "updated_at": now_iso}
+            self.learning_data[person_id] = {"weights": weights, "updated_at": now_iso}
 
         self._enqueue_save("learning")
 
-        if new_ls != old_ls:
-            self._log("INFO", f"LS: '{person_id}' LS{old_ls} → LS{new_ls}")
-            self._db_log("ls_change", {
-                "person_id": person_id, "old_ls": old_ls,
-                "new_ls": new_ls, "reward_delta": delta,
-            })
-        else:
-            self._log("INFO", f"LS: '{person_id}' unchanged at LS{current_ls} (delta={delta:+d})")
+        delta = self.LearningDelta(
+            person_id=person_id,
+            reward_delta=shift if success else -shift,
+            outcome=outcome,
+            reason=reason,
+            success=int(bool(success)),
+            abort_reason=abort_reason,
+            name_extracted=int(bool(name_extracted)),
+            exec_interaction_id=result.get("interaction_id"),
+            old_prox=old_weights.get("prox"),
+            old_cent=old_weights.get("cent"),
+            old_vel=old_weights.get("vel"),
+            old_gaze=old_weights.get("gaze"),
+            new_prox=weights.get("prox"),
+            new_cent=weights.get("cent"),
+            new_vel=weights.get("vel"),
+            new_gaze=weights.get("gaze"),
+        )
+        self._db_log("learning_change", asdict(delta))
 
     # ==================== Last Greeted (fresh read) ====================
 
@@ -1085,7 +1452,9 @@ class FaceSelectorModule(yarp.RFModule):
                 with open(self.last_greeted_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 with self._last_greeted_lock:
-                    self._last_greeted_snapshot = self._normalize_last_greeted_snapshot(data)
+                    self._last_greeted_snapshot = self._normalize_last_greeted_snapshot(
+                        data
+                    )
             else:
                 with self._last_greeted_lock:
                     self._last_greeted_snapshot = {}
@@ -1123,7 +1492,9 @@ class FaceSelectorModule(yarp.RFModule):
 
             entry_ts = entry.get("timestamp")
             try:
-                ts = datetime.fromisoformat(entry_ts).timestamp() if entry_ts else min_ts
+                ts = (
+                    datetime.fromisoformat(entry_ts).timestamp() if entry_ts else min_ts
+                )
             except Exception:
                 ts = min_ts
 
@@ -1134,7 +1505,9 @@ class FaceSelectorModule(yarp.RFModule):
 
         return latest_by_person
 
-    def get_last_greeted_entry(self, person_id: str, track_id: Optional[int] = None) -> Optional[Dict]:
+    def get_last_greeted_entry(
+        self, person_id: str, track_id: Optional[int] = None
+    ) -> Optional[Dict]:
         """Get last greeted entry for a person from the snapshot."""
         with self._last_greeted_lock:
             entry = self._last_greeted_snapshot.get(person_id)
@@ -1149,21 +1522,18 @@ class FaceSelectorModule(yarp.RFModule):
     def _load_all_json_files(self):
         with self._memory_lock:
             self.greeted_today = self._load_json(self.greeted_path, {})
-            self.talked_today  = self._load_json(self.talked_path,  {})
-            learning_raw       = self._load_json(self.learning_path, {"people": {}})
+            self.talked_today = self._load_json(self.talked_path, {})
+            learning_raw = self._load_json(self.learning_path, {"people": {}})
             self.learning_data = learning_raw.get("people", {})
 
-            # Clamp LS values to [1, 3]
-            for pdata in self.learning_data.values():
-                if "ls" in pdata:
-                    pdata["ls"] = max(1, min(3, pdata["ls"]))
-
             self.greeted_today = self._prune_to_today(self.greeted_today)
-            self.talked_today  = self._prune_to_today(self.talked_today)
-        self._log("INFO",
+            self.talked_today = self._prune_to_today(self.talked_today)
+        self._log(
+            "INFO",
             f"Loaded – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
-            f"learning:{len(self.learning_data)}")
+            f"learning:{len(self.learning_data)}",
+        )
 
     def _reload_memory_from_disk_and_prune_today(self):
         """Re-read memory JSON files from disk and prune greeted/talked to today.
@@ -1171,20 +1541,18 @@ class FaceSelectorModule(yarp.RFModule):
         """
         with self._memory_lock:
             self.greeted_today = self._load_json(self.greeted_path, {})
-            self.talked_today  = self._load_json(self.talked_path,  {})
-            learning_raw       = self._load_json(self.learning_path, {"people": {}})
+            self.talked_today = self._load_json(self.talked_path, {})
+            learning_raw = self._load_json(self.learning_path, {"people": {}})
             self.learning_data = learning_raw.get("people", {})
 
-            for pdata in self.learning_data.values():
-                if "ls" in pdata:
-                    pdata["ls"] = max(1, min(3, pdata["ls"]))
-
             self.greeted_today = self._prune_to_today(self.greeted_today)
-            self.talked_today  = self._prune_to_today(self.talked_today)
-        self._log("INFO",
+            self.talked_today = self._prune_to_today(self.talked_today)
+        self._log(
+            "INFO",
             f"Day-change reload – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
-            f"learning:{len(self.learning_data)}")
+            f"learning:{len(self.learning_data)}",
+        )
 
     def _save_all_json_files(self):
         self._save_greeted_json()
@@ -1220,7 +1588,7 @@ class FaceSelectorModule(yarp.RFModule):
         with self._memory_lock:
             in_memory = dict(self.greeted_today)
         # Cross-process exclusive lock: read → merge → write atomically so that
-        # entries written by interactionManager's responsive path are never lost.
+        # entries written by executiveControl's responsive path are never lost.
         lock_path = str(self.greeted_path) + ".lock"
         with open(lock_path, "w") as _lf:
             fcntl.flock(_lf, fcntl.LOCK_EX)
@@ -1257,10 +1625,10 @@ class FaceSelectorModule(yarp.RFModule):
 
     def _enqueue_save(self, kind: str):
         """Enqueue a JSON save task for the background worker."""
-        self._io_queue.put(kind)
+        self._queue_put_drop_oldest(self._io_queue, kind, f"IO queue ({kind})")
 
     def _io_worker(self):
-        """Background thread draining IO save queue."""
+        """Drain async JSON save queue."""
         while True:
             try:
                 item = self._io_queue.get(timeout=1.0)
@@ -1284,34 +1652,141 @@ class FaceSelectorModule(yarp.RFModule):
 
     def _init_db(self):
         try:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute("""CREATE TABLE IF NOT EXISTS target_selections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT, track_id INTEGER, face_id TEXT,
-                person_id TEXT, bbox_area REAL, ss TEXT, ls INTEGER, eligible INTEGER,
+                person_id TEXT, bbox_area REAL, ips REAL,
+                ss TEXT, eligible INTEGER, context_label INTEGER, reason TEXT,
                 last_greeted_ts TEXT
             )""")
+
             c.execute("""CREATE TABLE IF NOT EXISTS ss_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT, person_id TEXT, old_ss TEXT, new_ss TEXT
             )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS ls_changes (
+            c.execute("""CREATE TABLE IF NOT EXISTS learning_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, person_id TEXT, old_ls INTEGER,
-                new_ls INTEGER, reward_delta INTEGER
+                timestamp TEXT,
+                person_id TEXT,
+                reward_delta REAL,
+                outcome TEXT,
+                reason TEXT,
+                success INTEGER,
+                abort_reason TEXT,
+                name_extracted INTEGER,
+                exec_interaction_id TEXT,
+                old_prox REAL,
+                old_cent REAL,
+                old_vel REAL,
+                old_gaze REAL,
+                new_prox REAL,
+                new_cent REAL,
+                new_vel REAL,
+                new_gaze REAL
             )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS interaction_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                attempt_id TEXT,
+                track_id INTEGER,
+                face_id TEXT,
+                person_id TEXT,
+                start_ss TEXT,
+                success INTEGER,
+                final_state TEXT,
+                abort_reason TEXT,
+                exec_interaction_id TEXT,
+                duration_sec REAL
+            )""")
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_target_selections_time ON target_selections(timestamp)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_target_selections_track ON target_selections(track_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_target_selections_person ON target_selections(person_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_time ON interaction_attempts(timestamp)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_exec_id ON interaction_attempts(exec_interaction_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learning_changes_time ON learning_changes(timestamp)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learning_changes_person ON learning_changes(person_id)"
+            )
+
+            self._ensure_learning_changes_columns(conn)
             conn.commit()
             conn.close()
             self._log("INFO", f"DB ready: {self.db_path}")
         except Exception as e:
             self._log("ERROR", f"DB init failed: {e}")
 
+    def _ensure_learning_changes_columns(self, conn: sqlite3.Connection):
+        """Add missing learning_changes columns for existing DBs."""
+        try:
+            rows = conn.execute("PRAGMA table_info(learning_changes)").fetchall()
+            existing = {r[1] for r in rows}
+            required = {
+                "outcome": "TEXT",
+                "reason": "TEXT",
+                "success": "INTEGER",
+                "abort_reason": "TEXT",
+                "name_extracted": "INTEGER",
+                "exec_interaction_id": "TEXT",
+                "old_prox": "REAL",
+                "old_cent": "REAL",
+                "old_vel": "REAL",
+                "old_gaze": "REAL",
+                "new_prox": "REAL",
+                "new_cent": "REAL",
+                "new_vel": "REAL",
+                "new_gaze": "REAL",
+            }
+            for col, typ in required.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE learning_changes ADD COLUMN {col} {typ}")
+        except Exception as e:
+            self._log("WARNING", f"learning_changes migration skipped: {e}")
+
     def _db_log(self, table: str, data: Dict):
         data["timestamp"] = datetime.now(self.TIMEZONE).isoformat()
-        self._db_queue.put((table, data))
+        self._queue_put_drop_oldest(
+            self._db_queue, (table, data), f"DB queue (table={table})"
+        )
+
+    def _queue_put_drop_oldest(self, q: queue.Queue, item: Any, label: str):
+        try:
+            q.put_nowait(item)
+            return
+        except queue.Full:
+            self._log("WARNING", f"{label} full, dropping oldest")
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            self._log("WARNING", f"{label} still full, dropping new item")
+
+    def _open_db_connection(self, timeout: float) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=timeout)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
 
     def _db_worker(self):
+        conn = None
         while True:
             try:
                 item = self._db_queue.get(timeout=1.0)
@@ -1323,28 +1798,95 @@ class FaceSelectorModule(yarp.RFModule):
                 break
             table, data = item
             try:
-                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                if conn is None:
+                    conn = self._open_db_connection(timeout=5.0)
                 c = conn.cursor()
                 if table == "target_selection":
                     c.execute(
-                        "INSERT INTO target_selections (timestamp,track_id,face_id,person_id,bbox_area,ss,ls,eligible,last_greeted_ts) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (data["timestamp"], data["track_id"], data["face_id"],
-                         data["person_id"], data["bbox_area"], data["ss"],
-                         data["ls"], int(data["eligible"]),
-                         data.get("last_greeted_ts")))
+                        "INSERT INTO target_selections (timestamp,track_id,face_id,person_id,bbox_area,ips,ss,eligible,context_label,reason,last_greeted_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            data["timestamp"],
+                            data["track_id"],
+                            data["face_id"],
+                            data["person_id"],
+                            data["bbox_area"],
+                            data.get("ips"),
+                            data["ss"],
+                            int(data["eligible"]),
+                            data.get("context_label"),
+                            data.get("reason"),
+                            data.get("last_greeted_ts"),
+                        ),
+                    )
                 elif table == "ss_change":
                     c.execute(
                         "INSERT INTO ss_changes (timestamp,person_id,old_ss,new_ss) VALUES (?,?,?,?)",
-                        (data["timestamp"], data["person_id"], data["old_ss"], data["new_ss"]))
-                elif table == "ls_change":
+                        (
+                            data["timestamp"],
+                            data["person_id"],
+                            data["old_ss"],
+                            data["new_ss"],
+                        ),
+                    )
+                elif table == "learning_change":
                     c.execute(
-                        "INSERT INTO ls_changes (timestamp,person_id,old_ls,new_ls,reward_delta) VALUES (?,?,?,?,?)",
-                        (data["timestamp"], data["person_id"], data["old_ls"],
-                         data["new_ls"], data["reward_delta"]))
+                        """INSERT INTO learning_changes
+                        (timestamp,person_id,reward_delta,outcome,reason,success,abort_reason,
+                         name_extracted,exec_interaction_id,
+                         old_prox,old_cent,old_vel,old_gaze,
+                         new_prox,new_cent,new_vel,new_gaze)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            data["timestamp"],
+                            data["person_id"],
+                            data["reward_delta"],
+                            data.get("outcome"),
+                            data.get("reason"),
+                            data.get("success"),
+                            data.get("abort_reason"),
+                            data.get("name_extracted"),
+                            data.get("exec_interaction_id"),
+                            data.get("old_prox"),
+                            data.get("old_cent"),
+                            data.get("old_vel"),
+                            data.get("old_gaze"),
+                            data.get("new_prox"),
+                            data.get("new_cent"),
+                            data.get("new_vel"),
+                            data.get("new_gaze"),
+                        ),
+                    )
+                elif table == "interaction_attempt":
+                    c.execute(
+                        "INSERT INTO interaction_attempts (timestamp,attempt_id,track_id,face_id,person_id,start_ss,success,final_state,abort_reason,exec_interaction_id,duration_sec) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            data["timestamp"],
+                            data.get("attempt_id"),
+                            data.get("track_id"),
+                            data.get("face_id"),
+                            data.get("person_id"),
+                            data.get("start_ss"),
+                            int(data.get("success", 0)),
+                            data.get("final_state"),
+                            data.get("abort_reason"),
+                            data.get("exec_interaction_id"),
+                            data.get("duration_sec"),
+                        ),
+                    )
                 conn.commit()
-                conn.close()
             except Exception as e:
                 self._log("ERROR", f"DB write failed ({table}): {e}")
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # ==================== Debug Output ====================
 
@@ -1386,20 +1928,20 @@ if __name__ == "__main__":
         print("[ERROR] YARP network not available – start yarpserver first.")
         sys.exit(1)
 
-    module = FaceSelectorModule()
+    module = SalienceNetworkModule()
     rf = yarp.ResourceFinder()
     rf.setVerbose(False)
     rf.setDefaultContext("alwaysOn")
     rf.configure(sys.argv)
 
     print("=" * 55)
-    print(" FaceSelectorModule – Biggest-BBox Face Selection")
+    print(" SalienceNetworkModule – Adaptive IPS Face Selection")
     print("=" * 55)
     print(" ss1=unknown  ss2=known/not-greeted")
     print(" ss3=known/greeted/no-talk  ss4=ultimate")
     print()
-    print(" yarp connect /alwayson/vision/landmarks:o /faceSelector/landmarks:i")
-    print(" yarp connect /alwayson/vision/img:o       /faceSelector/img:i")
+    print(" yarp connect /alwayson/vision/landmarks:o /alwayson/salienceNetwork/landmarks:i")
+    print(" yarp connect /alwayson/salienceNetwork/targetCmd:o /alwayson/vision/targetCmd:i")
     print("=" * 55)
 
     try:

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-telegram_bot.py — Always-on iCub Telegram Bot (YARP RFModule)
+chatBot.py — Always-on iCub Telegram Bot (YARP RFModule)
 
 YARP:
-  yarp connect /interactionManager/hunger:o /telegramBot/hunger:i
+  yarp connect /alwayson/executiveControl/hunger:o /alwayson/chatBot/hunger:i
 
 RPC:
-  echo 'status'         | yarp rpc /telegramBot/rpc
-  echo 'set_hs HS3'     | yarp rpc /telegramBot/rpc
-  echo 'reload_prompts' | yarp rpc /telegramBot/rpc
+  echo 'status'         | yarp rpc /chatBot/rpc
+  echo 'set_hs HS3'     | yarp rpc /chatBot/rpc
+  echo 'reload_prompts' | yarp rpc /chatBot/rpc
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from openai import AzureOpenAI, APIConnectionError, APITimeoutError, RateLimitEr
 import yarp
 
 
-class TelegramBotModule(yarp.RFModule):
+class ChatBotModule(yarp.RFModule):
     # ------------------------- Tunables -------------------------
     MODULE_HZ: float = 10.0
 
@@ -55,7 +55,7 @@ class TelegramBotModule(yarp.RFModule):
     JOKE_CANDIDATE_TTL_SEC: int = 30 * 24 * 3600  # expire unconfirmed joke candidates after 30 days
     JOKE_CANDIDATE_MAX: int = 20  # max pending candidates per user
 
-    DB_FILENAME: str = "telegram_bot.db"
+    DB_FILENAME: str = "chat_bot.db"
     PROMPTS_FILENAME: str = "prompts.json"
     USER_MEMORY_FILENAME: str = "user_memory.json"
 
@@ -78,7 +78,8 @@ class TelegramBotModule(yarp.RFModule):
         super().__init__()
 
         self._script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.module_name = "telegramBot"
+        self._alwayson_dir = os.path.dirname(self._script_dir)
+        self.module_name = "chatBot"
         self._running = True
         self._closed = False
 
@@ -94,7 +95,7 @@ class TelegramBotModule(yarp.RFModule):
         self._stale_warned: bool = False
 
         # Prompts
-        self._prompts_path: str = os.path.join(self._script_dir, self.PROMPTS_FILENAME)
+        self._prompts_path: str = os.path.join(self._alwayson_dir, self.PROMPTS_FILENAME)
         self._prompts: Dict[str, Any] = {}
 
         # Telegram
@@ -123,8 +124,8 @@ class TelegramBotModule(yarp.RFModule):
                 self.module_name = rf.find("name").asString().lstrip("/")
             self.setName(self.module_name)
 
-            load_dotenv(os.path.join(self._script_dir, "memory", "llm.env"), override=False)
-            load_dotenv(os.path.join(self._script_dir, ".env"), override=False)
+            load_dotenv(os.path.join(self._alwayson_dir, "memory", "llm.env"), override=False)
+            load_dotenv(os.path.join(self._alwayson_dir, ".env"), override=False)
 
             if rf.check("prompts"):
                 self._prompts_path = rf.find("prompts").asString()
@@ -132,7 +133,7 @@ class TelegramBotModule(yarp.RFModule):
 
             # YARP ports
             self._hunger_port = yarp.BufferedPortBottle()
-            if not self._hunger_port.open(f"/{self.module_name}/hunger:i"):
+            if not self._hunger_port.open(f"/alwayson/{self.module_name}/hunger:i"):
                 self._log("ERROR", "Cannot open hunger port")
                 return False
 
@@ -143,7 +144,7 @@ class TelegramBotModule(yarp.RFModule):
             self.attach(self._rpc_port)
 
             # DB
-            db_path = os.path.join(self._script_dir, "memory", self.DB_FILENAME)
+            db_path = os.path.join(self._alwayson_dir, "memory", self.DB_FILENAME)
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             self._db = sqlite3.connect(db_path, check_same_thread=False)
             self._db.execute("PRAGMA journal_mode=WAL")
@@ -184,7 +185,7 @@ class TelegramBotModule(yarp.RFModule):
             self._tg_offset = int(self._db_get_meta("tg_offset", "0"))
 
             self._user_memory = self._load_user_memory()
-            json_path = os.path.join(self._script_dir, "memory", self.USER_MEMORY_FILENAME)
+            json_path = os.path.join(self._alwayson_dir, "memory", self.USER_MEMORY_FILENAME)
             if os.path.exists(json_path):
                 self._migrate_user_memory_from_json(json_path)
             self._log("INFO", f"User memory loaded ({len(self._user_memory)} users)")
@@ -194,7 +195,7 @@ class TelegramBotModule(yarp.RFModule):
 
             self._start_tg_thread()
             self._log("INFO", "Telegram polling started")
-            self._log("INFO", "TelegramBotModule ready")
+            self._log("INFO", "ChatBotModule ready")
             return True
 
         except Exception as exc:  # noqa: BLE001
@@ -369,7 +370,7 @@ class TelegramBotModule(yarp.RFModule):
     def _load_prompts(self) -> None:
         with open(self._prompts_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self._prompts = data.get("telegram_bot", data)
+        self._prompts = data.get("chat_bot", data)
         self._log("INFO", f"Prompts loaded: {self._prompts_path}")
 
     def _system_prompt(self, hs: str) -> str:
@@ -871,10 +872,7 @@ class TelegramBotModule(yarp.RFModule):
         record.setdefault("likes", [])
         record.setdefault("dislikes", [])
         record.setdefault("favorite_topics", [])
-        record.setdefault("relationship_style", "")
-        record.setdefault("inside_jokes", [])
-        record.setdefault("joke_candidates", {})  # phrase -> mention count; promoted to inside_jokes at 2+
-        record.setdefault("trust_level", "friend")
+        record.setdefault("inside_jokes", {})
         record.setdefault("first_talked", 0)
         record.setdefault("last_talked", 0)
         record.setdefault("last_personal_update", "")
@@ -883,6 +881,67 @@ class TelegramBotModule(yarp.RFModule):
             "message_length": "",
             "tone": "",
         })
+
+        # Normalize jokes memory into a single map:
+        # inside_jokes: phrase -> {"count": int, "last_seen": int}
+        # Supports migration from older layouts:
+        # - inside_jokes as list (confirmed jokes)
+        # - joke_candidates as separate map
+        jokes_raw = record.get("inside_jokes")
+        candidates_raw = record.pop("joke_candidates", None)
+        merged_jokes: Dict[str, Dict[str, int]] = {}
+
+        if isinstance(jokes_raw, dict):
+            for phrase, meta in jokes_raw.items():
+                if not isinstance(phrase, str) or not phrase.strip():
+                    continue
+                key = phrase.strip().lower()
+                if isinstance(meta, dict):
+                    count = int(meta.get("count", 1) or 1)
+                    last_seen = int(meta.get("last_seen", 0) or 0)
+                elif isinstance(meta, list):
+                    count = int(meta[0]) if len(meta) > 0 else 1
+                    last_seen = int(meta[1]) if len(meta) > 1 else 0
+                elif isinstance(meta, int):
+                    count, last_seen = int(meta), 0
+                else:
+                    count, last_seen = 1, 0
+                merged_jokes[key] = {
+                    "count": max(1, count),
+                    "last_seen": max(0, last_seen),
+                }
+        elif isinstance(jokes_raw, list):
+            for phrase in jokes_raw:
+                if isinstance(phrase, str) and phrase.strip():
+                    key = phrase.strip().lower()
+                    merged_jokes[key] = {"count": 2, "last_seen": 0}
+
+        if isinstance(candidates_raw, dict):
+            for phrase, meta in candidates_raw.items():
+                if not isinstance(phrase, str) or not phrase.strip():
+                    continue
+                key = phrase.strip().lower()
+                if isinstance(meta, list):
+                    count = int(meta[0]) if len(meta) > 0 else 1
+                    last_seen = int(meta[1]) if len(meta) > 1 else 0
+                elif isinstance(meta, int):
+                    count, last_seen = int(meta), 0
+                elif isinstance(meta, dict):
+                    count = int(meta.get("count", 1) or 1)
+                    last_seen = int(meta.get("last_seen", 0) or 0)
+                else:
+                    count, last_seen = 1, 0
+
+                prev = merged_jokes.get(key, {"count": 0, "last_seen": 0})
+                merged_jokes[key] = {
+                    "count": max(prev["count"], max(1, count)),
+                    "last_seen": max(prev["last_seen"], max(0, last_seen)),
+                }
+
+        # Drop removed keys if present in older records.
+        record.pop("relationship_style", None)
+        record.pop("trust_level", None)
+        record["inside_jokes"] = merged_jokes
         return record
 
     def _update_user_from_message(self, chat_id: int, msg: Dict[str, Any], user_text: str) -> None:
@@ -1093,21 +1152,6 @@ class TelegramBotModule(yarp.RFModule):
                     cs["tone"] = "playful"
                     changed = True
 
-            # --- Relationship style ---
-            if re.search(
-                r"\b(?:poor\s+i[Cc]ub|are\s+you\s+ok(?:ay)?|i'?l+\s+feed\s+you"
-                r"|i\s+wil+\s+feed\s+you|don'?t\s+worry(?:\s+about\s+it)?"
-                r"|hope\s+you'?re\s+ok(?:ay)?|is\s+someone\s+feeding\s+you"
-                r"|poor\s+(?:thing|baby|robot|lil|little)"
-                r"|i\s+wish\s+i\s+could\s+feed\s+you"
-                r"|(?:aw+|oh\s+no),?\s*(?:poor|are\s+you\s+ok)"
-                r"|take\s+care(?:\s+of\s+yourself)?|feel\s+better)\b",
-                norm, re.IGNORECASE,
-            ):
-                if record.get("relationship_style") != "protective":
-                    record["relationship_style"] = "protective"
-                    changed = True
-
             # --- Inside jokes ---
             # Catches explicit shared-memory references:
             # "remember when we/you X", "that's our joke/thing",
@@ -1129,80 +1173,38 @@ class TelegramBotModule(yarp.RFModule):
                 if raw_joke:
                     joke = self._clean_capture(raw_joke, max_len=80).lower()
                     if self._is_meaningful(joke, min_len=3):
-                        jokes: List[str] = record.setdefault("inside_jokes", [])
-                        candidates: Dict[str, Any] = record.setdefault("joke_candidates", {})
+                        jokes: Dict[str, Dict[str, int]] = record.setdefault("inside_jokes", {})
 
-                        # --- Migrate old int-valued candidates (count only) to [count, ts] ---
-                        for k, v in list(candidates.items()):
-                            if isinstance(v, int):
-                                candidates[k] = [v, now]
-
-                        # --- Prune expired candidates ---
-                        expired = [k for k, v in candidates.items()
-                                   if isinstance(v, list) and (now - v[1]) > self.JOKE_CANDIDATE_TTL_SEC]
+                        # prune stale entries
+                        expired = [
+                            k for k, v in jokes.items()
+                            if isinstance(v, dict)
+                            and int(v.get("last_seen", 0) or 0) > 0
+                            and (now - int(v.get("last_seen", 0))) > self.JOKE_CANDIDATE_TTL_SEC
+                        ]
                         for k in expired:
-                            del candidates[k]
+                            del jokes[k]
                         if expired:
                             changed = True
 
-                        # Only store as a confirmed inside joke after 2+ references
-                        if not any(joke in j or j in joke for j in jokes):
-                            existing_key = next(
-                                (k for k in candidates if joke in k or k in joke), None
-                            )
-                            if existing_key is not None:
-                                candidates[existing_key][0] += 1
-                                if candidates[existing_key][0] >= 2:
-                                    jokes.append(existing_key)
-                                    del candidates[existing_key]
-                                    if len(jokes) > 5:
-                                        jokes.pop(0)
-                                    changed = True
-                            else:
-                                # Enforce size cap: drop oldest candidate by first-seen timestamp
-                                if len(candidates) >= self.JOKE_CANDIDATE_MAX:
-                                    oldest = min(candidates, key=lambda k: candidates[k][1])
-                                    del candidates[oldest]
-                                candidates[joke] = [1, now]  # first mention — wait for recurrence
-                                changed = True
-
-            # --- Trust level ---
-            # Escalates from "friend" (default) to "close_friend" on
-            # explicit trust signals: confiding, complimenting closeness,
-            # sharing secrets, expressing deep comfort.
-            _TRUST_RANK = {"new": 0, "acquaintance": 1, "friend": 2, "close_friend": 3}
-            current_trust = record.get("trust_level", "friend")
-            if _TRUST_RANK.get(current_trust, 0) < _TRUST_RANK["close_friend"]:
-                if re.search(
-                    r"\b(?:"
-                    # Direct trust declarations
-                    r"i\s+(?:really\s+)?trust\s+you"
-                    r"|i\s+can\s+trust\s+you"
-                    r"|you'?re\s+(?:the\s+)?only\s+(?:one|person)\s+i\s+(?:can\s+)?(?:talk|open\s+up|vent)\s+to"
-                    # Feeling safe / comfortable
-                    r"|i\s+feel\s+(?:so\s+)?(?:comfortable|safe|at\s+ease)\s+(?:with\s+you|talking\s+to\s+you)"
-                    # Confiding — "I've never told anyone"
-                    r"|i'?ve\s+never\s+told\s+(?:anyone|anybody)(?:\s+(?:this|before|else))?"
-                    r"|nobody\s+(?:else\s+)?knows\s+(?:this|about\s+this)"
-                    # Secret sharing
-                    r"|(?:don'?t|pls\s+don'?t|please?\s+don'?t)\s+tell\s+(?:anyone|anybody)"
-                    r"|(?:this|it)\s+(?:is|stays?)\s+between\s+us"
-                    r"|keep\s+(?:this|it)\s+between\s+us"
-                    r"|(?:this\s+is|it'?s)\s+a\s+secret"
-                    # Deep closeness
-                    r"|you'?re\s+(?:my\s+)?(?:best|closest)\s+friend"
-                    r"|i\s+(?:can|could)\s+tell\s+you\s+(?:anything|everything)"
-                    r"|you\s+(?:really\s+)?(?:get|understand)\s+me"
-                    r"|(?:you'?re\s+)?the\s+only\s+(?:one|person)\s+(?:who|that)\s+(?:gets|understands)\s+me"
-                    # Emotional attachment
-                    r"|i\s+(?:really\s+)?(?:lo+ve|appreciate)\s+talking\s+to\s+you"
-                    r"|you\s+mean\s+(?:a\s+lot|so\s+much|everything)\s+to\s+me"
-                    r"|i\s+don'?t\s+know\s+what\s+i'?d\s+do\s+without\s+you"
-                    r")\b",
-                    norm, re.IGNORECASE,
-                ):
-                    record["trust_level"] = "close_friend"
-                    changed = True
+                        existing_key = next((k for k in jokes if joke in k or k in joke), None)
+                        if existing_key is not None:
+                            meta = jokes.get(existing_key, {})
+                            meta_count = int(meta.get("count", 1) or 1) + 1
+                            jokes[existing_key] = {
+                                "count": meta_count,
+                                "last_seen": now,
+                            }
+                            changed = True
+                        else:
+                            if len(jokes) >= self.JOKE_CANDIDATE_MAX:
+                                oldest = min(
+                                    jokes,
+                                    key=lambda k: int((jokes.get(k) or {}).get("last_seen", 0) or 0),
+                                )
+                                del jokes[oldest]
+                            jokes[joke] = {"count": 1, "last_seen": now}
+                            changed = True
 
         if changed:
             self._save_user_memory()
@@ -1247,21 +1249,26 @@ class TelegramBotModule(yarp.RFModule):
         if dislikes:
             parts.append(f"Dislikes: {', '.join(dislikes)}.")
 
-        rel_style = _safe_str(record.get("relationship_style"))
-        if rel_style:
-            parts.append(f"Relationship style: {rel_style}.")
-
         update = _safe_str(record.get("last_personal_update"), max_len=80)
         if update:
             parts.append(f"Recent personal update: {update}.")
 
-        jokes = _safe_list(record.get("inside_jokes"), max_items=3)
-        if jokes:
-            parts.append(f"Inside joke: {jokes[-1]}.")
-
-        trust = _safe_str(record.get("trust_level"))
-        if trust == "close_friend":
-            parts.append("Trust level: close friend.")
+        jokes_raw = record.get("inside_jokes")
+        jokes_confirmed: List[str] = []
+        if isinstance(jokes_raw, dict):
+            ranked = sorted(
+                (
+                    (phrase, meta)
+                    for phrase, meta in jokes_raw.items()
+                    if isinstance(phrase, str) and isinstance(meta, dict) and int(meta.get("count", 0) or 0) >= 2
+                ),
+                key=lambda item: int(item[1].get("last_seen", 0) or 0),
+            )
+            jokes_confirmed = [self._clean_capture(p, max_len=80) for p, _ in ranked if self._is_meaningful(p, min_len=3)]
+        elif isinstance(jokes_raw, list):  # backward-compatible read of older records
+            jokes_confirmed = _safe_list(jokes_raw, max_items=3)
+        if jokes_confirmed:
+            parts.append(f"Inside joke: {jokes_confirmed[-1]}.")
 
         cs = record.get("conversation_style")
         if not isinstance(cs, dict):
@@ -1563,7 +1570,7 @@ if __name__ == "__main__":
             print("ERROR: YARP network not available")
             raise SystemExit(1)
 
-        module = TelegramBotModule()
+        module = ChatBotModule()
         rf = yarp.ResourceFinder()
         rf.setVerbose(False)
         rf.configure(sys.argv)

@@ -1,4 +1,8 @@
+import os
 import sys
+import subprocess
+import threading
+import urllib.request
 import cv2
 import numpy as np
 import yarp
@@ -9,6 +13,9 @@ from collections import deque
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+import supervision as sv
+from ultralytics import YOLO
 
 import logging
 import colorlog
@@ -61,12 +68,15 @@ class VisionAnalyzer(yarp.RFModule):
         self.rate = 0.05
 
         self.img_in_port = yarp.BufferedPortImageRgb()              # Raw images
-        self.face_detection_port = yarp.BufferedPortBottle()        # FaceDetection detections
         self.vision_features_port = yarp.Port()                     # Output Features
         self.landmarks_port = yarp.Port()                           # Per-face detailed information
 
+        # --- Target command from salienceNetwork (lightweight: [track_id, ips_score]) ---
+        self.target_cmd_port = yarp.BufferedPortBottle()
+        # --- Target box output to FaceTracker (full bounding box bottle) ---
+        self.target_box_port = yarp.BufferedPortBottle()
+
         self.img_in_btl = yarp.ImageRgb()
-        self.face_detection_btl = yarp.Bottle()
         self.vision_features_btl = yarp.Bottle()
         self.landmarks_btl = yarp.Bottle()
 
@@ -96,7 +106,7 @@ class VisionAnalyzer(yarp.RFModule):
         self.max_face_match_distance = 100.0  # Max distance (pixels) for matching MediaPipe to bbox
 
         self.face_mesh = None
-        self.detected_faces = []  # Store face data from faceDetection (bbox, face_id)
+        self.detected_faces = []  # Store face data from YOLO/ByteTrack (bbox, face_id)
         
         # Talking detection based on lip motion
         self.mouth_motion_history = {}  # dict[track_id] -> deque of normalized mouth_open values
@@ -104,6 +114,481 @@ class VisionAnalyzer(yarp.RFModule):
         self.talking_threshold = 0.012  # Std threshold for mouth motion (tunable: increase to reduce false positives)
         self.last_seen_track = {}  # dict[track_id] -> timestamp for cleanup
         self.first_seen_track = {}  # dict[track_id] -> timestamp when first seen
+
+
+        self.default_face_model_url = (
+            "https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt"
+        )
+        self.default_face_model = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "yolov11n-face.pt",
+        )
+        self.yolo_model = None
+        self.byte_tracker = None
+        self.conf_threshold = 0.7
+        self.track = True
+        self.identify_faces = True
+        self.tolerance = 0.62
+        self.verbose = False
+        self.debug = False
+        self.identity_sticky_sec = 1.5
+        self.max_enroll_samples = 5
+        self.unknown_retry_interval_sec = 2.0
+        self.unknown_retry_max_attempts = 3
+
+        self.known_faces = {}
+        self.tracked_faces = {}
+        self.last_known_identity = {}  # dict[track_id] -> (name, confidence, timestamp)
+        self.unknown_retry_state = {}  # dict[track_id] -> (attempt_count, last_retry_ts)
+        self._face_identity_lock = threading.Lock()
+        self.objects = []
+        self.last_frame = None
+        self.faces_path = None
+
+        self.face_recognition_available = False
+        self.face_recognition = None
+        self.auto_download_model = True
+        self.fallback_models = ["yolov8n-face.pt"]
+        self._warned_non_face_model = False
+
+        # RPC port for face naming commands
+        self.handle_port = yarp.Port()
+        self.attach(self.handle_port)
+
+        # Annotated face detection image output
+        self.face_detection_img_port = yarp.BufferedPortImageRgb()
+        self.display_buf_image = yarp.ImageRgb()
+        self._display_rgb_buffer = None
+
+        # --- Target command state ---
+        self._current_target_track_id = -1
+        self._current_target_ips = 0.0
+
+        # QR state tracking (emit once per appearance)
+        self._active_qr_value = None
+        self._qr_missing_scans = 0
+        self._qr_lost_reset_scans = 3
+
+    # ==================== face identity methods ====================
+
+    def _pip_install(self, package: str) -> bool:
+        python_exec = sys.executable
+
+        print(f"[INFO] Installing {package} using {python_exec}")
+
+        try:
+            subprocess.run(
+                [python_exec, "-m", "pip", "install", package],
+                check=True,
+            )
+            return True
+        except Exception as err:
+            print(f"\033[93m[WARNING] Failed to install {package}: {err}\033[00m")
+            return False
+
+    def _install_face_recognition_stack(self, install_face_lib: bool, install_models: bool) -> bool:
+        ok = True
+
+        ok = self._pip_install("setuptools<70.0.0") and ok
+
+        if install_face_lib:
+            ok = self._pip_install("face-recognition") and ok
+
+        if install_models:
+            ok = self._pip_install("git+https://github.com/ageitgey/face_recognition_models") and ok
+
+        return ok
+
+    def _initialize_face_recognition(self):
+        error_text = ""
+        missing_models = False
+        missing_face_library = False
+
+        try:
+            import face_recognition as fr
+
+            self.face_recognition_available = True
+            self.face_recognition = fr
+            return
+        except (Exception, SystemExit) as err:
+            error_text = str(err) if err is not None else ""
+            err_lower = error_text.lower()
+            missing_models = isinstance(err, SystemExit) or (
+                "face_recognition_models" in err_lower
+            )
+            missing_face_library = (
+                "no module named 'face_recognition'" in err_lower
+                or "no module named \"face_recognition\"" in err_lower
+            )
+            self.face_recognition_available = False
+            print(f"\033[93m[WARNING] face_recognition unavailable: {error_text}\033[00m")
+
+        if not (missing_face_library or missing_models):
+            return
+
+        print("\033[93m[WARNING] Attempting auto-install for face recognition dependencies...\033[00m")
+
+        if not self._install_face_recognition_stack(
+            install_face_lib=missing_face_library,
+            install_models=missing_models or missing_face_library,
+        ):
+            return
+
+        try:
+            import face_recognition as fr
+
+            self.face_recognition_available = True
+            self.face_recognition = fr
+            print("[INFO] face_recognition_models installed successfully")
+        except (Exception, SystemExit) as err:
+            self.face_recognition_available = False
+            print(f"\033[93m[WARNING] face_recognition still unavailable after install: {err}\033[00m")
+
+    def _resolve_model_path(self, model_path: str):
+        candidates = []
+
+        if os.path.isabs(model_path):
+            candidates.append(model_path)
+        else:
+            current_script_folder = os.path.dirname(os.path.abspath(__file__))
+            candidates.extend(
+                [
+                    model_path,
+                    os.path.join(current_script_folder, model_path),
+                    os.path.join(current_script_folder, "model", model_path),
+                    os.path.join(os.getcwd(), model_path),
+                ]
+            )
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+
+        return None
+
+    def _build_model_candidates(self, model_path: str, fallback_models_cfg: str):
+        candidates = [model_path]
+
+        if fallback_models_cfg:
+            fallback_models = [m.strip() for m in fallback_models_cfg.split(",") if m.strip()]
+            for fallback in fallback_models:
+                if fallback not in candidates:
+                    candidates.append(fallback)
+
+        return candidates
+
+    def _filter_face_detections(self, detections, names):
+        if len(detections) == 0 or detections.class_id is None:
+            return detections
+
+        face_class_ids = []
+        if isinstance(names, dict):
+            face_class_ids = [class_id for class_id, label in names.items() if str(label).lower() == "face"]
+        elif isinstance(names, list):
+            face_class_ids = [idx for idx, label in enumerate(names) if str(label).lower() == "face"]
+
+        if not face_class_ids:
+            if not self._warned_non_face_model:
+                print(
+                    "\033[93m[WARNING] Loaded model has no 'face' class label. "
+                    "Dropping all detections to enforce face-only output. "
+                    "Use a face model for valid face boxes.\033[00m"
+                )
+                self._warned_non_face_model = True
+            return detections[np.zeros(len(detections), dtype=bool)]
+
+        return detections[np.isin(detections.class_id, face_class_ids)]
+
+    def _initialize_yolo_model(self, model_candidates):
+        last_error = None
+        perception_dir = os.path.dirname(os.path.abspath(__file__))
+
+        for candidate in model_candidates:
+            resolved_path = self._resolve_model_path(candidate)
+
+            if (
+                resolved_path is None
+                and os.path.isabs(candidate)
+                and candidate == self.default_face_model
+                and self.auto_download_model
+            ):
+                if self._download_default_face_model(candidate):
+                    resolved_path = candidate
+
+            if resolved_path is None and self.auto_download_model:
+                candidate_basename = os.path.basename(candidate)
+                if candidate.startswith("http://") or candidate.startswith("https://"):
+                    local_candidate = os.path.join(perception_dir, candidate_basename)
+                    if self._download_default_face_model(local_candidate):
+                        resolved_path = local_candidate
+                elif candidate_basename == os.path.basename(self.default_face_model):
+                    local_candidate = os.path.join(perception_dir, candidate_basename)
+                    if self._download_default_face_model(local_candidate):
+                        resolved_path = local_candidate
+
+            if resolved_path is not None:
+                model_source = resolved_path
+            else:
+                print(
+                    "\033[93m[WARNING] Model candidate not found locally and remote loading is disabled: "
+                    f"{candidate}\033[00m"
+                )
+                continue
+
+            try:
+                self.yolo_model = YOLO(model_source)
+                print(f"[INFO] Loaded YOLO model: {resolved_path}")
+                return True
+            except Exception as err:
+                last_error = err
+                print(
+                    f"\033[93m[WARNING] Failed to load model candidate {candidate}: {err}\033[00m"
+                )
+
+        candidates_text = ", ".join(model_candidates)
+        print(
+            "\033[91m[ERROR] Could not load any YOLO model candidate: "
+            f"{candidates_text}\033[00m"
+        )
+        if last_error is not None:
+            print(f"\033[91m[ERROR] Last YOLO load error: {last_error}\033[00m")
+        return False
+
+    def _download_default_face_model(self, local_path: str) -> bool:
+        try:
+            parent_dir = os.path.dirname(local_path)
+            os.makedirs(parent_dir, exist_ok=True)
+            print(f"[INFO] Downloading default face model to: {local_path}")
+            urllib.request.urlretrieve(self.default_face_model_url, local_path)
+            return True
+        except Exception as err:
+            print(
+                "\033[93m[WARNING] Failed to download default face model to "
+                f"{local_path}: {err}\033[00m"
+            )
+            return False
+
+    def _load_known_faces(self, faces_path: str):
+        database = {}
+        if not os.path.exists(faces_path):
+            print(f"\033[93m[WARNING] Faces folder does not exist: {faces_path}\033[00m")
+            return database
+
+        for filename in sorted(os.listdir(faces_path)):
+            if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            file_path = os.path.join(faces_path, filename)
+            person_name = os.path.splitext(filename)[0]
+            if person_name in database:
+                print(
+                    f"\033[93m[WARNING] Duplicate face identity basename '{person_name}' in {faces_path}. "
+                    f"Keeping first file and skipping {filename}.\033[00m"
+                )
+                continue
+            image = self.face_recognition.load_image_file(file_path)
+            encoding = self.face_recognition.face_encodings(image, model="large")
+            if len(encoding) > 0:
+                database[person_name] = [encoding[0]]
+
+        return database
+
+    def _compare_embeddings(self, frame_bgr, box):
+        if not self.face_recognition_available:
+            return "unknown", 0.0
+
+        x1, y1, x2, y2 = [int(v) for v in box]
+        h, w = frame_bgr.shape[:2]
+
+        x1 = max(0, min(x1, w))
+        y1 = max(0, min(y1, h))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            return "recognizing", 0.0
+
+        cropped_frame = frame_bgr[y1:y2, x1:x2]
+        if cropped_frame.size == 0:
+            return "recognizing", 0.0
+
+        cropped_rgb = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2RGB)
+        unknown_encoding = self.face_recognition.face_encodings(
+            np.array(cropped_rgb), model="large"
+        )
+        if len(unknown_encoding) == 0:
+            return "recognizing", 0.0
+
+        with self._face_identity_lock:
+            known_faces_snapshot = {
+                name: samples[:] if isinstance(samples, list) else samples
+                for name, samples in self.known_faces.items()
+            }
+
+        if not known_faces_snapshot:
+            return "unknown", 0.0
+
+        unknown_encoding = unknown_encoding[0]
+        best_name = None
+        best_effective_distance = float("inf")
+
+        for name, stored_samples in known_faces_snapshot.items():
+            if isinstance(stored_samples, np.ndarray):
+                sample_list = [stored_samples]
+            elif isinstance(stored_samples, list):
+                sample_list = stored_samples
+            else:
+                continue
+
+            if len(sample_list) == 0:
+                continue
+
+            sample_arr = np.array(sample_list)
+            distances = self.face_recognition.face_distance(sample_arr, unknown_encoding)
+            if len(distances) == 0:
+                continue
+
+            min_distance = float(np.min(distances))
+            median_distance = float(np.median(distances))
+            effective_distance = 0.5 * (min_distance + median_distance)
+
+            # Gate by best sample, rank by min+median robustness.
+            if min_distance <= self.tolerance and effective_distance < best_effective_distance:
+                best_effective_distance = effective_distance
+                best_name = name
+
+        if best_name is not None:
+            confidence = 1.0 - best_effective_distance
+            return best_name, confidence
+
+        return "unknown", 0.0
+
+    def _handle_face_naming(self, command, reply):
+        """Handle runtime face naming command: name <person_name> id <track_id>."""
+        reply.clear()
+
+        if command.size() != 4:
+            reply.addString("nack")
+            reply.addString("Usage: name <person_name> id <track_id>")
+            return
+
+        if command.get(0).asString() != "name" or command.get(2).asString() != "id":
+            reply.addString("nack")
+            reply.addString("Usage: name <person_name> id <track_id>")
+            return
+
+        if not self.track:
+            reply.addString("nack")
+            reply.addString("Face naming requires --track true")
+            return
+
+        if not self.identify_faces:
+            reply.addString("nack")
+            reply.addString("Face naming requires --identify_faces true")
+            return
+
+        if not self.face_recognition_available:
+            reply.addString("nack")
+            reply.addString("face_recognition library is not available")
+            return
+
+        if self.last_frame is None:
+            reply.addString("nack")
+            reply.addString("No frame available yet")
+            return
+
+        person_name = command.get(1).asString()
+        track_id = command.get(3).asInt32()
+
+        target_obj = None
+        for obj in self.objects:
+            if "track_id" in obj and obj["track_id"] == track_id:
+                target_obj = obj
+                break
+
+        if target_obj is None:
+            reply.addString("nack")
+            reply.addString(f"Track ID {track_id} not found in current detections")
+            return
+
+        box = target_obj["box"]
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+
+        h, w = self.last_frame.shape[:2]
+        x1 = max(0, min(x1, w))
+        y1 = max(0, min(y1, h))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            reply.addString("nack")
+            reply.addString("Invalid bounding box")
+            return
+
+        face_crop = self.last_frame[y1:y2, x1:x2]
+        if face_crop.size == 0:
+            reply.addString("nack")
+            reply.addString("Empty face crop")
+            return
+
+        if self.faces_path is None:
+            reply.addString("nack")
+            reply.addString("Faces path is not configured")
+            return
+
+        os.makedirs(self.faces_path, exist_ok=True)
+        face_path = os.path.join(self.faces_path, f"{person_name}.jpg")
+        cv2.imwrite(face_path, face_crop)
+
+        face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        encoding = self.face_recognition.face_encodings(face_crop_rgb, model="large")
+
+        if len(encoding) == 0:
+            reply.addString("nack")
+            reply.addString("Could not extract face encoding from crop")
+            return
+
+        with self._face_identity_lock:
+            existing_samples = self.known_faces.get(person_name)
+            if existing_samples is None:
+                self.known_faces[person_name] = [encoding[0]]
+            elif isinstance(existing_samples, list):
+                existing_samples.append(encoding[0])
+                if len(existing_samples) > self.max_enroll_samples:
+                    existing_samples = existing_samples[-self.max_enroll_samples:]
+                self.known_faces[person_name] = existing_samples
+            else:
+                self.known_faces[person_name] = [existing_samples, encoding[0]][-self.max_enroll_samples:]
+
+            self.tracked_faces[track_id] = (person_name, 1.0)
+            self.last_known_identity[track_id] = (person_name, 1.0, time.time())
+
+        reply.addString("ok")
+        reply.addString(face_path)
+
+    def respond(self, command, reply):
+        reply.clear()
+        if command.get(0).asString() == "quit":
+            reply.addString("quitting")
+            return False
+        if command.get(0).asString() == "process":
+            if command.size() < 2:
+                reply.addString("nack")
+                reply.addString("Usage: process on/off")
+                return True
+            # process flag not used in merged module, but keep for compat
+            reply.addString("ok")
+            return True
+        if command.get(0).asString() == "name":
+            self._handle_face_naming(command, reply)
+            return True
+        if command.get(0).asString() == "help":
+            reply.addString("Commands: quit | process on/off | name <person_name> id <track_id>")
+            return True
+
+        reply.addString("nack")
+        return True
+
+    # ==================== Original VisionAnalyzer methods ====================
 
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         self.name = rf.check("name", yarp.Value(self.name)).asString()
@@ -125,9 +610,10 @@ class VisionAnalyzer(yarp.RFModule):
         print(f"MODEL FULL PATH: {model_full_path}")
 
         self.img_in_port.open(f'/{self.name}/img:i')
-        self.face_detection_port.open(f'/{self.name}/recognition:i')
         self.vision_features_port.open(f'/{self.name}/features:o')
         self.landmarks_port.open(f'/{self.name}/landmarks:o')
+        self.target_cmd_port.open(f'/{self.name}/targetCmd:i')
+        self.target_box_port.open(f'/{self.name}/targetBox:o')
 
         self.input_img_array = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
 
@@ -149,7 +635,71 @@ class VisionAnalyzer(yarp.RFModule):
 
         self.face_mesh = vision.FaceLandmarker.create_from_options(options)
 
-        self.logger.info("Start processing video")
+        # --- face identity init ---
+        self.conf_threshold = rf.check("conf_threshold", yarp.Value(0.7)).asFloat32()
+        self.track = rf.check("track", yarp.Value(True)).asBool()
+        self.identify_faces = rf.check("identify_faces", yarp.Value(True)).asBool()
+        self.tolerance = rf.check("id_tolerance", yarp.Value(0.62)).asFloat32()
+        self.identity_sticky_sec = rf.check("identity_sticky_sec", yarp.Value(1.5)).asFloat64()
+        self.max_enroll_samples = rf.check("id_enroll_samples", yarp.Value(5)).asInt64()
+        self.unknown_retry_interval_sec = rf.check("unknown_retry_interval_sec", yarp.Value(1.0)).asFloat64()
+        self.unknown_retry_max_attempts = rf.check("unknown_retry_max_attempts", yarp.Value(3)).asInt64()
+        self.verbose = rf.check("verbose_yolo", yarp.Value(False)).asBool()
+        self.debug = rf.check("debug", yarp.Value(False)).asBool()
+        self.auto_download_model = rf.check("auto_download_model", yarp.Value(True)).asBool()
+
+        current_script_folder = os.path.dirname(os.path.abspath(__file__))
+        default_faces_path = os.path.abspath(
+            os.path.join(current_script_folder, "faces")
+        )
+        faces_path = rf.check("faces_path", yarp.Value(default_faces_path)).asString()
+        self.faces_path = faces_path
+
+        yolo_model_path = rf.check("yolo_model", yarp.Value(self.default_face_model)).asString()
+        fallback_models_cfg = rf.check(
+            "fallback_models",
+            yarp.Value(",".join(self.fallback_models)),
+        ).asString()
+        model_candidates = self._build_model_candidates(yolo_model_path, fallback_models_cfg)
+
+        self._initialize_face_recognition()
+
+        if not self._initialize_yolo_model(model_candidates):
+            return False
+
+        if self.track:
+            self.byte_tracker = sv.ByteTrack(
+                track_activation_threshold=self.conf_threshold,
+                lost_track_buffer=120,
+            )
+
+        if self.identify_faces:
+            if not self.face_recognition_available:
+                print("\033[93m[WARNING] identify_faces requested but face_recognition is unavailable\033[00m")
+            else:
+                self.known_faces = self._load_known_faces(faces_path)
+                print(
+                    f"[INFO] Face ID enabled with {len(self.known_faces)} identities from {faces_path}"
+                )
+
+        # RPC port for face naming
+        rpc_name = rf.check("rpc_name", yarp.Value(f"{self.name}/rpc")).asString()
+        self.handle_port.open("/" + rpc_name)
+
+        # Annotated face detection image output
+        self.face_detection_img_port.open(f'/{self.name}/faces_view:o')
+        self.display_buf_image.resize(self.img_width, self.img_height)
+
+        self.qr_detector = cv2.QRCodeDetector()
+        self.qr_port = yarp.BufferedPortBottle()
+        self.qr_port.open(f'/{self.name}/qr:o')
+        self._qr_seen_frames = 0
+        self._qr_lost_reset_scans = rf.check(
+            "qr_lost_reset_scans",
+            yarp.Value(3),
+        ).asInt64()
+
+        self.logger.info("Start processing video (vision monolith)")
         return True
 
     def getPeriod(self):
@@ -160,15 +710,22 @@ class VisionAnalyzer(yarp.RFModule):
         self.landmarks_btl.clear()
         has_features_subscriber = self.vision_features_port.getOutputCount() > 0
         has_landmarks_subscriber = self.landmarks_port.getOutputCount() > 0
+        has_target_subscriber = self.target_box_port.getOutputCount() > 0
+        has_view_subscriber = self.face_detection_img_port.getOutputCount() > 0
+        has_qr_subscriber = self.qr_port.getOutputCount() > 0
 
-        if has_features_subscriber or has_landmarks_subscriber:
+        if has_features_subscriber or has_landmarks_subscriber or has_target_subscriber or has_view_subscriber or has_qr_subscriber:
             self.img_in_btl = self.img_in_port.read(shouldWait=True)
             if self.img_in_btl:
                 self.image = self.__img_yarp_to_cv(self.img_in_btl)
-                self.detect_people_obj()        # Count how many people and objects in the scene
+                if has_qr_subscriber:
+                    self.detect_qr_codes()
+                self.detect_people_obj()        # Run YOLO/ByteTrack directly on self.image
                 self.detect_mutual_gaze()       # Count # people looking at the camera and publish per-face details
                 self.detect_light()             # Extract from a HSV space, the V component of the image
                 self.detect_motion()            # Only presence (no magnitude or orientation)
+                if has_view_subscriber:
+                    self.draw_and_publish_faces_view()
             self.timestamp = datetime.now().timestamp()
 
             if has_features_subscriber:
@@ -178,91 +735,369 @@ class VisionAnalyzer(yarp.RFModule):
             if has_landmarks_subscriber:
                 self.landmarks_port.write(self.landmarks_btl)
 
+        # --- Target delegation: read command from salienceNetwork, stream bbox to FaceTracker ---
+        self._handle_target_command()
+
         return True
 
+    def detect_qr_codes(self):
+        """Throttled QR code detector using OpenCV."""
+        if self.image is None:
+            return
+            
+        # Throttling to save CPU: only check 1 in 10 frames
+        self._qr_seen_frames += 1
+        if self._qr_seen_frames % 10 != 0:
+            return
+
+        gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+        raw_val, pts, _ = self.qr_detector.detectAndDecode(gray)
+
+        # No valid QR in this sampled frame: count misses and clear active state
+        # after a small hysteresis window to avoid flicker-triggered re-emits.
+        if not raw_val:
+            self._qr_missing_scans += 1
+            if self._qr_missing_scans >= self._qr_lost_reset_scans:
+                self._active_qr_value = None
+            return
+
+        if raw_val:
+            val = raw_val.strip().upper()
+            if val:
+                # QR is visible in this sampled frame, reset miss counter.
+                self._qr_missing_scans = 0
+
+                # Already active in view: suppress repeats.
+                if val == self._active_qr_value:
+                    return
+
+                btl = self.qr_port.prepare()
+                btl.clear()
+                btl.addString(val)
+                self.qr_port.write()
+                self._active_qr_value = val
+
     def detect_people_obj(self):
-        # Input from faceDetection: nested bottle structure
-        # Outer bottle contains N lists, each list is one detection:
-        # ((class face) (score ...) (track_id 1) (box (... ... ... ...)) (face_id nima) ...)
-        # ((class face) ...)
-        init = time.time()
-        # Always read the latest data from faceDetection
-        self.face_detection_btl = self.face_detection_port.read(shouldWait=False)
-        if self.face_detection_btl:
-            # Clear and rebuild with fresh data
-            self.detected_faces = []
-            num_faces = 0
-            
-            # Iterate through outer bottle (each element is a detection)
-            for i in range(self.face_detection_btl.size()):
-                det = self.face_detection_btl.get(i).asList()
-                if not det:
-                    continue
-                
-                # Initialize extraction variables
-                class_name = ""
-                track_id = -1
-                face_id = "unknown"
-                detection_score = 0.0
-                id_confidence = 0.0
-                x1, y1, x2, y2 = 0.0, 0.0, 0.0, 0.0
-                
-                # Iterate through fields in this detection
-                # Each field is itself a list like (class face), (track_id 1), (box x1 y1 x2 y2), etc.
-                for j in range(det.size()):
-                    field = det.get(j).asList()
-                    if not field or field.size() < 2:
-                        continue
-                    
-                    key = field.get(0).asString()
-                    
-                    if key == "class":
-                        class_name = field.get(1).asString()
-                    elif key == "track_id":
-                        track_id = field.get(1).asInt32()
-                    elif key == "face_id":
-                        face_id = field.get(1).asString()
-                    elif key == "score":
-                        detection_score = field.get(1).asFloat64()
-                    elif key == "id_confidence":
-                        id_confidence = field.get(1).asFloat64()
-                    elif key == "box":
-                        # box format: (box (x1 y1 x2 y2))
-                        box_list = field.get(1).asList()
-                        if box_list and box_list.size() >= 4:
-                            x1 = box_list.get(0).asFloat64()
-                            y1 = box_list.get(1).asFloat64()
-                            x2 = box_list.get(2).asFloat64()
-                            y2 = box_list.get(3).asFloat64()
-                
-                # Only process face detections with sufficient detection confidence
-                if class_name == "face" and detection_score > 0.5:
-                    num_faces += 1
-                    
-                    # Convert to (x, y, w, h) format
-                    x = x1
-                    y = y1
-                    w = x2 - x1
-                    h = y2 - y1
-                    
-                    # Store face info for matching with MediaPipe
-                    self.detected_faces.append({
-                        'face_id': face_id,
-                        'track_id': track_id,
-                        'bbox': (x, y, w, h),
-                        'detection_score': detection_score,
-                        'id_confidence': id_confidence
-                    })
-            
-            # Update face count immediately when we receive valid data
-            self.env_dict["Faces"] = num_faces
-            self.faces_sync_info = time.time()
+        """Run YOLO face detection + ByteTrack + face_recognition directly on self.image."""
+        if self.image is None or self.yolo_model is None:
+            return
+
+        # Convert to BGR for YOLO (self.image is already BGR from __img_yarp_to_cv)
+        frame = self.image.copy()
+        self.last_frame = frame.copy()
+        current_time = time.time()
+
+        result = self.yolo_model(frame, verbose=self.verbose)[0]
+        detections = sv.Detections.from_ultralytics(result)
+
+        if self.conf_threshold:
+            detections = detections[detections.confidence > self.conf_threshold]
+
+        detections = self._filter_face_detections(detections, result.names)
+
+        # Expand bounding boxes for face crops
+        if len(detections) > 0:
+            xyxy = detections.xyxy
+            widths = xyxy[:, 2] - xyxy[:, 0]
+            heights = xyxy[:, 3] - xyxy[:, 1]
+
+            # 10% expansion per side
+            expand_w = widths * 0.10
+            expand_h = heights * 0.10
+
+            xyxy[:, 0] -= expand_w
+            xyxy[:, 1] -= expand_h
+            xyxy[:, 2] += expand_w
+            xyxy[:, 3] += expand_h
+
+            xyxy[:, 0] = np.maximum(xyxy[:, 0], 0)
+            xyxy[:, 1] = np.maximum(xyxy[:, 1], 0)
+            xyxy[:, 2] = np.minimum(xyxy[:, 2], frame.shape[1])
+            xyxy[:, 3] = np.minimum(xyxy[:, 3], frame.shape[0])
+
+            detections.xyxy = xyxy
+
+        if self.track and len(detections) > 0:
+            detections = self.byte_tracker.update_with_detections(detections)
+
+        labels = [result.names[class_id] for class_id in detections.class_id] if len(detections) > 0 else []
+
+        if self.identify_faces and self.track and len(detections) > 0 and detections.tracker_id is not None:
+            current_ids = set(detections.tracker_id)
+            with self._face_identity_lock:
+                lost_ids = [tid for tid in list(self.tracked_faces.keys()) if tid not in current_ids]
+                for tid in lost_ids:
+                    cached_entry = self.tracked_faces.get(tid)
+                    if cached_entry is not None:
+                        cached_name, cached_conf = cached_entry
+                        if cached_name not in ("recognizing", "unknown"):
+                            self.last_known_identity[tid] = (cached_name, float(cached_conf), current_time)
+                    del self.tracked_faces[tid]
+                    if tid in self.unknown_retry_state:
+                        del self.unknown_retry_state[tid]
+
+                stale_ids = [
+                    tid
+                    for tid, (_, _, ts) in self.last_known_identity.items()
+                    if current_time - ts > self.identity_sticky_sec
+                ]
+                for tid in stale_ids:
+                    del self.last_known_identity[tid]
+
+            for tid, box in zip(detections.tracker_id, detections.xyxy):
+                with self._face_identity_lock:
+                    tracked_entry = self.tracked_faces.get(tid)
+
+                if tracked_entry is None:
+                    face_id, id_conf = self._compare_embeddings(frame, box)
+                    if face_id in ("unknown", "recognizing"):
+                        with self._face_identity_lock:
+                            sticky_entry = self.last_known_identity.get(tid)
+                        if sticky_entry is not None:
+                            sticky_name, sticky_conf, sticky_ts = sticky_entry
+                            if current_time - sticky_ts <= self.identity_sticky_sec:
+                                face_id, id_conf = sticky_name, sticky_conf
+
+                    with self._face_identity_lock:
+                        if face_id in ("unknown", "recognizing"):
+                            # Publish unknown while retrying in the background on a timer.
+                            self.tracked_faces[tid] = ("unknown", 0.0)
+                            self.unknown_retry_state[tid] = (1, current_time)
+                        else:
+                            self.tracked_faces[tid] = (face_id, id_conf)
+                            self.last_known_identity[tid] = (face_id, float(id_conf), current_time)
+                            if tid in self.unknown_retry_state:
+                                del self.unknown_retry_state[tid]
+                else:
+                    cached_name, retry_meta = tracked_entry
+                    if cached_name in ("recognizing", "unknown"):
+                        with self._face_identity_lock:
+                            attempts, last_try_ts = self.unknown_retry_state.get(tid, (0, 0.0))
+
+                        should_retry = (
+                            attempts < self.unknown_retry_max_attempts
+                            and (current_time - last_try_ts) >= self.unknown_retry_interval_sec
+                        )
+
+                        if should_retry:
+                            face_id, id_conf = self._compare_embeddings(frame, box)
+
+                            if face_id in ("unknown", "recognizing"):
+                                with self._face_identity_lock:
+                                    self.tracked_faces[tid] = ("unknown", 0.0)
+                                    self.unknown_retry_state[tid] = (attempts + 1, current_time)
+                            else:
+                                with self._face_identity_lock:
+                                    self.tracked_faces[tid] = (face_id, id_conf)
+                                    self.last_known_identity[tid] = (face_id, float(id_conf), current_time)
+                                    if tid in self.unknown_retry_state:
+                                        del self.unknown_retry_state[tid]
+                        else:
+                            # Keep publishing unknown, without transient recognizing labels.
+                            with self._face_identity_lock:
+                                self.tracked_faces[tid] = ("unknown", 0.0)
+                    elif cached_name != "unknown":
+                        with self._face_identity_lock:
+                            self.last_known_identity[tid] = (cached_name, float(retry_meta), current_time)
+
+        objects = []
+        for i in range(len(detections)):
+            obj = {
+                "class": labels[i],
+                "score": float(detections.confidence[i]),
+                "box": detections.xyxy[i].tolist(),
+            }
+
+            if self.track and detections.tracker_id is not None:
+                track_id = detections.tracker_id[i]
+                if track_id is not None:
+                    obj["track_id"] = int(track_id)
+                    with self._face_identity_lock:
+                        tracked_entry = self.tracked_faces.get(track_id)
+                    if self.identify_faces and tracked_entry is not None:
+                        face_id, id_conf = tracked_entry
+                        obj["face_id"] = face_id
+                        obj["id_confidence"] = float(id_conf)
+
+            objects.append(obj)
+
+        self.objects = objects
+
+        # Populate self.detected_faces for MediaPipe matching (same format as before)
+        self.detected_faces = []
+        num_faces = 0
+
+        for obj in objects:
+            if obj["class"] == "face" and obj["score"] > 0.5:
+                num_faces += 1
+                box = obj["box"]
+                x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
+                x = x1
+                y = y1
+                w = x2 - x1
+                h = y2 - y1
+
+                self.detected_faces.append({
+                    'face_id': obj.get('face_id', 'unknown'),
+                    'track_id': obj.get('track_id', -1),
+                    'bbox': (x, y, w, h),
+                    'detection_score': obj['score'],
+                    'id_confidence': obj.get('id_confidence', 0.0)
+                })
+
+        self.env_dict["Faces"] = num_faces
+        self.faces_sync_info = time.time()
+
+        # Save detections and labels for drawing later (after MediaPipe fields are computed)
+        self.current_detections = detections
+        self.current_labels = labels
+
+    def draw_and_publish_faces_view(self):
+        if self.face_detection_img_port.getOutputCount() == 0 or self.last_frame is None:
+            return
+
+        frame = self.last_frame.copy()
+        detections = getattr(self, 'current_detections', None)
+        labels = getattr(self, 'current_labels', [])
+
+        if detections is None:
+            self._write_annotated_image(frame)
+            return
+
+        display_labels = labels.copy()
+        if self.track and len(detections) > 0 and detections.tracker_id is not None:
+            display_labels = []
+            for label, track_id in zip(labels, detections.tracker_id):
+                name_str = label
+                if self.identify_faces:
+                    with self._face_identity_lock:
+                        tracked_entry = self.tracked_faces.get(track_id)
+                    if tracked_entry is not None:
+                        face_id, _ = tracked_entry
+                        if face_id != "recognizing":
+                            name_str = str(face_id)
+                        else:
+                            name_str = "recognizing..."
+
+                # Fetch MediaPipe attrs from self.detected_faces
+                attn_str = ""
+                dist_str = ""
+                zone_str = ""
+                for fd in self.detected_faces:
+                    if fd.get('track_id') == track_id:
+                        attn_str = fd.get('attention', '')
+                        dist_str = fd.get('distance', '')
+                        zone_str = fd.get('zone', '')
+                        break
+
+                # Build custom string (name | attention | distance | zone)
+                full_label = f"id:{int(track_id)} | {name_str}"
+                if attn_str and attn_str != "UNKNOWN":
+                    full_label += f" | {attn_str}"
+                if dist_str and dist_str != "UNKNOWN":
+                    full_label += f" | {dist_str}"
+                if zone_str and zone_str != "UNKNOWN":
+                    full_label += f" | {zone_str}"
+
+                display_labels.append(full_label)
+
+        if len(detections) > 0:
+            box_annotator = sv.BoxAnnotator()
+            label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_LEFT)
+            annotated_image = box_annotator.annotate(scene=frame, detections=detections)
+            annotated_image = label_annotator.annotate(
+                scene=annotated_image,
+                detections=detections,
+                labels=display_labels,
+            )
         else:
-            # sync with faceDetection; if no info comes for >0.5s, set faces=0
-            if (time.time() - self.faces_sync_info) > 0.5:
-                if self.env_dict["Faces"] != 0:
-                    self.env_dict["Faces"] = 0
-                    self.detected_faces = []
+            annotated_image = frame
+
+        self._write_annotated_image(annotated_image)
+
+    def _write_annotated_image(self, annotated_image_bgr):
+        annotated_rgb = cv2.cvtColor(annotated_image_bgr, cv2.COLOR_BGR2RGB)
+        h, w = annotated_rgb.shape[:2]
+        self._display_rgb_buffer = np.ascontiguousarray(annotated_rgb)
+        self.display_buf_image = self.face_detection_img_port.prepare()
+        self.display_buf_image.resize(w, h)
+        self.display_buf_image.setExternal(
+            self._display_rgb_buffer.data,
+            w,
+            h,
+        )
+        self.face_detection_img_port.write()
+
+    # ==================== Target Command Handling ====================
+
+    def _handle_target_command(self):
+        """Read lightweight [track_id, ips_score] from salienceNetwork, find bbox, stream to FaceTracker."""
+        # Drain queue to get the freshest command (eliminate lag if commands buffer)
+        while True:
+            cmd_btl = self.target_cmd_port.read(shouldWait=False)
+            if not cmd_btl:
+                break
+            if cmd_btl.size() >= 2:
+                self._current_target_track_id = cmd_btl.get(0).asInt32()
+                self._current_target_ips = cmd_btl.get(1).asFloat64()
+
+        # If no valid target, do nothing
+        if self._current_target_track_id < 0:
+            return
+
+        if self.target_box_port.getOutputCount() == 0:
+            return
+
+        # Find the matching bbox in self.detected_faces
+        target_face = None
+        for face_data in self.detected_faces:
+            if face_data['track_id'] == self._current_target_track_id:
+                target_face = face_data
+                break
+
+        if target_face is None:
+            return
+
+        # Construct the exact YARP Bottle format used by the old salienceNetwork:
+        # ((class face) (score <ips_score>) (box (<xmin> <ymin> <xmax> <ymax>)))
+        x, y, w, h = target_face['bbox']
+        x_min, y_min = float(x), float(y)
+        x_max, y_max = float(x + w), float(y + h)
+
+        bottle = self.target_box_port.prepare()
+        bottle.clear()
+
+        obj_bottle = yarp.Bottle()
+
+        # 1. ("class" "face")
+        class_btl = yarp.Bottle()
+        class_btl.addString("class")
+        class_btl.addString("face")
+        obj_bottle.addList().read(class_btl)
+
+        # 2. ("score" ips)
+        score_btl = yarp.Bottle()
+        score_btl.addString("score")
+        score_btl.addFloat64(self._current_target_ips)
+        obj_bottle.addList().read(score_btl)
+
+        # 3. ("box" (xmin ymin xmax ymax))
+        box_btl = yarp.Bottle()
+        box_btl.addString("box")
+        coords_btl = yarp.Bottle()
+        coords_btl.addFloat64(x_min)
+        coords_btl.addFloat64(y_min)
+        coords_btl.addFloat64(x_max)
+        coords_btl.addFloat64(y_max)
+
+        box_btl.addList().read(coords_btl)
+        obj_bottle.addList().read(box_btl)
+
+        bottle.addList().read(obj_bottle)
+
+        self.target_box_port.write()
+
+    # ==================== Original methods (unchanged) ====================
 
     def detect_light(self):
         if self.image.mean() != 0.0:
@@ -342,7 +1177,7 @@ class VisionAnalyzer(yarp.RFModule):
                 cos_angle = np.dot(face_forward, camera_forward)
 
                 # Determine attention state based on cos_angle
-                if cos_angle > 0.95:
+                if cos_angle > 0.90:
                     attention = "MUTUAL_GAZE"
                     self.env_dict["MutualGaze"] += 1
                 elif cos_angle > 0.7:
@@ -350,7 +1185,7 @@ class VisionAnalyzer(yarp.RFModule):
                 else:
                     attention = "AWAY"
 
-                # Match MediaPipe detection with faceDetection face (one-to-one)
+                # Match MediaPipe detection with face identity footprint
                 matched_face = self._match_face_to_bbox(face_center_x, face_center_y, matched_track_ids)
                 
                 # Mark this face as matched to prevent duplicate assignments
@@ -405,7 +1240,7 @@ class VisionAnalyzer(yarp.RFModule):
                 # Publish per-face landmarks data
                 self._publish_landmarks(matched_face, face_forward, pitch, yaw, roll, cos_angle, attention, is_talking, time_in_view)
         
-        # Publish data for faces detected by faceDetection but not matched by MediaPipe
+        # Publish data for faces detected by identity tracker but not matched by MediaPipe
         # (e.g., faces too small for landmark detection)
         for face_data in self.detected_faces:
             if face_data['track_id'] not in matched_track_ids:
@@ -540,6 +1375,7 @@ class VisionAnalyzer(yarp.RFModule):
             # Add zone
             face_btl.addString("zone")
             face_btl.addString(zone)
+            face_data['zone'] = zone
             
             # Determine distance based on face bbox height
             # Normalized height relative to default image height
@@ -557,6 +1393,9 @@ class VisionAnalyzer(yarp.RFModule):
             # Add distance
             face_btl.addString("distance")
             face_btl.addString(distance)
+            
+            face_data['distance'] = distance
+            face_data['attention'] = attention
         else:
             # Unmatched face - use default/null values for all fields
             face_btl.addString("face_id")
@@ -621,6 +1460,9 @@ class VisionAnalyzer(yarp.RFModule):
         img = np.frombuffer(self.input_img_array, dtype=np.uint8).reshape(
             (self.img_height, self.img_width, 3)).copy()
 
+        # YARP BufferedPortImageRgb provides RGB; normalize internal pipeline to BGR.
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
         if self.img_width != self.default_width or self.img_height != self.default_height:
             img = cv2.resize(img, (self.default_width, self.default_height))
 
@@ -677,17 +1519,23 @@ class VisionAnalyzer(yarp.RFModule):
     def interruptModule(self):
         print("stopping the module \n")
         self.img_in_port.interrupt()
-        self.face_detection_port.interrupt()
         self.vision_features_port.interrupt()
         self.landmarks_port.interrupt()
+        self.target_cmd_port.interrupt()
+        self.target_box_port.interrupt()
+        self.handle_port.interrupt()
+        self.face_detection_img_port.interrupt()
         return True
 
     def close(self):
         print("closing the module \n")
         self.img_in_port.close()
-        self.face_detection_port.close()
         self.vision_features_port.close()
         self.landmarks_port.close()
+        self.target_cmd_port.close()
+        self.target_box_port.close()
+        self.handle_port.close()
+        self.face_detection_img_port.close()
         return True
 
 
