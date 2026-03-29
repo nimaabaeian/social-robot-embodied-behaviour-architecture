@@ -15,6 +15,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import math
+from zoneinfo import ZoneInfo
 
 try:
     import yarp
@@ -22,10 +23,7 @@ except ImportError:
     print("[ERROR] YARP Python bindings required.")
     sys.exit(1)
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
+
 
 
 class SalienceNetworkModule(yarp.RFModule):
@@ -99,7 +97,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
     HABITUATION_LAMBDA = 0.05  # Habituation decay
-    WEIGHT_SHIFT_RATE = 0.05  # How much weights drift per interaction (+/-)
+    WEIGHT_SHIFT_RATE = 0.15  # How much weights drift per interaction (+/-)
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15
     DB_QUEUE_MAXSIZE = 1024
@@ -174,7 +172,10 @@ class SalienceNetworkModule(yarp.RFModule):
         self.cooldown_lively: float = 3.0
         self.cooldown_calm: float = 15.0
         self.cooldown_default: float = 5.0
-        self.min_track_ips: float = 0.6
+        self.min_track_ips: float = 0.9
+        self.track_stop_hysteresis: float = 0.1
+        self.track_stop_debounce_sec: float = 2.0
+        self._below_track_threshold_since: float = 0.0
         self.exec_rpc_retry_sec: float = 1.0
 
         self.current_context_label: int = -1
@@ -204,6 +205,9 @@ class SalienceNetworkModule(yarp.RFModule):
         self._last_target_key: Tuple[int, str, str] = (-2, "", "")
         self._last_sent_track_id: int = -99999
         self._last_sent_ips: float = -1.0
+        self._last_sent_target_ts: float = 0.0
+        self.target_cmd_keepalive_sec: float = 0.5
+        self._vision_cmd_was_connected: bool = False
         self._next_exec_rpc_try_ts: float = 0.0
         self._exec_rpc_offline_logged: bool = False
         self._last_target_log_key: Tuple[int, str, str, int] = (-2, "", "", -1)
@@ -254,6 +258,18 @@ class SalienceNetworkModule(yarp.RFModule):
                 )
             if rf.check("min_track_ips"):
                 self.min_track_ips = max(0.0, rf.find("min_track_ips").asFloat64())
+            if rf.check("track_stop_hysteresis"):
+                self.track_stop_hysteresis = max(
+                    0.0, rf.find("track_stop_hysteresis").asFloat64()
+                )
+            if rf.check("track_stop_debounce_sec"):
+                self.track_stop_debounce_sec = max(
+                    0.0, rf.find("track_stop_debounce_sec").asFloat64()
+                )
+            if rf.check("target_cmd_keepalive_sec"):
+                self.target_cmd_keepalive_sec = max(
+                    0.1, rf.find("target_cmd_keepalive_sec").asFloat64()
+                )
             if rf.check("exec_rpc_retry_sec"):
                 self.exec_rpc_retry_sec = max(
                     0.1, rf.find("exec_rpc_retry_sec").asFloat64()
@@ -616,14 +632,60 @@ class SalienceNetworkModule(yarp.RFModule):
                         target_to_look_at = best_face
 
                     should_track = False
+                    now_track = time.time()
+                    current_sent_track_id = self._last_sent_track_id
                     if target_to_look_at is not None:
                         if override_tid >= 0:
+                            self._below_track_threshold_since = 0.0
                             should_track = True
                         elif self.interaction_busy:
+                            self._below_track_threshold_since = 0.0
                             should_track = True
                         else:
+                            target_track_id = int(target_to_look_at.get("track_id", -1))
                             target_ips = float(target_to_look_at.get("ips", 0.0))
-                            should_track = target_ips >= self.min_track_ips
+                            same_as_current = (
+                                current_sent_track_id >= 0
+                                and target_track_id == current_sent_track_id
+                            )
+                            stop_threshold = max(
+                                0.0, self.min_track_ips - self.track_stop_hysteresis
+                            )
+                            threshold = (
+                                stop_threshold if same_as_current else self.min_track_ips
+                            )
+                            if target_ips >= threshold:
+                                self._below_track_threshold_since = 0.0
+                                should_track = True
+                            elif same_as_current and self.track_stop_debounce_sec > 0.0:
+                                if self._below_track_threshold_since <= 0.0:
+                                    self._below_track_threshold_since = now_track
+                                should_track = (
+                                    (now_track - self._below_track_threshold_since)
+                                    < self.track_stop_debounce_sec
+                                )
+                            else:
+                                self._below_track_threshold_since = 0.0
+                                should_track = False
+                    else:
+                        # If target briefly vanishes, debounce stop while holding last track.
+                        if (
+                            current_sent_track_id >= 0
+                            and self.track_stop_debounce_sec > 0.0
+                        ):
+                            if self._below_track_threshold_since <= 0.0:
+                                self._below_track_threshold_since = now_track
+                            should_track = (
+                                (now_track - self._below_track_threshold_since)
+                                < self.track_stop_debounce_sec
+                            )
+                            if should_track:
+                                target_to_look_at = {
+                                    "track_id": current_sent_track_id,
+                                    "ips": float(self._last_sent_ips),
+                                }
+                        else:
+                            self._below_track_threshold_since = 0.0
 
                     command_target = target_to_look_at if should_track else None
 
@@ -979,10 +1041,38 @@ class SalienceNetworkModule(yarp.RFModule):
             face["social_state"] = self._compute_social_state(
                 is_known, greeted_today, talked_today
             )
-            face["ips"] = self._calculate_ips(face, person_id)
-            face["eligible"] = self._is_eligible(face)
+            face["ips"] = self._calculate_ips(face, person_id, apply_habituation=False)
 
             new_area_history[track_id] = self._bbox_area(face)
+
+        # Apply habituation decay only when:
+        # 1) no interaction is ongoing,
+        # 2) there is more than one face,
+        # 3) at least one face has higher IPS than the current tracked target.
+        if (not self.interaction_busy) and len(faces) > 1:
+            current_track_id = self.current_target_track_id
+            current_face = next(
+                (f for f in faces if int(f.get("track_id", -1)) == current_track_id),
+                None,
+            )
+            if current_face is not None:
+                current_ips = float(current_face.get("ips", 0.0))
+                has_higher_competitor = any(
+                    int(f.get("track_id", -1)) != current_track_id
+                    and float(f.get("ips", 0.0)) > current_ips
+                    for f in faces
+                )
+                if has_higher_competitor:
+                    person_id = str(
+                        current_face.get(
+                            "person_id", current_face.get("face_id", "unknown")
+                        )
+                    )
+                    decay = self._habituation_multiplier(current_face, person_id)
+                    current_face["ips"] = float(current_face.get("ips", 0.0)) * decay
+
+        for face in faces:
+            face["eligible"] = self._is_eligible(face)
 
         active = {f["track_id"] for f in faces if f.get("track_id", -1) >= 0}
         self.track_to_person = {
@@ -1088,8 +1178,10 @@ class SalienceNetworkModule(yarp.RFModule):
 
         return {"prox": s_prox, "cent": s_cent, "vel": s_vel, "gaze": s_gaze}
 
-    def _calculate_ips(self, face: Dict[str, Any], person_id: str) -> float:
-        """Calculates final IPS using personal weights and Habituation Decay."""
+    def _calculate_ips(
+        self, face: Dict[str, Any], person_id: str, apply_habituation: bool = True
+    ) -> float:
+        """Calculates IPS using personal weights and optional Habituation Decay."""
         vars_norm = self._calculate_ips_variables(face)
         weights = self._get_person_weights(person_id)
 
@@ -1101,18 +1193,9 @@ class SalienceNetworkModule(yarp.RFModule):
             + weights["gaze"] * vars_norm["gaze"]
         )
 
-        # Habituation (e^-lambda * t_idle)
-        time_in_view = face.get("time_in_view", 0.0)
-        cd_key = self._cooldown_key(person_id, face.get("track_id", -1))
-        last_int_time = self.last_interaction_time.get(cd_key, 0)
-
-        time_since_int = (
-            time.time() - last_int_time if last_int_time > 0 else float("inf")
-        )
-        t_idle = min(time_in_view, time_since_int)
-
-        habituation_multiplier = math.exp(-self.HABITUATION_LAMBDA * t_idle)
-        ips = base_ips * habituation_multiplier
+        ips = base_ips
+        if apply_habituation:
+            ips *= self._habituation_multiplier(face, person_id)
 
         # Hysteresis Bonus
         if (
@@ -1122,6 +1205,18 @@ class SalienceNetworkModule(yarp.RFModule):
             ips += self.IPS_HYSTERESIS_BONUS
 
         return ips
+
+    def _habituation_multiplier(self, face: Dict[str, Any], person_id: str) -> float:
+        """Compute habituation multiplier e^(-lambda * t_idle)."""
+        time_in_view = face.get("time_in_view", 0.0)
+        cd_key = self._cooldown_key(person_id, face.get("track_id", -1))
+        last_int_time = self.last_interaction_time.get(cd_key, 0)
+
+        time_since_int = (
+            time.time() - last_int_time if last_int_time > 0 else float("inf")
+        )
+        t_idle = min(time_in_view, time_since_int)
+        return math.exp(-self.HABITUATION_LAMBDA * t_idle)
 
     # ==================== Face Selection (Best IPS) ====================
 
@@ -1157,8 +1252,18 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def _send_target_to_facetracker(self, face: Optional[Dict[str, Any]]):
         """Send target command [track_id, ips] to vision."""
+        now = time.time()
         if self.vision_cmd_port.getOutputCount() == 0:
+            # If downstream reconnects later, force the next command to be resent.
+            self._vision_cmd_was_connected = False
+            self._last_sent_track_id = -99999
+            self._last_sent_target_ts = 0.0
             return
+
+        if not self._vision_cmd_was_connected:
+            self._vision_cmd_was_connected = True
+            self._last_sent_track_id = -99999
+            self._last_sent_target_ts = 0.0
 
         if face is None:
             track_id = -1
@@ -1167,8 +1272,14 @@ class SalienceNetworkModule(yarp.RFModule):
             track_id = int(face.get("track_id", -1))
             ips = float(face.get("ips", 0.0))
 
-        # Event-driven output: only on start/stop/switch.
-        if track_id == self._last_sent_track_id:
+        # Event-driven output with keepalive resend to avoid missed downstream events.
+        same_track = track_id == self._last_sent_track_id
+        keepalive_due = (
+            same_track
+            and track_id >= 0
+            and (now - self._last_sent_target_ts) >= self.target_cmd_keepalive_sec
+        )
+        if same_track and not keepalive_due:
             return
 
         bottle = self.vision_cmd_port.prepare()
@@ -1179,6 +1290,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self._last_sent_track_id = track_id
         self._last_sent_ips = ips
+        self._last_sent_target_ts = now
 
         if track_id >= 0:
             self._log("INFO", f"track: start t{track_id} ips={ips:.2f}")
