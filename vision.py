@@ -716,6 +716,12 @@ class VisionAnalyzer(yarp.RFModule):
 
         if has_features_subscriber or has_landmarks_subscriber or has_target_subscriber or has_view_subscriber or has_qr_subscriber:
             self.img_in_btl = self.img_in_port.read(shouldWait=True)
+            # Drain backlog and keep only the freshest frame to reduce display lag/stutter.
+            while True:
+                newest = self.img_in_port.read(shouldWait=False)
+                if newest is None:
+                    break
+                self.img_in_btl = newest
             if self.img_in_btl:
                 self.image = self.__img_yarp_to_cv(self.img_in_btl)
                 if has_qr_subscriber:
@@ -1018,7 +1024,17 @@ class VisionAnalyzer(yarp.RFModule):
     def _write_annotated_image(self, annotated_image_bgr):
         annotated_rgb = cv2.cvtColor(annotated_image_bgr, cv2.COLOR_BGR2RGB)
         h, w = annotated_rgb.shape[:2]
-        self._display_rgb_buffer = np.ascontiguousarray(annotated_rgb)
+
+        # Keep a persistent backing buffer for setExternal to avoid pointer churn/flicker.
+        if (
+            self._display_rgb_buffer is None
+            or self._display_rgb_buffer.shape[0] != h
+            or self._display_rgb_buffer.shape[1] != w
+        ):
+            self._display_rgb_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+
+        np.copyto(self._display_rgb_buffer, annotated_rgb)
+
         self.display_buf_image = self.face_detection_img_port.prepare()
         self.display_buf_image.resize(w, h)
         self.display_buf_image.setExternal(
@@ -1469,13 +1485,14 @@ class VisionAnalyzer(yarp.RFModule):
         return img
 
     def opt_flow_add_img(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if len(self.opt_flow_buf) < 2:
             # Add new frame to the right part of the queue
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             self.opt_flow_buf.append(frame)
         else:
             # Remove oldest element at the beginning of the queue
             self.opt_flow_buf.popleft()
+            self.opt_flow_buf.append(frame)
 
     def detect_motion(self):
         if len(self.opt_flow_buf) == 2:
