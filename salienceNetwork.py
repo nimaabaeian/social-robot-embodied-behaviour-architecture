@@ -1047,8 +1047,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
         # Apply habituation decay only when:
         # 1) no interaction is ongoing,
-        # 2) there is more than one face,
-        # 3) at least one face has higher IPS than the current tracked target.
+        # 2) there is more than one face visible.
         if (not self.interaction_busy) and len(faces) > 1:
             current_track_id = self.current_target_track_id
             current_face = next(
@@ -1056,20 +1055,13 @@ class SalienceNetworkModule(yarp.RFModule):
                 None,
             )
             if current_face is not None:
-                current_ips = float(current_face.get("ips", 0.0))
-                has_higher_competitor = any(
-                    int(f.get("track_id", -1)) != current_track_id
-                    and float(f.get("ips", 0.0)) > current_ips
-                    for f in faces
-                )
-                if has_higher_competitor:
-                    person_id = str(
-                        current_face.get(
-                            "person_id", current_face.get("face_id", "unknown")
-                        )
+                person_id = str(
+                    current_face.get(
+                        "person_id", current_face.get("face_id", "unknown")
                     )
-                    decay = self._habituation_multiplier(current_face, person_id)
-                    current_face["ips"] = float(current_face.get("ips", 0.0)) * decay
+                )
+                decay = self._habituation_multiplier(current_face, person_id)
+                current_face["ips"] = float(current_face.get("ips", 0.0)) * decay
 
         for face in faces:
             face["eligible"] = self._is_eligible(face)
