@@ -288,7 +288,6 @@ class ExecutiveControlModule(yarp.RFModule):
         r"\b(hello|hi|hey|ciao|buongiorno|good\s+morning)\b"
     )
     RESPONSIVE_GREET_COOLDOWN_SEC = 10.0
-    RESPONSIVE_ALLOWED_ATTENTION = {"MUTUAL_GAZE", "NEAR_GAZE"}
     LLM_ASYNC_DEADLINE_SEC = 2.5
     LLM_ASYNC_LOCAL_WAIT_SEC = 1.0
     LLM_ASYNC_NAME_WAIT_SEC = 1.0

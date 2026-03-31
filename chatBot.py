@@ -57,8 +57,6 @@ class ChatBotModule(yarp.RFModule):
 
     DB_FILENAME: str = "chat_bot.db"
     PROMPTS_FILENAME: str = "prompts.json"
-    USER_MEMORY_FILENAME: str = "user_memory.json"
-
     HS2_HUNGER_EVERY_N: int = 3  # force hunger comment after N messages without one
 
     # Compiled emoji regex (proper Unicode ranges — avoids false-positives from CJK/Arabic etc.)
@@ -185,9 +183,6 @@ class ChatBotModule(yarp.RFModule):
             self._tg_offset = int(self._db_get_meta("tg_offset", "0"))
 
             self._user_memory = self._load_user_memory()
-            json_path = os.path.join(self._alwayson_dir, "memory", self.USER_MEMORY_FILENAME)
-            if os.path.exists(json_path):
-                self._migrate_user_memory_from_json(json_path)
             self._log("INFO", f"User memory loaded ({len(self._user_memory)} users)")
 
             self._llm, self._llm_deployment, self._llm_api_version = self._build_llm_client()
@@ -830,36 +825,6 @@ class ChatBotModule(yarp.RFModule):
             self._db.commit()
         except Exception as exc:
             self._log("WARN", f"Failed to save user memory to DB: {exc}")
-
-    def _migrate_user_memory_from_json(self, json_path: str) -> None:
-        """One-time import of user_memory.json into the DB, then rename the file."""
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
-            now = int(time.time())
-            count = 0
-            for key, record in data.items():
-                if not isinstance(record, dict):
-                    continue
-                # Don't overwrite records already in the DB
-                existing = self._db.execute(
-                    "SELECT 1 FROM user_memory WHERE chat_id=?", (int(key),)
-                ).fetchone()
-                if not existing:
-                    self._db.execute(
-                        "INSERT INTO user_memory(chat_id, data_json, updated_at) VALUES(?,?,?)",
-                        (int(key), json.dumps(record, ensure_ascii=False), now),
-                    )
-                    self._user_memory[key] = record
-                    count += 1
-            self._db.commit()
-            os.rename(json_path, json_path + ".migrated")
-            self._log("INFO", f"Migrated {count} user record(s) from JSON to DB; "
-                              f"original renamed to {os.path.basename(json_path)}.migrated")
-        except Exception as exc:
-            self._log("WARN", f"User memory JSON migration failed: {exc}")
 
     def _get_user_record(self, chat_id: int) -> Dict[str, Any]:
         key = str(chat_id)
