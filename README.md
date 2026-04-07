@@ -84,7 +84,7 @@ Supporting utilities:
   -> starts target monitor thread (abort if face gone > 12s)
   -> chooses behavior path: hunger tree or social SS tree
   -> TTS/STT exchanges, async LLM for responses
-  -> writes greeted/talked flags, logs to SQLite
+  -> writes greeted/talked/replied_any flags + compact analytics fields to SQLite
   -> publishes hunger state continuously
 
 [chatBot main loop @ 10 Hz]
@@ -249,9 +249,9 @@ This gradually releases gaze lock toward a more novel face.
 **Step 5 — Eligibility thresholds by social state**
 
 ```text
-ss1 (unknown)            IPS >= 1.0
-ss2 (known, ungreeted)   IPS >= 0.8   (more eager to approach)
-ss3 (greeted, no talk)   IPS >= 1.2   (more conservative)
+ss1 (unknown)            IPS >= 1.10  (stricter hurdle)
+ss2 (known, ungreeted)   IPS >= 0.90  (most proactive)
+ss3 (greeted, no talk)   IPS >= 1.00  (still proactive, less than ss2)
 ss4 (fully talked)       IPS >= 99.0  (never proactively triggered)
 ```
 
@@ -322,9 +322,11 @@ STM missing               → default cooldown (5 s)
 - Runs a hunger feeding tree when the robot is hungry
 - Handles responsive interactions (greeting detection from STT, opportunistic QR feeds)
 - Manages the `HungerModel` — a time-draining stomach level that persists across restarts
+- Supports `hunger_mode on|off` to enable/disable hunger-driven behavior globally
 - Publishes current hunger state to `chatBot`
 - Performs cross-channel personalization: looks up the face's name in the Telegram DB to personalize face-to-face conversation with learned preferences (likes, dislikes, topics, inside jokes)
 - Uses Azure OpenAI for name extraction and short conversational turns
+- Logs compact interaction analytics (e.g., replied-any, hunger context, meal outcomes) to SQLite
 
 ### Behavior routing
 
@@ -400,6 +402,15 @@ HS2: level >= 25%  (hungry)
 HS3: level <  25%  (starving)
 ```
 
+`hunger_mode` controls whether hunger logic is active:
+
+```text
+hunger_mode on  -> normal draining + HS transitions + hunger tree routing
+hunger_mode off -> hunger logic disabled, treated as HS1/100%, QR meal scans ignored
+
+mode switch always resets stored level to 100%
+```
+
 **Hunger feeding tree**
 
 ```text
@@ -470,7 +481,7 @@ A conversation starter for SS3 is pre-generated in the background before it is n
 | Input | `/alwayson/executiveControl/qr:i` | QR payload strings from vision |
 | Output | `/alwayson/executiveControl/speech:o` | TTS text to speech synthesizer |
 | Output | `/alwayson/executiveControl/hunger:o` | Current hunger state string |
-| RPC server | `/executiveControl` | `status`, `ping`, `run`, `hunger`, `help`, `quit` |
+| RPC server | `/executiveControl` | `status`, `ping`, `run`, `hunger`, `hunger_mode`, `help`, `quit` |
 
 **RPC `hunger` command level mapping:**
 
@@ -494,6 +505,7 @@ Maintains a persistent social relationship with each user over Telegram, indepen
 - Extracts user profile from message text via regex (no extra LLM call needed)
 - Periodically summarizes conversation history to keep context compact
 - Broadcasts starvation alerts (HS3) to all Telegram subscribers
+- Logs per-message/per-broadcast analytics events and creates daily SQL metric views
 
 ### Hunger-driven persona
 
@@ -552,11 +564,11 @@ Additionally, Telegram metadata (sender name from `from.first_name`) is used to 
 
 | Command | Effect |
 |---|---|
-| `status` | Returns hunger state, subscriber count, queue size, thread health |
+| `status` | Returns effective hunger state (`HS0/HS1/HS2/HS3`), subscriber count, queue size, thread health |
 | `set_hs HS1\|HS2\|HS3` | Manual override of effective hunger state (bypasses stale protection) |
 | `reload_prompts` | Hot-reload `prompts.json` without restart |
 
-**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS1 to avoid stuck HS2/HS3 behavior.
+**Stale hunger protection:** if no hunger update arrives for 60 s and no manual override is active, effective state falls back to HS0 (hunger drive unavailable) to avoid injecting stale hunger behavior.
 
 ---
 
@@ -588,6 +600,7 @@ Central prompt file loaded by both `executiveControl` and `chatBot` at startup a
 
 **`executiveControl` section:**
 - `system_default`, `system_json` — base LLM system prompts
+- `system_default` now emphasizes emotional mirroring, varied sentence openings, and natural kid-like hesitation phrases
 - `ss1_greeting`, `ss1_ask_name`, `ss1_ask_name_retry`, `ss1_nice_to_meet`
 - `ss2_greeting`
 - `convo_starter_fallback`, `ss3_mid_turn_fallback`, `closing_ack_fallback`
@@ -595,7 +608,8 @@ Central prompt file loaded by both `executiveControl` and `chatBot` at startup a
 
 **`chat_bot` section:**
 - `base_system_prompt`
-- `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
+- `base_system_prompt` now further biases toward natural rhythm, reduced repetition, and context-specific emotional responses
+- `hs_overlays.HS0`, `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
 - `hs3_override_system` — strict starvation override injected at the top of the message list
 - `hs2_force_hunger_system` — forced hunger comment directive
 - `hs3_broadcast_system`, `hs3_broadcast_user` — LLM prompts for HS3 broadcasts
@@ -647,7 +661,7 @@ level < 25%           → HS3  (starving)
 
 ```text
 hunger stream fresh and no override  → use raw hunger state from stream
-hunger stale (> 60 s) and no override → force effective state to HS1
+hunger stale (> 60 s) and no override → force effective state to HS0
 manual override active               → use overridden state regardless of staleness
 ```
 
@@ -719,8 +733,8 @@ any internal queue full (DB / IO / responsive / Telegram)
 
 ```text
 no fresh hunger update for 60 s (and no manual override)
-  → effective hunger forced to HS1
-  → prevents stale HS2/HS3 persona from persisting after disconnection
+  → effective hunger forced to HS0
+  → hunger-drive overlay is disabled until hunger stream becomes fresh again
 ```
 
 ### 5.7 LLM unavailability
@@ -775,6 +789,7 @@ yarp connect /alwayson/stm/context:o /alwayson/salienceNetwork/context:i
 | `salienceNetwork` | `reset_cooldown <face_id> <track_id>` | Clear interaction cooldown for a person |
 | `executiveControl` | `run <track_id> <face_id> <ss>` | Manually trigger an interaction |
 | `executiveControl` | `hunger <hs1\|hs2\|hs3>` | Manually set stomach level |
+| `executiveControl` | `hunger_mode <on\|off>` | Enable/disable hunger logic globally (resets level to 100%) |
 | `executiveControl` | `status`, `ping`, `help`, `quit` | Module control |
 | `chatBot` | `status` | Returns hunger state, subscribers, thread health |
 | `chatBot` | `set_hs HS1\|HS2\|HS3` | Override effective hunger persona |
@@ -804,16 +819,16 @@ Long-term person scale (across sessions)
   learning.json       → per-person IPS weights (adapts selection behavior)
 
 Relationship scale (permanent)
-  chat_bot.db         → Telegram chat history, summaries, user profiles
+  chat_bot.db         → Telegram chat history, user profiles, and message/event analytics
 ```
 
 ### 7.2 Who writes what
 
 | Module | Writes |
 |---|---|
-| `salienceNetwork.py` | `greeted_today.json`, `talked_today.json`, `learning.json`, `salience_network.db` |
-| `executiveControl.py` | `last_greeted.json`, `greeted_today.json`, `hunger_state.json`, `executive_control.db` |
-| `chatBot.py` | `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`) |
+| `salienceNetwork.py` | `greeted_today.json`, `talked_today.json`, `learning.json`, `salience_network.db` (+ analytics SQL views) |
+| `executiveControl.py` | `last_greeted.json`, `greeted_today.json`, `hunger_state.json`, `executive_control.db` (expanded interaction analytics fields + SQL views) |
+| `chatBot.py` | `chat_bot.db` (`meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events`) + analytics SQL views |
 
 ### 7.3 Write safety model
 
@@ -831,9 +846,15 @@ module main loop
 
 | Database | Tables | Contents |
 |---|---|---|
-| `data_collection/executive_control.db` | `interactions` | Proactive and responsive interaction records |
-| `data_collection/salience_network.db` | `target_selections`, `ss_changes`, `learning_changes` | Selection events and learning deltas |
-| `memory/chat_bot.db` | `meta`, `subscribers`, `chat_memory`, `user_memory` | Telegram state, per-chat history, per-user profiles |
+| `data_collection/executive_control.db` | `interactions`, `responsive_interactions` | Proactive + responsive records, including replied-any and hunger-context analytics fields |
+| `data_collection/salience_network.db` | `target_selections`, `ss_changes`, `learning_changes`, `interaction_attempts` | Selection events, learning deltas, and interaction-attempt analytics |
+| `memory/chat_bot.db` | `meta`, `subscribers`, `chat_memory`, `user_memory`, `chat_events` | Telegram state, per-chat history, per-user profiles, and per-message/broadcast analytics |
+
+### 7.4.1 Analytics SQL views (auto-created at startup)
+
+- `executiveControl.py` creates: `v_proactive_interactions`, `v_metric_ss3_to_ss4_daily`, `v_metric_daily_interactions_completed`, `v_metric_proactive_response_rate_daily`, `v_metric_repeat_users_daily`, `v_metric_ss1ss2_to_ss4_daily`
+- `salienceNetwork.py` creates: `v_interaction_attempts_clean`, `v_interaction_attempts_daily`
+- `chatBot.py` creates: `v_chat_events_clean`, `v_chat_daily_metrics`
 
 ### 7.5 JSON files
 
@@ -896,7 +917,8 @@ chatBot.py
 
 - Proactive and responsive execution paths are mutually exclusive — responsive events are dropped (not deferred) while a proactive interaction runs.
 - `salienceNetwork` starts and runs without STM context connected — the context port is optional and can be connected at any time.
-- `chatBot` is safe against disconnected `executiveControl` — stale hunger falls back to HS1 after 60 s.
+- `chatBot` is safe against disconnected `executiveControl` — stale hunger falls back to HS0 after 60 s.
+- `executiveControl` can run with hunger mode OFF — interactions proceed as hunger-neutral (`HS1`/100%), and QR feeding events are ignored.
 - All LLM calls have fallback strings — no interaction or Telegram reply ever blocks indefinitely on LLM availability.
 - All file I/O and DB writes are off the main loop — latency spikes in storage never stall perception or interaction.
 - The hunger level survives restarts — `HungerModel` loads `hunger_state.json` on startup and continues draining from the saved level.
