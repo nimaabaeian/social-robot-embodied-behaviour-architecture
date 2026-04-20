@@ -7,7 +7,9 @@ YARP:
 
 RPC:
   echo 'status'         | yarp rpc /chatBot/rpc
+    echo 'help'           | yarp rpc /chatBot/rpc
   echo 'set_hs HS3'     | yarp rpc /chatBot/rpc
+    echo 'clear_hs'       | yarp rpc /chatBot/rpc
   echo 'reload_prompts' | yarp rpc /chatBot/rpc
 """
 
@@ -17,6 +19,7 @@ import json
 import os
 import queue
 import re
+import signal
 import sqlite3
 import threading
 import time
@@ -24,6 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import httpx
 import requests
 from dotenv import load_dotenv
 from openai import AzureOpenAI, APIConnectionError, APITimeoutError, RateLimitError
@@ -36,7 +40,6 @@ class ChatBotModule(yarp.RFModule):
     MODULE_HZ: float = 10.0
 
     VALID_HS = {"HS1", "HS2", "HS3"}
-    NO_HUNGER_HS = "HS0"
     HS_STALE_SEC: float = 60.0
 
     DEFAULT_TZ: str = "Europe/Rome"  # local timezone for time-of-day context
@@ -45,7 +48,7 @@ class ChatBotModule(yarp.RFModule):
     TG_POLL_TIMEOUT_SEC: int = 20  # long-poll timeout (seconds)
     TG_HTTP_TIMEOUT_SEC: int = 35  # HTTP request timeout
 
-    MAX_HISTORY_TURNS: int = 10
+    MAX_HISTORY_TURNS: int = 6
     SUMMARY_EVERY_TURNS: int = 8
     MAX_USER_CHARS: int = 500
     MAX_REPLY_CHARS: int = 4096  # Telegram limit
@@ -88,11 +91,10 @@ class ChatBotModule(yarp.RFModule):
         self._rpc_port: Optional[yarp.Port] = None
 
         # Hunger state
-        self._raw_hs: str = "HS1"
+        self._raw_hs: str = ""
         self._last_hs_update: float = 0.0
-        self._hs_manual_override: bool = False
-        self._prev_effective_hs: str = "HS1"
-        self._stale_warned: bool = False
+        self._hs_source: str = "none"
+        self._prev_effective_hs: str = ""
 
         # Prompts
         self._prompts_path: str = os.path.join(self._script_dir, self.PROMPTS_FILENAME)
@@ -115,6 +117,8 @@ class ChatBotModule(yarp.RFModule):
         self._llm_reply_max_tokens: int = 220
         self._llm_hs3_broadcast_max_tokens: int = 160
         self._llm_summary_max_tokens: int = 512
+        self._llm_reasoning_effort: str = "minimal"
+        self._llm_verbosity: str = "low"
 
         self._db: Optional[sqlite3.Connection] = None
         self._user_memory: Dict[str, Dict[str, Any]] = {}  # in-memory cache, persisted to SQLite
@@ -219,6 +223,7 @@ class ChatBotModule(yarp.RFModule):
 
             self._llm, self._llm_deployment, self._llm_api_version = self._build_llm_client()
             self._log("INFO", f"LLM ready (deployment={self._llm_deployment}, api_version={self._llm_api_version})")
+            self._warmup_llm()
 
             self._start_tg_thread()
             self._log("INFO", "Telegram polling started")
@@ -238,6 +243,7 @@ class ChatBotModule(yarp.RFModule):
         self._read_hunger()
         self._process_tg_updates(max_per_cycle=25)
         self._maybe_hs3_broadcast()
+        self._maybe_hs_transition_broadcast()
         self._prev_effective_hs = self._effective_hs()
         return self._running
 
@@ -296,6 +302,7 @@ class ChatBotModule(yarp.RFModule):
                             "module": self.module_name,
                             "effective_hs": self._effective_hs(),
                             "raw_hs": self._raw_hs,
+                            "hs_source": self._hs_source,
                             "hs_stale": self._is_hs_stale(),
                             "subscribers": self._db_count_subscribers(),
                             "tg_offset": self._tg_offset,
@@ -316,11 +323,20 @@ class ChatBotModule(yarp.RFModule):
                     reply.addString("error")
                     reply.addString(f"invalid hs: {hs}")
                     return True
-                self._raw_hs = hs
-                self._last_hs_update = time.time()
-                self._hs_manual_override = True
+                self._set_hs_state(hs, "rpc")
                 reply.addString("ok")
-                reply.addString(f"hunger overridden to {hs}")
+                reply.addString(f"hunger set to {hs}")
+                return True
+
+            if action == "clear_hs":
+                self._set_hs_state("", "none")
+                reply.addString("ok")
+                reply.addString("hunger cleared")
+                return True
+
+            if action == "help":
+                reply.addString("ok")
+                reply.addString(self._rpc_help_text())
                 return True
 
             if action == "reload_prompts":
@@ -349,10 +365,8 @@ class ChatBotModule(yarp.RFModule):
         hs = self._parse_hunger_bottle(bottle)
         if hs and hs in self.VALID_HS:
             if hs != self._raw_hs:
-                self._log("INFO", f"Hunger: {self._raw_hs} -> {hs}")
-            self._raw_hs = hs
-            self._last_hs_update = time.time()
-            self._hs_manual_override = False
+                self._log("INFO", f"HS raw: {self._raw_hs or 'none'} -> {hs}")
+            self._set_hs_state(hs, "port")
 
     @staticmethod
     def _parse_hunger_bottle(b: yarp.Bottle) -> Optional[str]:
@@ -378,20 +392,18 @@ class ChatBotModule(yarp.RFModule):
         return None
 
     def _is_hs_stale(self) -> bool:
-        if self._hs_manual_override:
+        if self._hs_source != "port":
             return False
         if self._last_hs_update == 0.0:
             return True
         return (time.time() - self._last_hs_update) > self.HS_STALE_SEC
 
     def _effective_hs(self) -> str:
-        if self._is_hs_stale():
-            if not self._stale_warned:
-                self._log("WARN", f"Hunger stale ({self._raw_hs}); hunger drive unavailable")
-                self._stale_warned = True
-            return self.NO_HUNGER_HS
-        self._stale_warned = False
-        return self._raw_hs
+        if self._hs_source == "rpc":
+            return self._raw_hs if self._raw_hs in self.VALID_HS else ""
+        if self._hs_source == "port" and not self._is_hs_stale() and self._raw_hs in self.VALID_HS:
+            return self._raw_hs
+        return ""
 
     # ------------------------- Prompts -------------------------
     def _resolve_prompts_path(self) -> str:
@@ -444,6 +456,17 @@ class ChatBotModule(yarp.RFModule):
         sys_p = self._prompts.get("hs3_broadcast_system", "")
         usr_p = self._prompts.get("hs3_broadcast_user", "")
         return sys_p, usr_p
+
+    def _set_hs_state(self, hs: str, source: str) -> None:
+        self._raw_hs = hs
+        self._hs_source = source
+        self._last_hs_update = time.time() if source == "port" else 0.0
+
+    @staticmethod
+    def _rpc_help_text() -> str:
+        return (
+            "commands: status | help | set_hs HS1|HS2|HS3 | clear_hs | reload_prompts"
+        )
 
     # ------------------------- Telegram Polling -------------------------
     def _start_tg_thread(self) -> None:
@@ -525,6 +548,22 @@ class ChatBotModule(yarp.RFModule):
         except Exception:
             pass
 
+    def _tg_typing_start(self, chat_id: int) -> threading.Event:
+        """Send typing indicator repeatedly every 4s until the returned event is set."""
+        stop = threading.Event()
+
+        def _loop() -> None:
+            self._tg_typing(chat_id)
+            while not stop.wait(4.0):
+                self._tg_typing(chat_id)
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        return stop
+
+    def _tg_typing_stop(self, stop: threading.Event) -> None:
+        stop.set()
+
     @staticmethod
     def _split_chunks(text: str, limit: int) -> List[str]:
         text = (text or "").strip()
@@ -594,19 +633,12 @@ class ChatBotModule(yarp.RFModule):
         self._db_clear_memory(chat_id, commit=False)
         if msg:
             self._update_user_from_message(chat_id, msg, "")
-        name = self._get_user_record(chat_id).get("name") or ""
-        if name:
-            tpl = self._prompts.get("start_greeting_with_name", "hey {name}! i'm iCub 😊 what's up?")
-            greeting = tpl.format(name=name)
-        else:
-            greeting = self._prompts.get("start_greeting", "hey! i'm iCub 😊 what's on your mind?")
-        self._tg_send(chat_id, greeting)
         self._db_log_event(
             event_type="start",
             chat_id=chat_id,
             hs=self._effective_hs(),
-            assistant_chars=len(greeting),
-            note="command:/start",
+            assistant_chars=0,
+            note="command:/start_no_auto_reply",
             commit=False,
         )
         self._db_commit()
@@ -726,11 +758,14 @@ class ChatBotModule(yarp.RFModule):
 
         messages.append({"role": "user", "content": user_text})
 
-        self._tg_typing(chat_id)
-
-        llm_reply = self._llm_chat(messages, max_tokens=self._llm_reply_max_tokens)
+        _typing_stop = self._tg_typing_start(chat_id)
+        try:
+            llm_reply = self._llm_chat(messages, max_tokens=self._llm_reply_max_tokens)
+        finally:
+            self._tg_typing_stop(_typing_stop)
         used_fallback = not bool(llm_reply)
         reply_text = llm_reply or self._fallback(hs)
+
         self._tg_send(chat_id, reply_text)
 
         if hs == "HS2":  # update hunger counter
@@ -815,6 +850,49 @@ class ChatBotModule(yarp.RFModule):
         if sent_any:
             self._db_commit()
 
+    def _maybe_hs_transition_broadcast(self) -> None:
+        prev = self._prev_effective_hs
+        curr = self._effective_hs()
+        if prev == curr:
+            return
+        self._log("INFO", f"HS effective: {prev or 'none'} -> {curr or 'none'}")
+        if prev == "HS3" and curr != "HS3":
+            self._broadcast_hs3_recovery(curr)
+
+    def _broadcast_hs3_recovery(self, new_hs: str) -> None:
+        candidates = self._db_list_subscribers()
+        if not candidates:
+            return
+        msgs = [
+            {"role": "system", "content": self._system_prompt(new_hs)},
+            {"role": "user", "content": self._prompts.get(
+                "hs3_recovery_trigger",
+                "send a short message to your friends about how you're feeling right now",
+            )},
+        ]
+        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_broadcast_max_tokens)
+        text = text or self._prompts.get(
+            "hs3_recovery_fallback",
+            "omg they just fed me!! 😭❤️ feeling SO much better now, thank you",
+        )
+        sent_any = False
+        for chat_id in candidates:
+            self._tg_send(chat_id, text)
+            self._db_log_event(
+                event_type="hs3_recovery",
+                chat_id=chat_id,
+                hs=new_hs,
+                assistant_chars=len(text),
+                hunger_mentioned=0,
+                broadcast_mode="hs3_exit",
+                note="hs3_recovery_sent",
+                commit=False,
+            )
+            sent_any = True
+            self._log("INFO", f"HS3 recovery broadcast -> {chat_id}")
+        if sent_any:
+            self._db_commit()
+
     # ------------------------- LLM (Azure OpenAI) -------------------------
     def _build_llm_client(self) -> Tuple[AzureOpenAI, str, str]:
         endpoint = self._get_env("AZURE_OPENAI_ENDPOINT") or self._get_env("AZURE_OPENAI_API_BASE")
@@ -823,6 +901,7 @@ class ChatBotModule(yarp.RFModule):
 
         deployment = (
             self._get_env("AZURE_DEPLOYMENT_GPT5_MINI")
+            or self._get_env("AZURE_DEPLOYMENT_GPT5_NANO")
             or self._get_env("AZURE_OPENAI_DEPLOYMENT")
             or self._get_env("AZURE_DEPLOYMENT")
             or "gpt5-mini"
@@ -839,22 +918,38 @@ class ChatBotModule(yarp.RFModule):
         if not api_version:
             raise RuntimeError("OPENAI_API_VERSION not set")
 
+        http_client = httpx.Client(
+            timeout=20.0,
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+                keepalive_expiry=60.0,
+            ),
+        )
+
         client = AzureOpenAI(
             azure_endpoint=endpoint,
             api_key=api_key,
             api_version=api_version,
+            timeout=20.0,
+            max_retries=0,
+            http_client=http_client,
         )
 
-        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "512")
+        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "192")
         self._llm_reply_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "220"
+            self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "96"
         )
         self._llm_hs3_broadcast_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "160"
+            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "80"
         )
         self._llm_summary_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "512"
+            self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "192"
         )
+        reasoning_effort = (self._get_env("TELEGRAM_LLM_REASONING_EFFORT") or "minimal").strip().lower()
+        verbosity = (self._get_env("TELEGRAM_LLM_VERBOSITY") or "low").strip().lower()
+        self._llm_reasoning_effort = "" if reasoning_effort in {"", "none", "off"} else reasoning_effort
+        self._llm_verbosity = "" if verbosity in {"", "none", "off"} else verbosity
 
         self._llm_reply_max_tokens = max(64, min(self._llm_reply_max_tokens, self._llm_max_tokens))
         self._llm_hs3_broadcast_max_tokens = max(64, min(self._llm_hs3_broadcast_max_tokens, self._llm_max_tokens))
@@ -872,9 +967,28 @@ class ChatBotModule(yarp.RFModule):
             f"global={self._llm_max_tokens}, "
             f"reply={self._llm_reply_max_tokens}, "
             f"hs3_broadcast={self._llm_hs3_broadcast_max_tokens}, "
-            f"summary={self._llm_summary_max_tokens}",
+            f"summary={self._llm_summary_max_tokens}, "
+            f"reasoning_effort={self._llm_reasoning_effort or 'off'}, "
+            f"verbosity={self._llm_verbosity or 'off'}",
         )
         return client, deployment, api_version
+
+    def _warmup_llm(self) -> None:
+        if not self._llm:
+            return
+        sys_prompt = self._system_prompt("HS1")
+        messages: List[Dict[str, str]] = []
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        messages.append({"role": "user", "content": "hey"})
+        t0 = time.monotonic()
+        # Two calls: Azure needs 2+ requests to fully warm model + KV cache.
+        ok = bool(self._llm_chat(messages, max_tokens=self._llm_reply_max_tokens))
+        ok = ok and bool(self._llm_chat(messages, max_tokens=self._llm_reply_max_tokens))
+        if ok:
+            self._log("INFO", f"LLM warm-up ok in {time.monotonic() - t0:.2f}s")
+        else:
+            self._log("WARN", "LLM warm-up failed")
 
     def _llm_chat(self, messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> str:
         if not self._llm:
@@ -882,37 +996,77 @@ class ChatBotModule(yarp.RFModule):
 
         token_budget = int(max_tokens if max_tokens is not None else self._llm_max_tokens)
         token_budget = max(32, token_budget)
+        max_budget = max(token_budget, int(self._llm_max_tokens))
+        retry_budget = min(max(token_budget * 2, token_budget + 64), max_budget)
+        budgets = [token_budget]
+        if retry_budget > token_budget:
+            budgets.append(retry_budget)
 
         last_exc: Optional[Exception] = None
-        use_completion_tokens = True
 
-        for attempt in range(3):
-            try:
-                kwargs: Dict[str, Any] = {
-                    "model": self._llm_deployment,
-                    "messages": messages,
-                }
-                if use_completion_tokens:
-                    kwargs["max_completion_tokens"] = token_budget
-                else:
-                    kwargs["max_tokens"] = token_budget
+        for budget_index, current_budget in enumerate(budgets):
+            use_completion_tokens = True
+            use_reasoning_controls = True
+            retry_with_more_tokens = False
 
-                resp = self._llm.chat.completions.create(**kwargs)
-                content = (resp.choices[0].message.content or "").strip()
-                if content:
-                    return content
-                return ""
+            for attempt in range(3):
+                try:
+                    kwargs: Dict[str, Any] = {
+                        "model": self._llm_deployment,
+                        "messages": messages,
+                    }
+                    if use_completion_tokens:
+                        kwargs["max_completion_tokens"] = current_budget
+                    else:
+                        kwargs["max_tokens"] = current_budget
 
-            except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
-                last_exc = exc
-                time.sleep(0.6 * (2**attempt))
-                continue
-            except Exception as exc:  # noqa: BLE001
-                if use_completion_tokens and "max_completion_tokens" in str(exc):  # fallback param name
-                    use_completion_tokens = False
+                    if use_reasoning_controls:
+                        if self._llm_reasoning_effort:
+                            kwargs["reasoning_effort"] = self._llm_reasoning_effort
+                        if self._llm_verbosity:
+                            kwargs["verbosity"] = self._llm_verbosity
+
+                    resp = self._llm.chat.completions.create(**kwargs)
+                    choice = resp.choices[0]
+                    content = (choice.message.content or "").strip()
+                    if content:
+                        return content
+
+                    finish_reason = str(getattr(choice, "finish_reason", "") or "")
+                    if finish_reason == "length" and budget_index < (len(budgets) - 1):
+                        self._log(
+                            "WARN",
+                            f"LLM empty response at {current_budget} tokens; retrying with {budgets[budget_index + 1]}",
+                        )
+                        retry_with_more_tokens = True
+                        break
+
+                    last_exc = RuntimeError(
+                        f"empty_response (finish_reason={finish_reason or 'unknown'})"
+                    )
+                    break
+
+                except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
+                    last_exc = exc
+                    time.sleep(0.6 * (2**attempt))
                     continue
-                last_exc = exc
-                break
+                except Exception as exc:  # noqa: BLE001
+                    err_msg = str(exc)
+                    if use_completion_tokens and "max_completion_tokens" in err_msg:
+                        use_completion_tokens = False
+                        continue
+                    if use_reasoning_controls and (
+                        "reasoning_effort" in err_msg or "verbosity" in err_msg
+                    ):
+                        self._log("WARN", "LLM endpoint rejected reasoning controls; retrying without them")
+                        use_reasoning_controls = False
+                        continue
+                    last_exc = exc
+                    break
+
+            if retry_with_more_tokens:
+                continue
+            break
 
         self._log("WARN", f"LLM error: {last_exc}")
         return ""
@@ -1851,8 +2005,71 @@ class ChatBotModule(yarp.RFModule):
 
 if __name__ == "__main__":
     import sys
+    from typing import cast
+
+    def _run_with_signal_handling(module: ChatBotModule, rf: yarp.ResourceFinder) -> bool:
+        stop_requested = threading.Event()
+        run_done = threading.Event()
+        run_state: Dict[str, Any] = {"result": False, "error": None}
+
+        def _runner() -> None:
+            try:
+                run_state["result"] = bool(module.runModule(rf))
+            except BaseException as exc:  # noqa: BLE001
+                run_state["error"] = exc
+            finally:
+                run_done.set()
+
+        def _on_signal(signum, _frame) -> None:
+            if stop_requested.is_set():
+                return
+            stop_requested.set()
+            try:
+                os.write(2, f"\n[INFO] Signal {signum} received, shutting down.\n".encode("utf-8", "replace"))
+            except Exception:
+                pass
+
+        prev_handlers = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, _on_signal)
+            except Exception:
+                pass
+
+        run_thread = threading.Thread(
+            target=_runner,
+            name=f"{module.module_name}-run",
+            daemon=True,
+        )
+        run_thread.start()
+
+        interrupted = False
+        shutdown_after: Optional[float] = None
+        try:
+            while not run_done.wait(0.2):
+                if stop_requested.is_set() and not interrupted:
+                    interrupted = True
+                    shutdown_after = time.monotonic() + 2.0
+                    module.interruptModule()
+                elif interrupted and shutdown_after and time.monotonic() >= shutdown_after:
+                    break
+        finally:
+            for sig, handler in prev_handlers.items():
+                try:
+                    signal.signal(sig, cast(Any, handler))
+                except Exception:
+                    pass
+            module.interruptModule()
+            module.close()
+
+        run_thread.join(timeout=0.5)
+        if run_state["error"] is not None:
+            raise run_state["error"]
+        return bool(run_state["result"])
 
     yarp.Network.init()
+    module: Optional[ChatBotModule] = None
     try:
         if not yarp.Network.checkNetwork():
             print("ERROR: YARP network not available")
@@ -1862,13 +2079,11 @@ if __name__ == "__main__":
         rf = yarp.ResourceFinder()
         rf.setVerbose(False)
         rf.configure(sys.argv)
-        module.runModule(rf)
-
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+        _run_with_signal_handling(module, rf)
     finally:
-        try:
-            module.close()
-        except Exception:
-            pass
+        if module is not None:
+            try:
+                module.close()
+            except Exception:
+                pass
         yarp.Network.fini()

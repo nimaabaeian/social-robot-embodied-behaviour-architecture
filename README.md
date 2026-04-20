@@ -29,7 +29,7 @@ Four continuously running layers, each with a distinct responsibility:
  +------------------------------+
  | vision.py                    |
  | YOLO + ByteTrack + MediaPipe |
- | gaze / pose / talking / QR  |
+ | gaze / pose / talking / QR   |
  +------------------------------+
              |  /alwayson/vision/landmarks:o
              v
@@ -43,7 +43,7 @@ Four continuously running layers, each with a distinct responsibility:
  +------------------------------+
  | executiveControl.py          |
  | SS trees + hunger tree       |
- | TTS / STT / QR feed / LLM   |
+ | TTS / STT / QR feed / LLM    |
  +------------------------------+
              |  /alwayson/executiveControl/hunger:o
              v
