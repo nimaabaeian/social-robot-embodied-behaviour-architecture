@@ -64,6 +64,8 @@ class SalienceNetworkModule(yarp.RFModule):
         abort_reason: Optional[str]
         exec_interaction_id: Optional[str]
         duration_sec: float
+        hunger_state: Optional[str] = None
+        is_proactive: int = 1
 
     @dataclass(frozen=True)
     class LearningDelta:
@@ -223,6 +225,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._db_thread: Optional[threading.Thread] = None
         self._context_connected_logged = False
         self._unknown_ss1_since: Dict[int, float] = {}
+        self._last_hunger_state: str = "HS0"
 
     # ------------------------------------------------------------------ configure
     def configure(self, rf: yarp.ResourceFinder) -> bool:
@@ -723,6 +726,10 @@ class SalienceNetworkModule(yarp.RFModule):
                     ),
                 )
                 im_status = self._executive_control_status()
+                if isinstance(im_status, dict):
+                    hs_val = im_status.get("hunger_state")
+                    if hs_val and str(hs_val).startswith("HS"):
+                        self._last_hunger_state = str(hs_val)
                 if not isinstance(im_status, dict):
                     self._log("INFO", "try: blocked status_unavailable")
                     self._next_exec_rpc_try_ts = current_time + self.exec_rpc_retry_sec
@@ -1449,6 +1456,8 @@ class SalienceNetworkModule(yarp.RFModule):
                 abort_reason=abort_reason,
                 exec_interaction_id=exec_interaction_id,
                 duration_sec=duration_sec,
+                hunger_state=self._last_hunger_state,
+                is_proactive=1,
             )
             self._db_log("interaction_attempt", asdict(attempt))
             with self._interaction_lock:
@@ -1925,7 +1934,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 final_state TEXT,
                 abort_reason TEXT,
                 exec_interaction_id TEXT,
-                duration_sec REAL
+                duration_sec REAL,
+                hunger_state TEXT,
+                is_proactive INTEGER NOT NULL DEFAULT 1
             )""")
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_time ON target_selections(timestamp)"
@@ -1941,6 +1952,12 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_exec_id ON interaction_attempts(exec_interaction_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ia_hunger ON interaction_attempts(hunger_state)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ia_hs_day ON interaction_attempts(hunger_state, timestamp)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_learning_changes_time ON learning_changes(timestamp)"
@@ -1974,7 +1991,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 final_state,
                 abort_reason,
                 exec_interaction_id,
-                duration_sec
+                duration_sec,
+                COALESCE(hunger_state, 'HS0')        AS hunger_state,
+                COALESCE(is_proactive, 1)            AS is_proactive
             FROM interaction_attempts
             WHERE start_ss IN ('ss1', 'ss2', 'ss3')
             """
@@ -1986,12 +2005,18 @@ class SalienceNetworkModule(yarp.RFModule):
             CREATE VIEW v_interaction_attempts_daily AS
             SELECT
                 day_rome,
-                COUNT(*) AS launched,
-                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS completed,
-                SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END) AS reached_ss4,
-                AVG(duration_sec) AS avg_duration_sec
+                hunger_state,
+                start_ss,
+                COUNT(*)                                                          AS launched,
+                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END)                     AS completed,
+                SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END)             AS reached_ss4,
+                1.0 * SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END)
+                      / MAX(COUNT(*), 1)                                          AS ss4_rate,
+                SUM(CASE WHEN is_proactive = 1 THEN 1 ELSE 0 END)                AS proactive_count,
+                SUM(CASE WHEN abort_reason IS NOT NULL THEN 1 ELSE 0 END)        AS aborted_count,
+                AVG(duration_sec)                                                 AS avg_duration_sec
             FROM v_interaction_attempts_clean
-            GROUP BY day_rome
+            GROUP BY day_rome, hunger_state, start_ss
             """
         )
 
@@ -2096,7 +2121,11 @@ class SalienceNetworkModule(yarp.RFModule):
                     )
                 elif table == "interaction_attempt":
                     c.execute(
-                        "INSERT INTO interaction_attempts (timestamp,attempt_id,track_id,face_id,person_id,start_ss,success,final_state,abort_reason,exec_interaction_id,duration_sec) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        """INSERT INTO interaction_attempts
+                        (timestamp,attempt_id,track_id,face_id,person_id,start_ss,
+                         success,final_state,abort_reason,exec_interaction_id,duration_sec,
+                         hunger_state,is_proactive)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp"],
                             data.get("attempt_id"),
@@ -2109,6 +2138,8 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("abort_reason"),
                             data.get("exec_interaction_id"),
                             data.get("duration_sec"),
+                            data.get("hunger_state", "HS0"),
+                            int(data.get("is_proactive", 1)),
                         ),
                     )
                 conn.commit()

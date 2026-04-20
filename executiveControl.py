@@ -1,4 +1,4 @@
-#executiveControl.py – iCub social interaction controller
+"executiveControl.py - iCub social interaction controller"
 
 from __future__ import annotations
 
@@ -27,10 +27,9 @@ _ALWAYSON_DIR = os.path.dirname(_MODULE_DIR)
 load_dotenv()
 load_dotenv(os.path.join(_ALWAYSON_DIR, "memory", "llm.env"), override=False)
 
-import httpx                    # noqa: E402
-from openai import AzureOpenAI  # noqa: E402 (after dotenv)
-import yarp                     # noqa: E402
-
+import httpx                   
+from openai import AzureOpenAI 
+import yarp                     
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hunger model
@@ -208,6 +207,8 @@ class InteractionResult:
     stomach_level_end:    float           = 100.0
     meals_eaten_count:    int             = 0
     last_meal_payload:    Optional[str]   = None
+    n_turns:              int             = 0
+    trigger_mode:         str             = "proactive"   # "proactive" | "reactive"
     logs:                 List[Dict]      = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1147,7 +1148,7 @@ class ExecutiveControlModule(yarp.RFModule):
         for t in (self._landmarks_thread, self._qr_thread, self._reactive_thread):
             if t:
                 t.join(timeout=2.0)
-        self._db_queue_put(None)
+        self._db_enqueue(None)
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
         for port in (self.handle_port, self.landmarks_port, self.stt_port,
@@ -1597,6 +1598,7 @@ class ExecutiveControlModule(yarp.RFModule):
             first_utterance_mono=utterance_mono,
             result=result,
         )
+        result.n_turns = turns
         if turns > 0:
             result.success     = True
             result.talked      = True
@@ -1887,7 +1889,16 @@ class ExecutiveControlModule(yarp.RFModule):
 
                 if not self._hunger_tree_active.is_set():
                     self._speak(self._feed_ack(hs_before))
-                    self._db_enqueue(("reactive", {"type": "qr_feed", "track_id": None, "name": None, "payload": val}))
+                    self._db_enqueue(("reactive", {
+                        "type":                 "qr_feed",
+                        "track_id":             None,
+                        "name":                 None,
+                        "payload":              val,
+                        "hunger_state_before":  hs_before,
+                        "stomach_level_before": self.hunger.snapshot().level,
+                        "hunger_state_after":   snap.state,
+                        "stomach_level_after":  snap.level,
+                    }))
 
                 self._qr_stop.wait(0.02)
             except Exception as e:
@@ -1947,6 +1958,7 @@ class ExecutiveControlModule(yarp.RFModule):
             self._interaction_abort_event.clear()
             self._selector_set_track(track_id)
             dummy = InteractionResult(initial_state="ss3", final_state="ss3")
+            dummy.trigger_mode = "reactive"
             self._start_monitor(track_id, name, dummy)
             tag = f"[RGREET|{name}]"
             try:
@@ -1977,6 +1989,7 @@ class ExecutiveControlModule(yarp.RFModule):
             self._interaction_abort_event.clear()
             self._selector_set_track(track_id)
             dummy = InteractionResult(initial_state="ss1", final_state="ss1")
+            dummy.trigger_mode = "reactive"
             self._start_monitor(track_id, face_id, dummy)
             try:
                 self._log("INFO", f"Reactive unknown intro: track={track_id} face='{face_id}'")
@@ -2229,8 +2242,7 @@ class ExecutiveControlModule(yarp.RFModule):
             return list(self._latest_faces)
 
     def _reactive_candidate(self) -> Optional[Tuple[int, str, bool]]:
-        faces = self._latest_faces_snapshot(staleness_sec=30.0) if False else \
-                self._latest_faces_snapshot(30.0)
+        faces = self._latest_faces_snapshot(30.0)
         if not faces:
             return None
 
@@ -2874,29 +2886,6 @@ class ExecutiveControlModule(yarp.RFModule):
         self._log("WARNING", f"starter_llm_empty hs={hs}; using local fallback")
         return self._local_starter_fallback(hs)
 
-    def _llm_get_reply(self, utterance: str, is_last: bool, hs: str) -> str:
-        req = self._build_reply_request(
-            utterance,
-            is_last=is_last,
-            hs=hs,
-            turn_index=1,
-            interaction_id=self._get_iid(),
-        )
-        text = self._llm_text_with_fallback(
-            prompt=req.prompt,
-            system=req.system,
-            max_tokens=req.max_tokens,
-            timeout=req.timeout,
-            max_len=req.max_len,
-            log_tag=req.log_tag,
-            retry_on_empty=req.retry_on_empty,
-            verbosity=req.verbosity,
-        )
-        if text:
-            return text
-        self._log("WARNING", f"reply_llm_empty hs={hs}; using local fallback")
-        return self._local_reply_fallback(utterance, is_last)
-
     # ── JSON persistence ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -3003,6 +2992,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 hunger_state_start TEXT, hunger_state_end TEXT,
                 stomach_level_start REAL, stomach_level_end REAL,
                 meals_eaten_count INTEGER, last_meal_payload TEXT,
+                n_turns INTEGER NOT NULL DEFAULT 0,
+                trigger_mode TEXT NOT NULL DEFAULT 'proactive',
+                day_rome TEXT,
                 transcript TEXT, full_result TEXT
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS reactive_interactions (
@@ -3010,15 +3002,22 @@ class ExecutiveControlModule(yarp.RFModule):
                 interaction_id TEXT,
                 timestamp TEXT NOT NULL,
                 type TEXT NOT NULL,
-                track_id INTEGER, name TEXT, payload TEXT
+                track_id INTEGER, name TEXT, payload TEXT,
+                hunger_state_before TEXT,
+                stomach_level_before REAL,
+                hunger_state_after   TEXT,
+                stomach_level_after  REAL
             )""")
             for idx_sql in [
-                "CREATE INDEX IF NOT EXISTS idx_i_time   ON interactions(timestamp)",
-                "CREATE INDEX IF NOT EXISTS idx_i_track  ON interactions(track_id)",
-                "CREATE INDEX IF NOT EXISTS idx_i_iid    ON interactions(interaction_id)",
-                "CREATE INDEX IF NOT EXISTS idx_i_state  ON interactions(initial_state, final_state, success)",
-                "CREATE INDEX IF NOT EXISTS idx_i_hs     ON interactions(hunger_state_start)",
-                "CREATE INDEX IF NOT EXISTS idx_r_time   ON reactive_interactions(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
+                "CREATE INDEX IF NOT EXISTS idx_i_iid     ON interactions(interaction_id)",
+                "CREATE INDEX IF NOT EXISTS idx_i_state   ON interactions(initial_state, final_state, success)",
+                "CREATE INDEX IF NOT EXISTS idx_i_hs      ON interactions(hunger_state_start)",
+                "CREATE INDEX IF NOT EXISTS idx_i_day_rome ON interactions(day_rome)",
+                "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
+                "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
             ]:
                 c.execute(idx_sql)
             self._create_analytics_views(conn)
@@ -3032,7 +3031,8 @@ class ExecutiveControlModule(yarp.RFModule):
         c = conn.cursor()
         views = {
             "v_proactive_interactions": """
-                SELECT interaction_id, timestamp, substr(timestamp,1,10) AS day_rome,
+                SELECT interaction_id, timestamp,
+                       COALESCE(day_rome, substr(timestamp,1,10)) AS day_rome,
                        track_id, face_id,
                        COALESCE(NULLIF(extracted_name,''),face_id) AS user_key,
                        initial_state, final_state,
@@ -3043,7 +3043,9 @@ class ExecutiveControlModule(yarp.RFModule):
                        abort_reason, interaction_tag,
                        hunger_state_start, hunger_state_end,
                        stomach_level_start, stomach_level_end,
-                       meals_eaten_count, last_meal_payload
+                       meals_eaten_count, last_meal_payload,
+                       COALESCE(n_turns, 0) AS n_turns,
+                       COALESCE(trigger_mode, 'proactive') AS trigger_mode
                 FROM interactions WHERE initial_state IN ('ss1','ss2','ss3')""",
             "v_metric_ss3_daily": """
                 SELECT day_rome, hunger_state_start,
@@ -3058,6 +3060,45 @@ class ExecutiveControlModule(yarp.RFModule):
                        SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END) AS replied,
                        1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
                 FROM v_proactive_interactions GROUP BY day_rome, hunger_state_start""",
+            "v_metric_repeat_users_daily": """
+                SELECT
+                    day_rome,
+                    hunger_state_start,
+                    COUNT(*)                                                          AS total_visits,
+                    COUNT(DISTINCT user_key)                                          AS unique_users,
+                    SUM(CASE WHEN visit_count > 1 THEN 1 ELSE 0 END)                 AS repeat_visit_count,
+                    1.0 * SUM(CASE WHEN visit_count > 1 THEN 1 ELSE 0 END)
+                          / MAX(COUNT(DISTINCT user_key), 1)                          AS repeat_user_rate
+                FROM (
+                    SELECT
+                        day_rome,
+                        hunger_state_start,
+                        COALESCE(NULLIF(extracted_name, ''), face_id)                 AS user_key,
+                        COUNT(*) OVER (
+                            PARTITION BY day_rome,
+                                         COALESCE(NULLIF(extracted_name, ''), face_id)
+                        )                                                             AS visit_count
+                    FROM interactions
+                    WHERE trigger_mode = 'proactive'
+                      AND initial_state IN ('ss1', 'ss2', 'ss3')
+                )
+                GROUP BY day_rome, hunger_state_start""",
+            "v_metric_depth_progression": """
+                SELECT
+                    COALESCE(day_rome, substr(timestamp,1,10))                               AS day_rome,
+                    initial_state,
+                    hunger_state_start,
+                    COUNT(*)                                                                  AS launched,
+                    SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END)                     AS reached_ss4,
+                    1.0 * SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END)
+                          / MAX(COUNT(*), 1)                                                  AS completion_rate,
+                    AVG(CAST(n_turns AS REAL))                                               AS avg_turns,
+                    MAX(n_turns)                                                             AS max_turns,
+                    SUM(CASE WHEN n_turns >= 3 THEN 1 ELSE 0 END)                           AS deep_interactions,
+                    SUM(CASE WHEN replied_any = 1 AND final_state != 'ss4' THEN 1 ELSE 0 END) AS replied_but_no_ss4
+                FROM interactions
+                WHERE initial_state IN ('ss1', 'ss2', 'ss3')
+                GROUP BY day_rome, initial_state, hunger_state_start""",
         }
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
@@ -3075,9 +3116,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._db_queue.put_nowait(item)
             except queue.Full:
                 self._log("WARNING", "DB queue full, dropping item")
-
-    def _db_queue_put(self, item: Any) -> None:
-        self._db_enqueue(item)
 
     def _db_worker(self) -> None:
         conn: Optional[sqlite3.Connection] = None
@@ -3125,14 +3163,16 @@ class ExecutiveControlModule(yarp.RFModule):
                 ensure_ascii=False,
             )
             r_compact = {k: v for k, v in r.items() if k != "logs"}
+            day_rome  = datetime.now(self.TIMEZONE).date().isoformat()
             conn.cursor().execute(
                 """INSERT INTO interactions
                 (interaction_id,timestamp,track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
                  stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
+                 n_turns,trigger_mode,day_rome,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     datetime.now(self.TIMEZONE).isoformat(),
@@ -3146,6 +3186,9 @@ class ExecutiveControlModule(yarp.RFModule):
                     r.get("hunger_state_start"),        r.get("hunger_state_end"),
                     r.get("stomach_level_start"),       r.get("stomach_level_end"),
                     r.get("meals_eaten_count"),         r.get("last_meal_payload"),
+                    r.get("n_turns", 0),
+                    r.get("trigger_mode", "proactive"),
+                    day_rome,
                     transcript,
                     json.dumps(r_compact, ensure_ascii=False),
                 ),
@@ -3157,10 +3200,22 @@ class ExecutiveControlModule(yarp.RFModule):
     def _db_save_reactive(self, conn: sqlite3.Connection, data: Dict) -> None:
         try:
             conn.cursor().execute(
-                """INSERT INTO reactive_interactions (interaction_id,timestamp,type,track_id,name,payload)
-                VALUES (?,?,?,?,?,?)""",
-                (data.get("interaction_id"), datetime.now().astimezone().isoformat(),
-                 data.get("type"), data.get("track_id"), data.get("name"), data.get("payload")),
+                """INSERT INTO reactive_interactions
+                (interaction_id,timestamp,type,track_id,name,payload,
+                 hunger_state_before,stomach_level_before,hunger_state_after,stomach_level_after)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    data.get("interaction_id"),
+                    datetime.now().astimezone().isoformat(),
+                    data.get("type"),
+                    data.get("track_id"),
+                    data.get("name"),
+                    data.get("payload"),
+                    data.get("hunger_state_before"),
+                    data.get("stomach_level_before"),
+                    data.get("hunger_state_after"),
+                    data.get("stomach_level_after"),
+                ),
             )
             conn.commit()
         except Exception as e:

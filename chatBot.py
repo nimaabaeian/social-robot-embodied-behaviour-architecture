@@ -59,6 +59,7 @@ class ChatBotModule(yarp.RFModule):
     DB_FILENAME: str = "chat_bot.db"
     PROMPTS_FILENAME: str = "prompts.json"
     HS2_HUNGER_EVERY_N: int = 3  # force hunger comment after N messages without one
+    SESSION_GAP_SEC: float = 1800.0  # 30 min inactivity = new session
 
     # Compiled emoji regex (proper Unicode ranges — avoids false-positives from CJK/Arabic etc.)
     _EMOJI_RE = re.compile(
@@ -118,6 +119,7 @@ class ChatBotModule(yarp.RFModule):
         self._db: Optional[sqlite3.Connection] = None
         self._user_memory: Dict[str, Dict[str, Any]] = {}  # in-memory cache, persisted to SQLite
         self._hs2_hunger_counters: Dict[str, int] = {}  # per-user hunger mention counter
+        self._session_tracker: Dict[int, Dict[str, Any]] = {}  # chat_id -> {session_id, last_message_ts}
 
     # ------------------------- RFModule API -------------------------
     def configure(self, rf: yarp.ResourceFinder) -> bool:
@@ -187,12 +189,15 @@ class ChatBotModule(yarp.RFModule):
                     hunger_mentioned INTEGER,
                     llm_fallback INTEGER,
                     broadcast_mode TEXT,
-                    note TEXT
+                    note TEXT,
+                    turn_count_at_event INTEGER,
+                    session_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_chat_events_ts ON chat_events(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_day ON chat_events(day_rome);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_chat_id ON chat_events(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_type ON chat_events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_session ON chat_events(session_id);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_seen ON subscribers(last_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_broadcast ON subscribers(last_broadcast_at);
                 CREATE INDEX IF NOT EXISTS idx_chat_memory_updated ON chat_memory(updated_at);
@@ -622,6 +627,17 @@ class ChatBotModule(yarp.RFModule):
         self._db_commit()
         self._log("INFO", f"/reset from {chat_id}")
 
+    def _get_or_create_session(self, chat_id: int, now_ts: float) -> str:
+        import uuid as _uuid
+        key = int(chat_id)
+        rec = self._session_tracker.get(key)
+        if rec is None or (now_ts - rec["last_message_ts"]) > self.SESSION_GAP_SEC:
+            sid = f"{key}_{int(now_ts)}_{_uuid.uuid4().hex[:8]}"
+            self._session_tracker[key] = {"session_id": sid, "last_message_ts": now_ts}
+        else:
+            self._session_tracker[key]["last_message_ts"] = now_ts
+        return self._session_tracker[key]["session_id"]
+
     def _on_text(self, chat_id: int, user_text: str, msg_date: int = 0) -> None:
         self._db_upsert_subscriber(chat_id, commit=False)
         self._db_touch_subscriber(chat_id, commit=False)
@@ -631,12 +647,16 @@ class ChatBotModule(yarp.RFModule):
         user_record = self._get_user_record(chat_id)
 
         user_text = (user_text or "")[: self.MAX_USER_CHARS]
+        now_ts = float(msg_date or time.time())
+        sid = self._get_or_create_session(chat_id, now_ts)
         self._db_log_event(
             event_type="user_message",
             chat_id=chat_id,
             hs=hs,
             user_chars=len(user_text),
             note="incoming_text",
+            turn_count_at_event=turn_count,
+            session_id=sid,
             commit=False,
         )
 
@@ -740,6 +760,8 @@ class ChatBotModule(yarp.RFModule):
             hunger_mentioned=hunger_mentioned,
             llm_fallback=1 if used_fallback else 0,
             note=("hs2_forced" if hs2_forced else ""),
+            turn_count_at_event=turn_count,
+            session_id=sid,
             commit=False,
         )
 
@@ -1546,12 +1568,14 @@ class ChatBotModule(yarp.RFModule):
                 chat_id,
                 event_type,
                 hs,
-                CAST(COALESCE(user_chars, 0) AS INTEGER) AS user_chars,
-                CAST(COALESCE(assistant_chars, 0) AS INTEGER) AS assistant_chars,
-                CAST(COALESCE(hunger_mentioned, 0) AS INTEGER) AS hunger_mentioned,
-                CAST(COALESCE(llm_fallback, 0) AS INTEGER) AS llm_fallback,
-                COALESCE(broadcast_mode, '') AS broadcast_mode,
-                COALESCE(note, '') AS note
+                CAST(COALESCE(user_chars, 0) AS INTEGER)       AS user_chars,
+                CAST(COALESCE(assistant_chars, 0) AS INTEGER)   AS assistant_chars,
+                CAST(COALESCE(hunger_mentioned, 0) AS INTEGER)  AS hunger_mentioned,
+                CAST(COALESCE(llm_fallback, 0) AS INTEGER)      AS llm_fallback,
+                COALESCE(broadcast_mode, '')                    AS broadcast_mode,
+                COALESCE(note, '')                              AS note,
+                turn_count_at_event,
+                session_id
             FROM chat_events
             """
         )
@@ -1583,6 +1607,49 @@ class ChatBotModule(yarp.RFModule):
             """
         )
 
+        self._db.execute("DROP VIEW IF EXISTS v_chat_user_daily")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_user_daily AS
+            SELECT
+                day_rome,
+                chat_id,
+                hs,
+                COUNT(CASE WHEN event_type = 'user_message'    THEN 1 END) AS user_messages,
+                COUNT(CASE WHEN event_type = 'assistant_reply' THEN 1 END) AS bot_replies,
+                MAX(turn_count_at_event)                                    AS max_turn_depth,
+                SUM(hunger_mentioned)                                       AS hunger_mentions,
+                COUNT(DISTINCT session_id)                                  AS sessions_today
+            FROM v_chat_events_clean
+            WHERE event_type IN ('user_message', 'assistant_reply')
+            GROUP BY day_rome, chat_id, hs
+            """
+        )
+
+        self._db.execute("DROP VIEW IF EXISTS v_chat_session_metrics")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_session_metrics AS
+            SELECT
+                session_id,
+                MIN(day_rome)                                               AS day_rome,
+                chat_id,
+                MAX(hs)                                                     AS hs_peak,
+                MIN(hs)                                                     AS hs_min,
+                COUNT(CASE WHEN event_type = 'user_message'    THEN 1 END) AS user_turns,
+                COUNT(CASE WHEN event_type = 'assistant_reply' THEN 1 END) AS bot_turns,
+                MAX(turn_count_at_event)                                    AS session_depth,
+                SUM(CASE WHEN hunger_mentioned = 1 THEN 1 ELSE 0 END)      AS hunger_mentions,
+                SUM(llm_fallback)                                           AS fallback_count,
+                MIN(timestamp)                                              AS session_start_ts,
+                MAX(timestamp) - MIN(timestamp)                             AS session_duration_sec
+            FROM v_chat_events_clean
+            WHERE session_id IS NOT NULL
+              AND event_type IN ('user_message', 'assistant_reply')
+            GROUP BY session_id
+            """
+        )
+
     # ------------------------- DB helpers -------------------------
     def _db_commit(self) -> None:
         if not self._db:
@@ -1600,6 +1667,8 @@ class ChatBotModule(yarp.RFModule):
         llm_fallback: Optional[int] = None,
         broadcast_mode: Optional[str] = None,
         note: str = "",
+        turn_count_at_event: Optional[int] = None,
+        session_id: Optional[str] = None,
         commit: bool = True,
     ) -> None:
         if not self._db:
@@ -1611,8 +1680,8 @@ class ChatBotModule(yarp.RFModule):
             INSERT INTO chat_events
             (timestamp, day_rome, chat_id, event_type, hs,
              user_chars, assistant_chars, hunger_mentioned, llm_fallback,
-             broadcast_mode, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             broadcast_mode, note, turn_count_at_event, session_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 now,
@@ -1626,6 +1695,8 @@ class ChatBotModule(yarp.RFModule):
                 int(llm_fallback) if llm_fallback is not None else None,
                 broadcast_mode,
                 note,
+                int(turn_count_at_event) if turn_count_at_event is not None else None,
+                session_id,
             ),
         )
         if commit:
