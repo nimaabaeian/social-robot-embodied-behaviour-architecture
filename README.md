@@ -1,57 +1,55 @@
-# Embodied Behaviour
+# Always-on Cognitive Architecture - Embodied Behaviour
 
 > **Robot:** iCub
 > **Platform:** YARP
 > **Author:** Nima Abaeian
 
-Technical reference for the always-on proactive social robot Cognitive Architecture.
-Covers perception, selection, interaction, and long-term relationship layers end-to-end.
+Technical reference for the always-on proactive social robot cognitive architecture.
+Covers the embodied perception-to-interaction loop plus the parallel Telegram companion channel.
 
 ---
 
 ## 1) Big Picture
 
-Four continuously running layers, each with a distinct responsibility:
+The system is a set of cooperating YARP modules, not a single monolith.
+The embodied control path is `vision.py -> salienceNetwork.py -> executiveControl.py`.
+`chatBot.py` runs in parallel as a Telegram-facing social channel; it consumes the shared hunger state and shared prompt file, but keeps its own Telegram-side memory and is not in the real-time face-to-face loop.
 
-| Layer | Module | Role |
+| Component | Main responsibility | Main interfaces |
 |---|---|---|
-| See | `vision.py` | Perceive faces, pose, gaze, talking, QR |
-| Choose | `salienceNetwork.py` | Decide who to look at and who to approach |
-| Act | `executiveControl.py` | Run interaction trees, manage hunger |
-| Remember | `chatBot.py` | Long-term relationship via Telegram |
+| `vision.py` | Perception front-end: detect, track, identify, and describe visible faces; emit QR events | Camera in, landmarks/features/QR out, target command in |
+| `salienceNetwork.py` | Attention and initiation policy: score faces, assign social state, hold gaze target, decide when to start a proactive interaction, and adapt per-person IPS weights | Landmarks in, STM context in, target command out, RPC to `executiveControl.py` |
+| `executiveControl.py` | Interaction executor: run social-state trees, reactive greetings, hunger/feeding logic, speech I/O, and interaction logging | RPC from `salienceNetwork.py`, landmarks/STT/QR in, speech/hunger out, RPC back to selector and vision |
+| `chatBot.py` | Remote social channel: Telegram messaging, user memory, summaries, hunger-aware broadcasts and replies | Hunger in, Telegram API, SQLite memory/events |
+| `prompts.json` | Shared behavior and prompt configuration for `executiveControl.py` and `chatBot.py` | Loaded locally by both modules |
 
 ### System map
 
 ```text
-           CAMERA
-             |
-             v
- +------------------------------+
- | vision.py                    |
- | YOLO + ByteTrack + MediaPipe |
- | gaze / pose / talking / QR   |
- +------------------------------+
-             |  /alwayson/vision/landmarks:o
-             v
- +------------------------------+
- | salienceNetwork.py           |
- | IPS scoring + SS assignment  |
- | two-layer arbitration        |
- +------------------------------+
-             |  RPC run(track_id, face_id, ss)
-             v
- +------------------------------+
- | executiveControl.py          |
- | SS trees + hunger tree       |
- | TTS / STT / QR feed / LLM    |
- +------------------------------+
-             |  /alwayson/executiveControl/hunger:o
-             v
- +------------------------------+
- | chatBot.py                   |
- | Telegram LLM + user memory   |
- | hunger-aware persona         |
- +------------------------------+
+camera
+  -> vision.py
+       -> /alwayson/vision/landmarks:o ----------------------+
+                                                            |
+stm context ------------------------------------------------>|
+                                                            v
+                                                      salienceNetwork.py
+                                                       - IPS scoring
+                                                       - social state assignment
+                                                       - attention arbitration
+                                                       - proactive start gating
+                                                            |
+                     /alwayson/<name>/targetCmd:o ----------+----> vision.py
+                                                            |
+                                                            +----> RPC run/status
+                                                                   executiveControl.py
+                                                                   - ss1/ss2/ss3 trees
+                                                                   - reactive greeting loop
+                                                                   - hunger + QR feeding
+                                                                   - speech + LLM replies
+                                                                   - logs + shared JSON state
+
+executiveControl.py -> /alwayson/executiveControl/hunger:o -> chatBot.py
+chatBot.py <-> Telegram users
 ```
 
 ---
@@ -59,43 +57,52 @@ Four continuously running layers, each with a distinct responsibility:
 ## 2) End-to-End Dataflow
 
 ```text
-[Frame arrives]
-  -> vision.py drains backlog, keeps freshest frame
-  -> YOLO detects faces, ByteTrack assigns stable track_id
-  -> MediaPipe computes head pose, gaze direction
-  -> lip motion analysis decides is_talking
-  -> face_recognition matches known identities (with sticky retry)
-  -> QR detector (throttled, once per 10 frames) emits new codes
-  -> landmarks bottle published per face
+[Embodied loop]
+  camera frame
+    -> vision.py keeps only the freshest frame
+    -> YOLO + ByteTrack produce tracked face boxes
+    -> face_recognition resolves identity when possible
+    -> MediaPipe adds pose/gaze, lip motion adds is_talking
+    -> per-face landmark bottles are published
 
-[salienceNetwork loop @ 20 Hz]
-  -> reads landmark stream
-  -> computes IPS score per face
-  -> assigns social state (ss1..ss4) from memory files
-  -> selects attention target (gaze) continuously
-  -> when gates pass: spawns interaction thread → RPC run()
+  landmark stream
+    -> salienceNetwork.py computes IPS per face
+    -> assigns ss1..ss4 from persistent greeted/talked memory
+    -> chooses one attention target for tracking
+    -> if gates pass and executive is idle, sends RPC run(track_id, face_id, ss)
 
-[executiveControl on run()]
-  -> starts target monitor thread (abort if face gone > 12s)
-  -> chooses behavior path: hunger tree or social SS tree
-  -> TTS/STT exchanges, synchronous starter + latest-only async LLM follow-up replies
-  -> writes replied/greeted/talked + turn-depth/trigger/hunger analytics to SQLite
-  -> publishes hunger state continuously
+  interaction request
+    -> executiveControl.py locks the selected track in salienceNetwork
+    -> monitors target continuity from the landmark stream
+    -> runs either a hunger/feeding branch or a social-state branch
+    -> uses STT/TTS plus short LLM turns for ss3 conversation
+    -> may name unknown faces back into vision.py
+    -> writes JSON/SQLite interaction state and publishes current hunger state
+    -> returns outcome so salienceNetwork.py can refresh social memory and adaptive weights
 
-[chatBot main loop @ 10 Hz]
-  -> reads hunger port
-  -> drains Telegram update queue (up to 25/cycle)
-  -> generates hunger-aware LLM replies
-  -> groups messages into inactivity-based sessions (30 min gap)
-  -> extracts user profile from message text
-  -> broadcasts HS3 starvation alerts to subscribers
+[Remote Telegram loop]
+  hunger updates from executiveControl.py
+    -> chatBot.py conditions Telegram replies and HS3 broadcasts
+    -> maintains per-user memory, rolling summaries, session grouping, and analytics
 ```
 
-### Conceptual model
+### Architectural style
 
 ```text
-Perception (high rate) → Selection gate → Interaction transaction → Memory update
-    continuous              opportunistic        bounded/abortable       persistent
+Real-time perception pipeline
+  -> `vision.py` continuously publishes observations.
+
+Stateful arbitration layer
+  -> `salienceNetwork.py` separates "who to look at" from "who to talk to".
+
+Finite-state interaction executor
+  -> `executiveControl.py` implements social-state trees (`ss1`..`ss4`) plus hunger states (`HS1`..`HS3`).
+
+Event-driven, asynchronous coordination
+  -> YARP ports/RPC connect modules, while background threads handle monitors, polling, QR, DB writes, and latest-only LLM work.
+
+Persistent memory around the loop
+  -> shared JSON files hold short-term social state, and each major module logs analytics to SQLite.
 ```
 
 ---
@@ -577,17 +584,22 @@ Additionally, Telegram metadata (sender name from `from.first_name`) is used to 
 Central prompt file loaded by both `executiveControl` and `chatBot` at startup, with runtime reload support.
 
 **`executiveControl` section:**
-- `system_default`, `system_json` — base LLM system prompts
-- `system_default` now emphasizes emotional mirroring, varied sentence openings, and natural kid-like hesitation phrases
+- `system_default` — base spoken-conversation system prompt
+- `system_overlay_hs1`, `system_overlay_hs2` — hunger overlays for normal and hungry states
+- `system_fast` — short fallback for a single spoken sentence
+- `system_json` — strict JSON prompt for name extraction
+- `extract_name_prompt` — extracts a speaker's self-stated name from an utterance
+- `convo_starter_prompt`, `convo_starter_prompt_hs1`, `convo_starter_prompt_hs2`
+- `followup_prompt`, `followup_prompt_hs1`, `followup_prompt_hs2`
+- `closing_ack_prompt`, `closing_ack_prompt_hs1`, `closing_ack_prompt_hs2`
 - `ss1_greeting`, `ss1_ask_name`, `ss1_ask_name_retry`, `ss1_nice_to_meet`
-- `ss2_greeting`
-- `convo_starter_prompt[_hs1|_hs2]`, `followup_prompt[_hs1|_hs2]`, `closing_ack_prompt[_hs1|_hs2]`
-- `hunger_ask_feed`, `hunger_still_hungry`, `hunger_look_around`, `feed_ack_hs1|feed_ack_hs2|feed_ack_hs3`
-- `reactive_greeting`
+- `ss2_greeting`, `reactive_greeting`
+- `hunger_ask_feed`, `hunger_still_hungry`, `hunger_look_around`
+- `feed_ack_hs1`, `feed_ack_hs2`, `feed_ack_hs3`
 
 **`chat_bot` section:**
 - `base_system_prompt`
-- `base_system_prompt` now further biases toward natural rhythm, reduced repetition, and context-specific emotional responses
+- `base_system_prompt` biases Telegram replies toward natural rhythm, reduced repetition, and context-specific emotional responses
 - `hs_overlays.HS1`, `hs_overlays.HS2`, `hs_overlays.HS3` — layered on top of base
 - `hs3_override_system` — strict starvation override injected at the top of the message list
 - `hs2_force_hunger_system` — forced hunger comment directive
@@ -595,7 +607,8 @@ Central prompt file loaded by both `executiveControl` and `chatBot` at startup, 
 - `hs3_broadcast_fallback` — hard-coded fallback if LLM fails
 - `summarize_system` — prompt for periodic history summarization
 - `summary_injection` — template to inject summary back into context
-- `start_greeting`, `start_greeting_with_name`, `reset_reply`
+- `hs3_recovery_trigger`, `hs3_recovery_fallback` — used when recovering from HS3 starvation mode
+- `reset_reply` — short reset message
 - `fallback_default`, `fallback_hs2`, `fallback_hs3`
 
 ---
