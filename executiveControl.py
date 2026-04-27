@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import json
 import os
 import queue
+import random
 import re
 import signal
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
 import uuid
+
+sys.setswitchinterval(0.05)
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -203,6 +209,7 @@ class InteractionResult:
     interaction_tag:      str             = ""
     hunger_state_start:   str             = ""
     hunger_state_end:     str             = ""
+    hunger_drive_enabled: bool            = True
     stomach_level_start:  float           = 100.0
     stomach_level_end:    float           = 100.0
     meals_eaten_count:    int             = 0
@@ -253,13 +260,11 @@ class LlmTurnRequest:
     max_tokens:      int
     timeout:         float
     max_len:         int
-    log_tag:         str
     turn_index:      int
     interaction_id:  Optional[str]
     request_id:      int           = 0
     stream:          bool          = True
-    retry_on_empty:  bool          = False
-    verbosity:       str           = "low"
+    history:         Tuple[Tuple[str, str], ...] = ()
 
 
 class LatencyTrace:
@@ -501,11 +506,16 @@ class LatestOnlyLlmWorker:
         self._latest_request_id    = 0
         self._pending_request: Optional[LlmTurnRequest] = None
         self._stop_event = threading.Event()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._max_parallel,
+            thread_name_prefix="llm-turn",
+        )
 
     def close(self) -> None:
         self._stop_event.set()
         with self._lock:
             self._pending_request = None
+        self._executor.shutdown(wait=False)
 
     def poll_event(self, timeout: float) -> Optional[LlmTurnEvent]:
         try:
@@ -545,13 +555,7 @@ class LatestOnlyLlmWorker:
         return assigned.request_id
 
     def _start_request(self, request: LlmTurnRequest) -> None:
-        t = threading.Thread(
-            target=self._run_request,
-            args=(request,),
-            daemon=True,
-            name=f"llm-turn-{request.request_id}",
-        )
-        t.start()
+        self._executor.submit(self._run_request, request)
 
     def _finish_request(self, request_id: int) -> None:
         to_start: Optional[LlmTurnRequest] = None
@@ -608,15 +612,16 @@ class LatestOnlyLlmWorker:
                 ))
                 return
 
+            messages: List[Dict[str, str]] = [{"role": "system", "content": request.system}]
+            for role, content in request.history:
+                if content:
+                    messages.append({"role": role, "content": content})
+            messages.append({"role": "user", "content": request.prompt})
+
             kwargs: Dict[str, Any] = {
                 "model": self.module._llm_deployment,
-                "messages": [
-                    {"role": "system", "content": request.system},
-                    {"role": "user", "content": request.prompt},
-                ],
+                "messages": messages,
                 "max_completion_tokens": request.max_tokens,
-                "reasoning_effort": "minimal",
-                "verbosity": request.verbosity,
                 "timeout": request.timeout,
             }
 
@@ -631,10 +636,10 @@ class LatestOnlyLlmWorker:
     def _run_sync_request(self, request: LlmTurnRequest, kwargs: Dict[str, Any]) -> None:
         started = time.monotonic()
         try:
-            resp = self.module._llm_create_with_watchdog(kwargs, max(0.5, request.timeout + 0.5))
+            resp = self.module.llm_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
             self.module._log(
                 "INFO",
-                f"llm_worker[{request.request_id}]: sync create() returned in {time.monotonic()-started:.2f}s",
+                f"llm_worker[{request.request_id}]: sync create() returned in {time.monotonic()-started:.2f}s model={getattr(resp, 'model', '?')}",
             )
             choice = resp.choices[0]
             text = (choice.message.content or "").strip()
@@ -653,6 +658,11 @@ class LatestOnlyLlmWorker:
                 self._emit(LlmTurnEvent("final", request.request_id, request.turn_index, request.interaction_id, now, text=text))
                 return
             finish_reason = str(getattr(choice, "finish_reason", "") or "")
+            self.module._log(
+                "WARNING",
+                f"llm_worker[{request.request_id}]: rejected response"
+                f" finish_reason={finish_reason} text_len={len(text)} max_len={request.max_len}",
+            )
             err = "empty_response_length" if finish_reason == "length" else "empty_response"
             self._emit(LlmTurnEvent(
                 kind="error",
@@ -679,6 +689,7 @@ class LatestOnlyLlmWorker:
         first_token_mono: Optional[float] = None
         finish_reason = ""
         parts: List[str] = []
+        chunk_count = 0
 
         try:
             stream = self.module.llm_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
@@ -711,6 +722,7 @@ class LatestOnlyLlmWorker:
                 choice = chunk.choices[0]
                 delta_text = self._chunk_text(choice)
                 if delta_text:
+                    chunk_count += 1
                     parts.append(delta_text)
                     if first_token_mono is None:
                         first_token_mono = time.monotonic()
@@ -831,7 +843,7 @@ class ExecutiveControlModule(yarp.RFModule):
     SS1_STT_TIMEOUT          = 15.0
     SS2_GREET_TIMEOUT        = 15.0
     SS3_STT_TIMEOUT          = 15.0
-    LLM_TIMEOUT              = 12.0
+    LLM_TIMEOUT              = 8.0
     SS3_MAX_TURNS            = 3
     STT_POLL_INTERVAL_SEC    = 0.05
 
@@ -848,7 +860,7 @@ class ExecutiveControlModule(yarp.RFModule):
     SS3_CLOSING_MAX_TOKENS     = 18
     SS3_TURN_MAX_LEN           = 140
     SS3_CLOSING_MAX_LEN        = 72
-    SS3_LLM_STREAMING_ENABLED  = True
+    SS3_LLM_STREAMING_ENABLED  = False
     SS3_LLM_WORKER_PARALLELISM = 3
 
     # Target monitor
@@ -863,6 +875,7 @@ class ExecutiveControlModule(yarp.RFModule):
     _REACTIVE_GAZE_STATES   = frozenset({"MUTUAL_GAZE", "NEAR_GAZE"})
 
     VALID_STATES    = {"ss1", "ss2", "ss3", "ss4"}
+    HUNGER_OFF_STATE = "HS0"
     DB_QUEUE_MAX    = 512
     TIMEZONE        = ZoneInfo("Europe/Rome")
 
@@ -900,7 +913,7 @@ class ExecutiveControlModule(yarp.RFModule):
     def __init__(self):
         super().__init__()
         self.module_name = "executiveControl"
-        self.period      = 1.0
+        self.period      = 0.02
         self._running    = True
 
         # YARP ports
@@ -1014,9 +1027,16 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._llm_diagnostics_enabled = rf.find("llm_diagnostics").toString().strip().lower() in {
                     "1", "true", "yes", "on",
                 }
+            self.hunger_enabled = self._rf_hunger_enabled(rf)
+            if not self.hunger_enabled:
+                self.hunger.set_level(100.0)
 
             snap = self.hunger.snapshot()
-            self._log("INFO", f"Hunger restored: {snap.level:.1f}% ({snap.state})")
+            self._log(
+                "INFO",
+                f"Hunger drive {'enabled' if self.hunger_enabled else 'disabled'}; "
+                f"stored stomach={snap.level:.1f}% ({snap.state}), effective={self._effective_hunger_state()}",
+            )
 
             # Ports
             self.handle_port.open("/" + self.module_name)
@@ -1064,7 +1084,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     model=self._llm_deployment,
                     messages=[{"role": "user", "content": "ok"}],
                     max_completion_tokens=16,
-                    reasoning_effort="minimal",
                     timeout=20.0,
                 )
                 self._log("INFO", f"LLM warm-up (post-threads) ok in {time.monotonic()-t0:.2f}s")
@@ -1082,8 +1101,6 @@ class ExecutiveControlModule(yarp.RFModule):
                         messages=[{"role": "system", "content": sys_msg},
                                   {"role": "user", "content": user_msg}],
                         max_completion_tokens=self.SS3_STARTER_MAX_TOKENS,
-                        reasoning_effort="minimal",
-                        verbosity="low",
                         timeout=20.0,
                     )
                     self._log("INFO", f"LLM diag (full-prompt, main thread) ok in {time.monotonic()-t0:.2f}s")
@@ -1098,8 +1115,6 @@ class ExecutiveControlModule(yarp.RFModule):
                         "messages": [{"role": "system", "content": sys_msg},
                                      {"role": "user", "content": user_msg}],
                         "max_completion_tokens": self.SS3_STARTER_MAX_TOKENS,
-                        "reasoning_effort": "minimal",
-                        "verbosity": "low",
                         "timeout": 20.0,
                     }
                     t0 = time.monotonic()
@@ -1112,16 +1127,37 @@ class ExecutiveControlModule(yarp.RFModule):
             return True
         except Exception as e:
             self._log("ERROR", f"configure() failed: {e}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
             return False
 
     def _open_port(self, port, name: str, optional: bool = False) -> Optional[Any]:
         if not port.open(name):
-            msg = f"Failed to open port: {name}"
-            (self._log("WARNING", msg) if optional else self._log("ERROR", msg))
-            return None if not optional else None
+            self._log("WARNING" if optional else "ERROR", f"Failed to open port: {name}")
+            return None
         self._log("INFO", f"Port open: {name}")
         return port
+
+    @staticmethod
+    def _parse_boolish(value: str, default: bool = True) -> bool:
+        v = (value or "").strip().lower()
+        if v in {"1", "true", "yes", "on", "enabled", "enable"}:
+            return True
+        if v in {"0", "false", "no", "off", "disabled", "disable"}:
+            return False
+        return default
+
+    def _rf_hunger_enabled(self, rf: yarp.ResourceFinder) -> bool:
+        if rf.check("hunger_enabled"):
+            return self._parse_boolish(rf.find("hunger_enabled").toString(), default=True)
+        if rf.check("hunger_mode"):
+            return self._parse_boolish(rf.find("hunger_mode").toString(), default=True)
+        return True
+
+    def _effective_hunger_state(self, snap: Optional[HungerSnapshot] = None) -> str:
+        if not self.hunger_enabled:
+            return self.HUNGER_OFF_STATE
+        snap = snap or self.hunger.snapshot()
+        return snap.state
 
     def interruptModule(self) -> bool:
         self._log("INFO", "Interrupting…")
@@ -1177,11 +1213,10 @@ class ExecutiveControlModule(yarp.RFModule):
         return self.period
 
     def updateModule(self) -> bool:
-        if self.hunger_enabled and self.hunger_port:
-            snap = self.hunger.snapshot()
+        if self.hunger_port:
             b = self.hunger_port.prepare()
             b.clear()
-            b.addString(snap.state)
+            b.addString(self._effective_hunger_state())
             self.hunger_port.write()
         return self._running
 
@@ -1209,7 +1244,7 @@ class ExecutiveControlModule(yarp.RFModule):
             return self._rpc_error(reply, f"Unknown command: {command}")
         except Exception as e:
             self._log("ERROR", f"respond() exception: {e}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
             return self._rpc_error(reply, str(e))
 
     def _cmd_status(self, reply: yarp.Bottle) -> bool:
@@ -1224,15 +1259,15 @@ class ExecutiveControlModule(yarp.RFModule):
             "busy_reason":     reason,
             "busy_for_sec":    round(for_sec, 3),
             "hunger_enabled":  self.hunger_enabled,
-            "hunger_state":    snap.state if snap else "HS1",
+            "hunger_state":    self._effective_hunger_state(snap),
             "hunger_level":    snap.level if snap else 100.0,
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:
         reply.addString(
             "run <track_id> <face_id> <ss1|ss2|ss3|ss4>  -- start interaction\n"
-            "hunger <hs1|hs2|hs3>                         -- set hunger state\n"
-            "hunger_mode <on|off>                         -- toggle hunger (resets to 100%)\n"
+            "hunger <hs0|hs1|hs2|hs3>                     -- set no-drive/full/hungry/starving\n"
+            "hunger_mode <on|off>                         -- toggle hunger drive (off publishes HS0)\n"
             "status                                        -- check busy / hunger\n"
             "quit                                          -- shut down"
         )
@@ -1251,29 +1286,53 @@ class ExecutiveControlModule(yarp.RFModule):
             return self._rpc_error(reply, "Usage: hunger_mode <on|off>")
         self.hunger_enabled = arg == "on"
         self.hunger.set_level(100.0)
-        self._log("INFO", f"Hunger mode {'ON' if self.hunger_enabled else 'OFF'}; reset to 100%")
-        snap = self.hunger.snapshot() if self.hunger_enabled else None
+        if not self.hunger_enabled:
+            with self._feed_condition:
+                self._feed_condition.notify_all()
+        snap = self.hunger.snapshot()
+        self._log(
+            "INFO",
+            f"Hunger drive {'ON' if self.hunger_enabled else 'OFF'}; reset to 100%; "
+            f"effective={self._effective_hunger_state(snap)}",
+        )
         return self._rpc_ok(reply, {
             "success":        True,
             "hunger_enabled": self.hunger_enabled,
-            "hunger_state":   snap.state if snap else "HS1",
-            "hunger_level":   100.0,
+            "hunger_state":   self._effective_hunger_state(snap),
+            "hunger_level":   snap.level,
         })
 
     def _cmd_hunger(self, cmd: yarp.Bottle, reply: yarp.Bottle) -> bool:
-        if not self.hunger_enabled:
-            return self._rpc_error(reply, "Hunger mode is OFF. Use: hunger_mode on")
         if cmd.size() < 2:
-            return self._rpc_error(reply, "Usage: hunger <hs1|hs2|hs3>")
+            return self._rpc_error(reply, "Usage: hunger <hs0|hs1|hs2|hs3>")
         level_map = {"hs1": 100.0, "hs2": 59.0, "hs3": 24.0}
         arg = cmd.get(1).asString().lower()
+        if arg == "hs0":
+            self.hunger_enabled = False
+            self.hunger.set_level(100.0)
+            with self._feed_condition:
+                self._feed_condition.notify_all()
+            snap = self.hunger.snapshot()
+            self._log("INFO", "Hunger drive manually disabled (HS0)")
+            return self._rpc_ok(reply, {
+                "success": True,
+                "hunger_enabled": False,
+                "hunger_level": snap.level,
+                "hunger_state": self.HUNGER_OFF_STATE,
+            })
         if arg not in level_map:
-            return self._rpc_error(reply, "Usage: hunger <hs1|hs2|hs3>")
+            return self._rpc_error(reply, "Usage: hunger <hs0|hs1|hs2|hs3>")
+        self.hunger_enabled = True
         new_level = level_map[arg]
         self.hunger.set_level(new_level)
         snap = self.hunger.snapshot()
-        self._log("INFO", f"Hunger manually set to {new_level}% ({snap.state})")
-        return self._rpc_ok(reply, {"success": True, "hunger_level": new_level, "hunger_state": snap.state})
+        self._log("INFO", f"Hunger drive enabled; manually set to {new_level}% ({snap.state})")
+        return self._rpc_ok(reply, {
+            "success": True,
+            "hunger_enabled": True,
+            "hunger_level": snap.level,
+            "hunger_state": snap.state,
+        })
 
     def _cmd_run(self, cmd: yarp.Bottle, reply: yarp.Bottle) -> bool:
         if cmd.size() < 4:
@@ -1366,7 +1425,7 @@ class ExecutiveControlModule(yarp.RFModule):
         elif social_state in ("ss2", "ss3", "ss4"):
             c["name"] = r.resolved_face_id or face_id
 
-        for key in ("interaction_tag", "hunger_state_start", "hunger_state_end",
+        for key in ("interaction_tag", "hunger_state_start", "hunger_state_end", "hunger_drive_enabled",
                     "stomach_level_start", "stomach_level_end", "meals_eaten_count", "last_meal_payload"):
             val = getattr(r, key, None)
             if val is not None:
@@ -1405,13 +1464,11 @@ class ExecutiveControlModule(yarp.RFModule):
         self._selector_set_track(track_id)
 
         try:
-            if self.hunger_enabled:
-                snap = self.hunger.snapshot()
-                hs   = snap.state
-                lvl  = snap.level
-            else:
-                hs, lvl = "HS1", 100.0
+            snap = self.hunger.snapshot() if self.hunger_enabled else None
+            hs   = self._effective_hunger_state(snap)
+            lvl  = snap.level if snap else 100.0
             result.hunger_state_start  = hs
+            result.hunger_drive_enabled = self.hunger_enabled
             result.stomach_level_start = lvl
             result.interaction_tag     = f"{social_state.upper()}{hs}"
 
@@ -1429,13 +1486,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 elif social_state == "ss3":
                     self._run_ss3(face_id, result)
 
-            if self.hunger_enabled:
-                snap2 = self.hunger.snapshot()
-                result.hunger_state_end  = snap2.state
-                result.stomach_level_end = snap2.level
-            else:
-                result.hunger_state_end  = "HS1"
-                result.stomach_level_end = 100.0
+            snap2 = self.hunger.snapshot() if self.hunger_enabled else None
+            result.hunger_state_end  = self._effective_hunger_state(snap2)
+            result.stomach_level_end = snap2.level if snap2 else 100.0
         except Exception as e:
             self._log("ERROR", f"Tree execution error: {e}")
             result.abort_reason = f"exception: {e}"
@@ -1597,6 +1650,7 @@ class ExecutiveControlModule(yarp.RFModule):
             face_id=face_id,
             first_utterance_mono=utterance_mono,
             result=result,
+            prior_assistant=starter,
         )
         result.n_turns = turns
         if turns > 0:
@@ -1616,12 +1670,16 @@ class ExecutiveControlModule(yarp.RFModule):
         face_id: str = "",
         first_utterance_mono: Optional[float] = None,
         result: Optional[InteractionResult] = None,
+        prior_assistant: Optional[str] = None,
     ) -> int:
         """Run up to SS3_MAX_TURNS follow-up turns with latest-utterance-wins semantics."""
         turns          = 0
         utterance      = first_utterance
         utterance_mono = first_utterance_mono or time.monotonic()
         interaction_id = self._get_iid()
+        history: List[Tuple[str, str]] = []
+        if prior_assistant:
+            history.append(("assistant", prior_assistant))
 
         while utterance and turns < self.SS3_MAX_TURNS:
             if result is not None and self._should_abort(result):
@@ -1662,6 +1720,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     hs=hs,
                     turn_index=next_turn,
                     interaction_id=interaction_id,
+                    history=tuple(history),
                 )
                 request_id = self._llm_turn_worker.submit(req)
                 trace.request_id = request_id
@@ -1747,6 +1806,8 @@ class ExecutiveControlModule(yarp.RFModule):
             if result is not None and self._should_abort(result):
                 break
 
+            reply = reply.replace("—", ", ")
+
             self._speech.wait_until_idle(trace=trace, poll_sec=self.TTS_POLL_INTERVAL_SEC)
             dispatch = self._speech.dispatch(
                 reply,
@@ -1759,6 +1820,9 @@ class ExecutiveControlModule(yarp.RFModule):
                     result.abort_reason = "tts_dispatch_failed"
                 self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
                 break
+
+            history.append(("user", utterance))
+            history.append(("assistant", reply))
 
             turns += 1
             if is_last:
@@ -1784,9 +1848,14 @@ class ExecutiveControlModule(yarp.RFModule):
             result.talked = True
 
             meals, timeouts, max_timeouts = 0, 0, 2
+            drive_disabled = False
             wait_since = time.time()
 
             while not self._should_abort(result):
+                if not self.hunger_enabled:
+                    drive_disabled = True
+                    self._log("INFO", "Hunger tree stopped: drive disabled")
+                    break
                 hs_before     = self.hunger.snapshot().state
                 fed, payload, new_ts = self._wait_feed_since(wait_since, self._feed_wait_timeout_sec)
 
@@ -1803,6 +1872,10 @@ class ExecutiveControlModule(yarp.RFModule):
                     wait_since = new_ts
                     timeouts   = 0
                 else:
+                    if not self.hunger_enabled:
+                        drive_disabled = True
+                        self._log("INFO", "Hunger tree stopped: drive disabled")
+                        break
                     if self._should_abort(result):
                         break
                     timeouts += 1
@@ -1814,7 +1887,9 @@ class ExecutiveControlModule(yarp.RFModule):
                     wait_since = time.time()
 
             result.meals_eaten_count = meals
-            if meals > 0:
+            if drive_disabled:
+                result.success = True
+            elif meals > 0:
                 result.success = True
             elif not result.abort_reason:
                 result.abort_reason = "no_food_qr"
@@ -1827,6 +1902,8 @@ class ExecutiveControlModule(yarp.RFModule):
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if self._abort_requested():
+                    return False, None, time.time()
+                if not self.hunger_enabled:
                     return False, None, time.time()
                 with self.hunger._lock:
                     lfts    = self.hunger.last_feed_ts
@@ -1966,7 +2043,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 utterance = self._greet_known(name, timeout=self.SS3_STT_TIMEOUT, attempts=1, tag=tag)
 
                 if utterance:
-                    turns    = self._run_conversation(f"[RSS3|{name}]", utterance, face_id=name)
+                    greeting = self._P.get("reactive_greeting", "Hi {name}").format(name=name)
+                    turns    = self._run_conversation(
+                        f"[RSS3|{name}]",
+                        utterance,
+                        face_id=name,
+                        prior_assistant=greeting,
+                    )
                     self._log("INFO", f"[RSS3|{name}] DONE turns={turns}")
 
                 if not self._abort_requested() and not dummy.aborted:
@@ -2535,7 +2618,7 @@ class ExecutiveControlModule(yarp.RFModule):
         endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().strip('"').strip("'")
         api_key    = os.getenv("AZURE_OPENAI_API_KEY",  "").strip().strip('"').strip("'")
         api_ver    = (os.getenv("OPENAI_API_VERSION", "") or os.getenv("AZURE_OPENAI_API_VERSION", "")).strip().strip('"').strip("'")
-        deployment = os.getenv("AZURE_DEPLOYMENT_GPT5_NANO", "contact-Yogaexperiment_gpt5nano")
+        deployment = os.getenv("AZURE_DEPLOYMENT_GPT41_NANO", "contact-Yogaexperiment_gpt41nano")
 
         if not all([endpoint, api_key, api_ver, deployment]):
             raise RuntimeError("Missing one or more Azure OpenAI env vars")
@@ -2574,7 +2657,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 model=deployment,
                 messages=[{"role": "user", "content": "ok"}],
                 max_completion_tokens=16,
-                reasoning_effort="minimal",
                 timeout=20.0,
             )
             self._log("INFO", f"LLM warm-up ok in {time.monotonic()-t0:.2f}s")
@@ -2589,7 +2671,6 @@ class ExecutiveControlModule(yarp.RFModule):
         timeout:         Optional[float] = None,
         response_format: Optional[Any]   = None,
         deployment:      Optional[str]   = None,
-        verbosity:       Optional[str]   = None,
     ) -> LlmResult:
         if self.llm_client is None:
             return self.LlmResult(ok=False, error="client_not_initialized")
@@ -2600,22 +2681,21 @@ class ExecutiveControlModule(yarp.RFModule):
             "model":                model_name,
             "messages":             messages,
             "max_completion_tokens": max_tokens,
-            "reasoning_effort":     "minimal",
         }
-        if verbosity is not None:
-            kwargs["verbosity"] = verbosity
         if timeout is not None:
             kwargs["timeout"] = timeout
         if response_format is not None:
             kwargs["response_format"] = response_format
 
+        last_err: str = "no_attempts"
+        last_tmo: bool = False
         for attempt in range(self.llm_retry_attempts):
             if self._abort_requested():
                 return self.LlmResult(ok=False, error="interaction_aborted")
             try:
                 req_timeout = timeout if timeout is not None else self.LLM_TIMEOUT
-                hard_timeout = max(0.5, float(req_timeout) + 0.5)
-                resp = self._llm_create_with_watchdog(kwargs, hard_timeout)
+                kwargs["timeout"] = req_timeout
+                resp = self.llm_client.chat.completions.create(**kwargs)
                 choice = resp.choices[0]
                 text = (choice.message.content or "").strip()
                 if text:
@@ -2625,14 +2705,13 @@ class ExecutiveControlModule(yarp.RFModule):
                     return self.LlmResult(ok=False, error="empty_response_length", empty=True)
                 return self.LlmResult(ok=False, error="empty_response", empty=True)
             except Exception as e:
-                err = str(e)
-                tmo = "timeout" in err.lower() or "timed out" in err.lower()
+                last_err = str(e)
+                last_tmo = "timeout" in last_err.lower() or "timed out" in last_err.lower()
                 self._log("WARNING", f"LLM attempt {attempt+1}/{self.llm_retry_attempts}: {e}")
                 if attempt < self.llm_retry_attempts - 1:
                     time.sleep(self.llm_retry_delay)
-                last_err, last_tmo = err, tmo
 
-        return self.LlmResult(ok=False, error=last_err, timed_out=last_tmo)  # type: ignore[possibly-undefined]
+        return self.LlmResult(ok=False, error=last_err, timed_out=last_tmo)
 
     def _llm_create_with_watchdog(self, kwargs: Dict[str, Any], timeout_sec: float):
         """Run Azure call in a daemon worker and enforce a hard wall-clock timeout."""
@@ -2653,7 +2732,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 result_q.put(("err", e))
 
         t = threading.Thread(target=_worker, daemon=True, name="llm-call")
-        t_spawn = time.monotonic()
         t.start()
         self._log("INFO", f"llm_watchdog: thread.start() issued, timeout={timeout_sec:.1f}s")
 
@@ -2664,7 +2742,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 "WARNING",
                 f"llm_watchdog: hard_timeout started={worker_started[0]} "
                 f"entered_create={worker_entered_create[0]} "
-                f"thread_alive={t.is_alive()} elapsed={time.monotonic()-t_spawn:.2f}s",
+                f"thread_alive={t.is_alive()} timeout_sec={timeout_sec:.1f}s",
             )
             raise TimeoutError(f"LLM hard timeout after {timeout_sec:.1f}s") from e
 
@@ -2674,7 +2752,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
     def _current_hs(self) -> str:
         if not self.hunger_enabled:
-            return "HS1"
+            return self.HUNGER_OFF_STATE
         try:
             return self.hunger.snapshot().state
         except Exception as e:
@@ -2686,22 +2764,29 @@ class ExecutiveControlModule(yarp.RFModule):
         return self._P.get(hs_key) or self._P.get(base_key, default_value)
 
     def _system_for_hs(self, hs: str) -> str:
-        base = self.LLM_SYS_FAST or self.LLM_SYS_DEFAULT
-        if hs == "HS2":
-            overlay = self._P.get(
-                "system_overlay_hs2",
-                "You are getting hungry. Keep conversation normal, but occasionally include a brief natural hunger side-comment."
-            )
-            return f"{base}\n\n{overlay}".strip()
-        overlay = self._P.get("system_overlay_hs1", "")
-        if overlay:
-            return f"{base}\n\n{overlay}".strip()
-        return base
+        base = self.LLM_SYS_DEFAULT or self.LLM_SYS_FAST
+        overlay_key = {
+            self.HUNGER_OFF_STATE: "system_overlay_hs0",
+            "HS1": "system_overlay_hs1",
+            "HS2": "system_overlay_hs2",
+            "HS3": "system_overlay_hs3",
+        }.get(hs, "system_overlay_hs1")
+        overlay = self._P.get(overlay_key, "")
+        return f"{base}\n\n{overlay}".strip() if overlay else base
 
     def _local_starter_fallback(self, hs: str) -> str:
         if hs == "HS2":
-            return "how's your day going?"
-        return "what are you up to today?"
+            return random.choice([
+                "how's your day going?",
+                "what have you been up to?",
+                "how are you doing today?",
+            ])
+        return random.choice([
+            "what are you up to today?",
+            "how's your day going so far?",
+            "anything interesting going on?",
+            "how are you doing?",
+        ])
 
     def _local_reply_fallback(self, utterance: str, is_last: bool, face_id: str = "") -> str:
         if self._is_greeting(utterance):
@@ -2720,6 +2805,7 @@ class ExecutiveControlModule(yarp.RFModule):
         hs: str,
         turn_index: int,
         interaction_id: Optional[str],
+        history: Tuple[Tuple[str, str], ...] = (),
     ) -> LlmTurnRequest:
         if is_last:
             tmpl = self._prompt_for_hs(
@@ -2729,7 +2815,6 @@ class ExecutiveControlModule(yarp.RFModule):
             )
             max_tokens = self.SS3_CLOSING_MAX_TOKENS
             max_len    = self.SS3_CLOSING_MAX_LEN
-            log_tag    = "closing_ack"
         else:
             tmpl = self._prompt_for_hs(
                 "followup_prompt",
@@ -2738,7 +2823,6 @@ class ExecutiveControlModule(yarp.RFModule):
             )
             max_tokens = self.SS3_FOLLOWUP_MAX_TOKENS
             max_len    = self.SS3_TURN_MAX_LEN
-            log_tag    = "followup"
 
         return LlmTurnRequest(
             prompt=tmpl.format(last_utterance=utterance),
@@ -2746,12 +2830,10 @@ class ExecutiveControlModule(yarp.RFModule):
             max_tokens=max_tokens,
             timeout=self.LLM_TIMEOUT,
             max_len=max_len,
-            log_tag=log_tag,
             turn_index=turn_index,
             interaction_id=interaction_id,
             stream=self.SS3_LLM_STREAMING_ENABLED,
-            retry_on_empty=False,
-            verbosity="low",
+            history=history,
         )
 
     def _llm_text_with_fallback(
@@ -2764,7 +2846,6 @@ class ExecutiveControlModule(yarp.RFModule):
         max_len: int,
         log_tag: str,
         retry_on_empty: bool = True,
-        verbosity: Optional[str] = "low",
     ) -> Optional[str]:
         if self._abort_requested():
             return None
@@ -2774,7 +2855,6 @@ class ExecutiveControlModule(yarp.RFModule):
             max_tokens=max_tokens,
             timeout=timeout,
             deployment=self._llm_deployment,
-            verbosity=verbosity,
         )
 
         clean = res.text.strip("\"'").strip() if res.ok else ""
@@ -2791,7 +2871,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     max_tokens=retry_tokens,
                     timeout=timeout,
                     deployment=self._llm_deployment,
-                    verbosity=verbosity,
                 )
                 clean_retry = res_retry.text.strip("\"'").strip() if res_retry.ok else ""
                 if clean_retry and len(clean_retry) < max_len:
@@ -2863,24 +2942,39 @@ class ExecutiveControlModule(yarp.RFModule):
         return {"answered": answered, "name": name_raw.strip() if name_raw else None, "confidence": conf}
 
     def _llm_get_starter(self, hs: str) -> str:
-        prompt  = self._prompt_for_hs(
+        prompt = self._prompt_for_hs(
             "convo_starter_prompt",
             hs,
             "Ask ONE short friendly question about the person's day (6–12 words). No greeting. Output only the sentence.",
         )
-        timeout = self.LLM_TIMEOUT
         system = self._system_for_hs(hs)
 
-        text = self._llm_text_with_fallback(
+        req = LlmTurnRequest(
             prompt=prompt,
             system=system,
             max_tokens=self.SS3_STARTER_MAX_TOKENS,
-            timeout=timeout,
+            timeout=self.LLM_TIMEOUT,
             max_len=96,
-            log_tag="starter",
-            retry_on_empty=False,
-            verbosity="low",
+            turn_index=0,
+            interaction_id=self._get_iid(),
+            stream=self.SS3_LLM_STREAMING_ENABLED,
         )
+        request_id = self._llm_turn_worker.submit(req)
+        deadline = time.monotonic() + min(self.LLM_TIMEOUT, 2.0)
+        text: Optional[str] = None
+        while time.monotonic() < deadline:
+            if self._abort_requested():
+                break
+            event = self._llm_turn_worker.poll_event(0.1)
+            if event is None:
+                continue
+            if event.request_id != request_id:
+                continue
+            if event.kind == "final":
+                text = event.text.strip()
+                break
+            if event.kind in ("error", "cancelled"):
+                break
         if text:
             return text
         self._log("WARNING", f"starter_llm_empty hs={hs}; using local fallback")
@@ -2990,6 +3084,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 extracted_name TEXT, target_stayed_biggest INTEGER,
                 interaction_tag TEXT,
                 hunger_state_start TEXT, hunger_state_end TEXT,
+                hunger_drive_enabled INTEGER,
                 stomach_level_start REAL, stomach_level_end REAL,
                 meals_eaten_count INTEGER, last_meal_payload TEXT,
                 n_turns INTEGER NOT NULL DEFAULT 0,
@@ -3008,6 +3103,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 hunger_state_after   TEXT,
                 stomach_level_after  REAL
             )""")
+            interaction_cols = {row[1] for row in c.execute("PRAGMA table_info(interactions)")}
+            if "hunger_drive_enabled" not in interaction_cols:
+                c.execute("ALTER TABLE interactions ADD COLUMN hunger_drive_enabled INTEGER")
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp)",
                 "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
@@ -3042,6 +3140,7 @@ class ExecutiveControlModule(yarp.RFModule):
                        CAST(COALESCE(replied_any,0) AS INTEGER) AS replied_any,
                        abort_reason, interaction_tag,
                        hunger_state_start, hunger_state_end,
+                       CAST(COALESCE(hunger_drive_enabled, CASE WHEN hunger_state_start='HS0' THEN 0 ELSE 1 END) AS INTEGER) AS hunger_drive_enabled,
                        stomach_level_start, stomach_level_end,
                        meals_eaten_count, last_meal_payload,
                        COALESCE(n_turns, 0) AS n_turns,
@@ -3169,10 +3268,10 @@ class ExecutiveControlModule(yarp.RFModule):
                 (interaction_id,timestamp,track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
-                 stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
+                 hunger_drive_enabled,stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
                  n_turns,trigger_mode,day_rome,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     datetime.now(self.TIMEZONE).isoformat(),
@@ -3184,6 +3283,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     int(r.get("target_stayed_biggest", True)),
                     r.get("interaction_tag"),
                     r.get("hunger_state_start"),        r.get("hunger_state_end"),
+                    int(bool(r.get("hunger_drive_enabled", r.get("hunger_state_start") != self.HUNGER_OFF_STATE))),
                     r.get("stomach_level_start"),       r.get("stomach_level_end"),
                     r.get("meals_eaten_count"),         r.get("last_meal_payload"),
                     r.get("n_turns", 0),
