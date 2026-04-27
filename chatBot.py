@@ -23,7 +23,9 @@ import signal
 import sqlite3
 import threading
 import time
-from datetime import datetime
+import traceback
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -39,7 +41,7 @@ class ChatBotModule(yarp.RFModule):
     # ------------------------- Tunables -------------------------
     MODULE_HZ: float = 10.0
 
-    VALID_HS = {"HS1", "HS2", "HS3"}
+    VALID_HS = {"HS0", "HS1", "HS2", "HS3"}
     HS_STALE_SEC: float = 60.0
 
     DEFAULT_TZ: str = "Europe/Rome"  # local timezone for time-of-day context
@@ -113,11 +115,11 @@ class ChatBotModule(yarp.RFModule):
         self._llm: Optional[AzureOpenAI] = None
         self._llm_deployment: str = ""
         self._llm_api_version: str = ""
-        self._llm_max_tokens: int = 512
-        self._llm_reply_max_tokens: int = 220
-        self._llm_hs3_broadcast_max_tokens: int = 160
-        self._llm_summary_max_tokens: int = 512
-        self._llm_reasoning_effort: str = "minimal"
+        self._llm_max_tokens: int = 1024
+        self._llm_reply_max_tokens: int = 400
+        self._llm_hs3_broadcast_max_tokens: int = 200
+        self._llm_summary_max_tokens: int = 600
+        self._llm_reasoning_effort: str = "medium"
         self._llm_verbosity: str = "low"
 
         self._db: Optional[sqlite3.Connection] = None
@@ -232,7 +234,6 @@ class ChatBotModule(yarp.RFModule):
 
         except Exception as exc:  # noqa: BLE001
             self._log("ERROR", f"configure() failed: {exc}")
-            import traceback
             traceback.print_exc()
             return False
 
@@ -316,7 +317,7 @@ class ChatBotModule(yarp.RFModule):
             if action == "set_hs":
                 if cmd.size() < 2:
                     reply.addString("error")
-                    reply.addString("usage: set_hs HS1|HS2|HS3")
+                    reply.addString("usage: set_hs HS0|HS1|HS2|HS3")
                     return True
                 hs = cmd.get(1).asString().upper().strip()
                 if hs not in self.VALID_HS:
@@ -370,25 +371,26 @@ class ChatBotModule(yarp.RFModule):
 
     @staticmethod
     def _parse_hunger_bottle(b: yarp.Bottle) -> Optional[str]:
-        # Accept string: "HS1"
+        # Accept string: "HS0"
         v0 = b.get(0)
         if v0.isString():
             s = v0.asString().upper().strip()
-            if s in ("HS1", "HS2", "HS3"):
+            if s in ChatBotModule.VALID_HS:
                 return s
 
-        # Accept int: 1/2/3
+        # Accept int: 0/1/2/3
         if v0.isInt32() or v0.isInt64():
-            return {1: "HS1", 2: "HS2", 3: "HS3"}.get(v0.asInt32())
+            return {0: "HS0", 1: "HS1", 2: "HS2", 3: "HS3"}.get(v0.asInt32())
 
         # Accept "hs HS2"
         for i in range(b.size() - 1):
             if b.get(i).isString() and b.get(i).asString().lower() == "hs":
                 nxt = b.get(i + 1)
                 if nxt.isString():
-                    return nxt.asString().upper().strip()
+                    hs = nxt.asString().upper().strip()
+                    return hs if hs in ChatBotModule.VALID_HS else None
                 if nxt.isInt32() or nxt.isInt64():
-                    return {1: "HS1", 2: "HS2", 3: "HS3"}.get(nxt.asInt32())
+                    return {0: "HS0", 1: "HS1", 2: "HS2", 3: "HS3"}.get(nxt.asInt32())
         return None
 
     def _is_hs_stale(self) -> bool:
@@ -400,10 +402,10 @@ class ChatBotModule(yarp.RFModule):
 
     def _effective_hs(self) -> str:
         if self._hs_source == "rpc":
-            return self._raw_hs if self._raw_hs in self.VALID_HS else ""
+            return self._raw_hs if self._raw_hs in self.VALID_HS else "HS0"
         if self._hs_source == "port" and not self._is_hs_stale() and self._raw_hs in self.VALID_HS:
             return self._raw_hs
-        return ""
+        return "HS0"
 
     # ------------------------- Prompts -------------------------
     def _resolve_prompts_path(self) -> str:
@@ -465,7 +467,7 @@ class ChatBotModule(yarp.RFModule):
     @staticmethod
     def _rpc_help_text() -> str:
         return (
-            "commands: status | help | set_hs HS1|HS2|HS3 | clear_hs | reload_prompts"
+            "commands: status | help | set_hs HS0|HS1|HS2|HS3 | clear_hs | reload_prompts"
         )
 
     # ------------------------- Telegram Polling -------------------------
@@ -660,11 +662,10 @@ class ChatBotModule(yarp.RFModule):
         self._log("INFO", f"/reset from {chat_id}")
 
     def _get_or_create_session(self, chat_id: int, now_ts: float) -> str:
-        import uuid as _uuid
         key = int(chat_id)
         rec = self._session_tracker.get(key)
         if rec is None or (now_ts - rec["last_message_ts"]) > self.SESSION_GAP_SEC:
-            sid = f"{key}_{int(now_ts)}_{_uuid.uuid4().hex[:8]}"
+            sid = f"{key}_{int(now_ts)}_{uuid.uuid4().hex[:8]}"
             self._session_tracker[key] = {"session_id": sid, "last_message_ts": now_ts}
         else:
             self._session_tracker[key]["last_message_ts"] = now_ts
@@ -856,7 +857,7 @@ class ChatBotModule(yarp.RFModule):
         if prev == curr:
             return
         self._log("INFO", f"HS effective: {prev or 'none'} -> {curr or 'none'}")
-        if prev == "HS3" and curr != "HS3":
+        if prev == "HS3" and curr not in ("HS3", "HS0"):
             self._broadcast_hs3_recovery(curr)
 
     def _broadcast_hs3_recovery(self, new_hs: str) -> None:
@@ -919,7 +920,7 @@ class ChatBotModule(yarp.RFModule):
             raise RuntimeError("OPENAI_API_VERSION not set")
 
         http_client = httpx.Client(
-            timeout=20.0,
+            timeout=60.0,
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=5,
@@ -931,22 +932,22 @@ class ChatBotModule(yarp.RFModule):
             azure_endpoint=endpoint,
             api_key=api_key,
             api_version=api_version,
-            timeout=20.0,
+            timeout=60.0,
             max_retries=0,
             http_client=http_client,
         )
 
-        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "192")
+        self._llm_max_tokens = int(self._get_env("TELEGRAM_LLM_MAX_TOKENS") or "1024")
         self._llm_reply_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "96"
+            self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "400"
         )
         self._llm_hs3_broadcast_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "80"
+            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "200"
         )
         self._llm_summary_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "192"
+            self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "600"
         )
-        reasoning_effort = (self._get_env("TELEGRAM_LLM_REASONING_EFFORT") or "minimal").strip().lower()
+        reasoning_effort = (self._get_env("TELEGRAM_LLM_REASONING_EFFORT") or "medium").strip().lower()
         verbosity = (self._get_env("TELEGRAM_LLM_VERBOSITY") or "low").strip().lower()
         self._llm_reasoning_effort = "" if reasoning_effort in {"", "none", "off"} else reasoning_effort
         self._llm_verbosity = "" if verbosity in {"", "none", "off"} else verbosity
@@ -1650,7 +1651,7 @@ class ChatBotModule(yarp.RFModule):
         try:
             dt = datetime.fromtimestamp(ts, tz=ZoneInfo(tz_name))
         except Exception:
-            dt = datetime.utcfromtimestamp(ts)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
         hour = dt.hour
         if 5 <= hour < 12:
@@ -1699,7 +1700,7 @@ class ChatBotModule(yarp.RFModule):
         try:
             dt = datetime.fromtimestamp(ts, tz=ZoneInfo(tz_name))
         except Exception:
-            dt = datetime.utcfromtimestamp(ts)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         day_abbr = dt.strftime("%a")            # Mon
         day_num  = dt.strftime("%-d")           # 6  (no leading zero)
         month    = dt.strftime("%b")            # Mar
