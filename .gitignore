@@ -4,6 +4,10 @@ __pycache__/
 .vscode/
 .venv/
 
+# Codex and Claude
+.codex
+claude/
+
 # Build artifacts
 build/
 
