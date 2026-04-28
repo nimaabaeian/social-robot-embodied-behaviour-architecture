@@ -1,354 +1,71 @@
-# Always-on Cognitive Architecture - Embodied Behaviour
+# Always-on Cognitive Architecture — Embodied Behaviour (iCub)
 
-> **Robot:** iCub
-> **Platform:** YARP
-> **Author:** Nima Abaeian
+Robot: iCub  ·  Platform: YARP
 
-Technical reference for the always-on proactive social robot cognitive architecture.
-Covers the embodied perception-to-interaction loop plus the parallel Telegram companion channel.
+This repository contains a compact, always-on cognitive architecture for short, face-to-face social interactions and a parallel remote Telegram social channel. The design separates perception, attention/arbitration, and interaction execution into modular YARP modules to meet real-time and persistence requirements.
 
----
+Contents
+- `vision.py`         — perception front-end (camera → landmarks, QR, targetBox)
+- `salienceNetwork.py` — attention selection and proactive gating (IPS)
+# Always-on Cognitive Architecture — Embodied Behaviour (iCub)
 
-## 1) Big Picture
+Robot: iCub  ·  Platform: YARP
 
-The system is a set of cooperating YARP modules, not a single monolith.
-The embodied control path is `vision.py -> salienceNetwork.py -> executiveControl.py`.
-`chatBot.py` runs in parallel as a Telegram-facing social channel; it consumes the shared hunger state and shared prompt file, but keeps its own Telegram-side memory and is not in the real-time face-to-face loop.
+This repository contains a compact, always-on cognitive architecture for short, face-to-face social interactions and a parallel remote Telegram social channel. The design separates perception, attention/arbitration, and interaction execution into modular YARP modules to meet real-time and persistence requirements.
 
-| Component | Main responsibility | Main interfaces |
-|---|---|---|
-| `vision.py` | Perception front-end: detect, track, identify, and describe visible faces; emit QR events | Camera in, landmarks/features/QR out, target command in |
-| `salienceNetwork.py` | Attention and initiation policy: score faces, assign social state, hold gaze target, decide when to start a proactive interaction, and adapt per-person IPS weights | Landmarks in, STM context in, target command out, RPC to `executiveControl.py` |
-| `executiveControl.py` | Interaction executor: run social-state trees, reactive greetings, hunger/feeding logic, speech I/O, and interaction logging | RPC from `salienceNetwork.py`, landmarks/STT/QR in, speech/hunger out, RPC back to selector and vision |
-| `chatBot.py` | Remote social channel: Telegram messaging, user memory, summaries, hunger-aware broadcasts and replies | Hunger in, Telegram API, SQLite memory/events |
-| `prompts.json` | Shared behavior and prompt configuration for `executiveControl.py` and `chatBot.py` | Loaded locally by both modules |
+Contents
+- `vision.py`         — perception front-end (camera → landmarks, QR, targetBox)
+- `salienceNetwork.py` — attention selection and proactive gating (IPS)
+- `executiveControl.py` — interaction execution (social-state trees, hunger, STT/TTS, LLM)
+- `chatBot.py`        — Telegram companion and per-user memory
+- `prompts.json`      — shared prompt configuration for behavior and LLMs
 
-### System map
+Principles
+- Clear separation of concerns: perception → arbitration → execution
+- Real-time front-end with backlog draining and lightweight bottles
+- Stateful arbitration with adaptive per-person weights and habituation
+- Interaction executor with guarded monitors, timeouts, and persistent memory
+- Async LLM usage with fallbacks and latency-conscious orchestration
 
-```text
-camera
-  -> vision.py
-       -> /alwayson/vision/landmarks:o ----------------------+
-                                                            |
-stm context ------------------------------------------------>|
-                                                            v
-                                                      salienceNetwork.py
-                                                       - IPS scoring
-                                                       - social state assignment
-                                                       - attention arbitration
-                                                       - proactive start gating
-                                                            |
-                     /alwayson/<name>/targetCmd:o ----------+----> vision.py
-                                                            |
-                                                            +----> RPC run/status
-                                                                   executiveControl.py
-                                                                   - ss1/ss2/ss3 trees
-                                                                   - reactive greeting loop
-                                                                   - hunger + QR feeding
-                                                                   - speech + LLM replies
-                                                                   - logs + shared JSON state
+High-level dataflow
+1) Perception: `vision.py` reads the camera, detects and tracks faces, computes landmarks (pose, gaze, mouth motion), runs recognition against `faces/`, and emits per-face landmark bottles and QR events.
+2) Arbitration: `salienceNetwork.py` consumes landmarks and optional STM context, computes an Interest Priority Score (IPS) per face, applies hysteresis and habituation, assigns social states (ss1..ss4) from local JSON memory, and selects an attention target. When gating passes, it issues an RPC `run(track_id, face_id, ss)` to `executiveControl.py` and streams target command(s) back to `vision.py`.
+3) Execution: `executiveControl.py` locks the target, starts a monitor, chooses hunger vs social trees (HS0..HS3 influence), performs STT/TTS and short LLM turns for conversational flows, updates persisted memory (greeted/talked), and returns a compact interaction result so the selector can update learning weights.
+4) Remote channel: `executiveControl.py` publishes hunger state to `chatBot.py` over a YARP hunger port. `chatBot.py` runs independently, manages Telegram long-polling, per-user memory and summaries, HS3 broadcasts, and analytic logging to SQLite.
 
-executiveControl.py -> /alwayson/executiveControl/hunger:o -> chatBot.py
-chatBot.py <-> Telegram users
-```
+Core concepts
+- Interest Priority Score (IPS): normalized combination of proximity, centrality, approach velocity, and gaze, modulated by per-person learned weights. IPS drives attention ranking and proactive gating.
+- Social states: `ss1` (unknown), `ss2` (known, not greeted), `ss3` (known, greeted, not talked), `ss4` (already talked today). Social state determines proactive thresholds and which interaction tree to run.
+- Hunger model: persistent, time-draining stomach level in `executiveControl.py` influencing behavior and broadcasting to `chatBot.py` (HS0..HS3 semantics).
+- Adaptive learning: per-person weights shift after interactions (success/failure) and are persisted to JSON to tune future IPS calculations.
+- LLM usage: short assistant turns (name extraction, convo starter, follow-ups, closings) with latency-aware orchestration and fallbacks; prompts are centralized in `prompts.json`.
 
----
+Ports and RPC (overview)
+- Vision ports: `/alwayson/vision/landmarks:o`, `/alwayson/vision/qr:o`, `/alwayson/vision/targetCmd:i` (selector → vision)
+- Salience ports: `/alwayson/salienceNetwork/landmarks:i`, `/alwayson/salienceNetwork/targetCmd:o`, `/alwayson/salienceNetwork/debug:o` and RPC server `/salienceNetwork` (set_track_id, reset_cooldown)
+- Executive RPC: `/executiveControl` (status/run), hunger publish `/alwayson/executiveControl/hunger:o`
+- ChatBot ports: RPC `/chatBot/rpc`, hunger input `/alwayson/chatBot/hunger:i`
 
-## 2) End-to-End Dataflow
+Persistence and analytics
+- Short-term social state: `memory/greeted_today.json`, `memory/talked_today.json`, `memory/last_greeted.json`, `memory/hunger_state.json`
+- Learning weights: `memory/learning.json`
+- Interaction analytics and Telegram memory: per-module SQLite DBs in `data_collection/` for event logging and analysis.
 
-```text
-[Embodied loop]
-  camera frame
-    -> vision.py keeps only the freshest frame
-    -> YOLO + ByteTrack produce tracked face boxes
-    -> face_recognition resolves identity when possible
-    -> MediaPipe adds pose/gaze, lip motion adds is_talking
-    -> per-face landmark bottles are published
+Operational notes
+- The perception loop drains stale frames and only processes the freshest frame each cycle to reduce latency.
+- `salienceNetwork.py` runs a high-frequency attention loop and lower-frequency gating for proactive interactions; it includes IO and DB worker threads to offload disk writes.
+- `executiveControl.py` protects interactions with a target monitor (timeout if face lost), has STT/TTS coordination (speech dispatch + timing heuristics), and uses a latest-only LLM worker to prioritize the most recent user input.
+- `chatBot.py` is independent and tolerant of intermittent network/API errors; it summarizes chats periodically and stores compact summaries for fast context building.
 
-  landmark stream
-    -> salienceNetwork.py computes IPS per face
-    -> assigns ss1..ss4 from persistent greeted/talked memory
-    -> chooses one attention target for tracking
-    -> if gates pass and executive is idle, sends RPC run(track_id, face_id, ss)
+Development
+- Use YARP to connect ports and RPCs between modules during local integration testing.
+- Shared prompts are in `prompts.json`; both `executiveControl.py` and `chatBot.py` load overlays from this file.
 
-  interaction request
-    -> executiveControl.py locks the selected track in salienceNetwork
-    -> monitors target continuity from the landmark stream
-    -> runs either a hunger/feeding branch or a social-state branch
-    -> uses STT/TTS plus short LLM turns for ss3 conversation
-    -> may name unknown faces back into vision.py
-    -> writes JSON/SQLite interaction state and publishes current hunger state
-    -> returns outcome so salienceNetwork.py can refresh social memory and adaptive weights
-
-[Remote Telegram loop]
-  hunger updates from executiveControl.py
-    -> chatBot.py conditions Telegram replies and HS3 broadcasts
-    -> maintains per-user memory, rolling summaries, session grouping, and analytics
-```
-
-### Architectural style
-
-```text
-Real-time perception pipeline
-  -> `vision.py` continuously publishes observations.
-
-Stateful arbitration layer
-  -> `salienceNetwork.py` separates "who to look at" from "who to talk to".
-
-Finite-state interaction executor
-  -> `executiveControl.py` implements social-state trees (`ss1`..`ss4`) plus hunger states (`HS1`..`HS3`).
-
-Event-driven, asynchronous coordination
-  -> YARP ports/RPC connect modules, while background threads handle monitors, polling, QR, DB writes, and latest-only LLM work.
-
-Persistent memory around the loop
-  -> shared JSON files hold short-term social state, and each major module logs analytics to SQLite.
-```
+Contact
+For questions about design or instrumentation, check the top of each module (`vision.py`, `salienceNetwork.py`, `executiveControl.py`, `chatBot.py`) for implementation notes and tuning constants.
 
 ---
-
-## 3) Module Details
-
-## 3.1 `vision.py` — Perception Front-End
-
-### What it does
-
-Processes the camera stream and publishes high-fidelity per-face descriptors for downstream modules.
-
-- **YOLO face detection** — detects faces with confidence threshold, expands bounding boxes by 10% for better face crops
-- **ByteTrack** — maintains stable `track_id` across frames, even through brief occlusions
-- **face_recognition matching** — compares embeddings against a `faces/` image database; uses min+median distance for robustness; unknown faces are retried up to 3 times with configurable interval; identity is kept sticky for 1.5 s after a tracker drop
-- **MediaPipe Face Landmarker** — computes 3D head pose (pitch/yaw/roll), gaze direction vector, and cosine angle to camera for up to 10 faces
-- **Talking detection** — tracks normalized mouth-open values in a 10-frame sliding window; face is flagged `is_talking` if the standard deviation exceeds a threshold
-- **QR detection** — throttled to 1 in 10 frames; emits each new QR value exactly once per appearance (hysteresis window suppresses repeat triggers)
-- **Target delegation** — receives a lightweight `[track_id, ips_score]` command from `salienceNetwork`, finds the matching bounding box, and forwards a FaceTracker-compatible full bbox bottle
-- **Backlog draining** — reads the camera port until no new frames are queued, then processes only the freshest frame to minimize display lag
-- **Runtime naming** — `name <person_name> id <track_id>` RPC command enrolls the visible face into the identity database on the fly
-
-### Per-face landmark output
-
-```text
-face_id, track_id,
-bbox(x,y,w,h), zone, distance,
-gaze_direction(x,y,z), pitch, yaw, roll, cos_angle,
-attention, is_talking, time_in_view
-```
-
-### Perception pipeline
-
-```text
-RGB frame (freshest, backlog drained)
-  |
-  +--> YOLO face detector (conf > 0.7, bbox +10%)
-  |       |
-  |       +--> ByteTrack → stable track_id
-  |       |
-  |       +--> face_recognition → face_id
-  |              (sticky 1.5s, retry up to 3x)
-  |
-  +--> MediaPipe Face Landmarker → pose / gaze
-  |
-  +--> Lip motion std-dev → is_talking flag
-  |
-  +--> QR detector (1/10 frames) → /alwayson/vision/qr:o
-  |
-  +--> fused per-face landmark bottle → /alwayson/vision/landmarks:o
-```
-
-### Ports and RPC
-
-| Direction | Port | Content |
-|---|---|---|
-| Input | `/alwayson/vision/img:i` | Raw RGB camera stream |
-| Input | `/alwayson/vision/targetCmd:i` | `[track_id, ips]` from salienceNetwork |
-| Output | `/alwayson/vision/landmarks:o` | Per-face landmark bottles |
-| Output | `/alwayson/vision/features:o` | Scene-level compact features |
-| Output | `/alwayson/vision/targetBox:o` | FaceTracker-compatible bbox bottle |
-| Output | `/alwayson/vision/faces_view:o` | Annotated debug image |
-| Output | `/alwayson/vision/qr:o` | Detected QR payload strings |
-| RPC | `/alwayson/vision/rpc` | `name`, `help`, `process`, `quit` |
-
----
-
-## 3.2 `salienceNetwork.py` — Target Selection and Gating
-
-### What it does
-
-Consumes the face landmark stream and decides two things every loop cycle:
-
-1. **Who to look at** (attention target — continuous)
-2. **Who to approach** (dialogue trigger — opportunistic, gated)
-
-It also updates per-person adaptive weights after each interaction outcome.
-
-### Two-layer arbitration
-
-```text
-LAYER A — ATTENTION (head/eye gaze target)
-  Priority order:
-    1) RPC override track_id (set_track_id command)
-       — set at start of every interaction (proactive or responsive),
-         released (-1) when the interaction ends
-    2) Active interaction lock (holds gaze on current partner)
-    3) Highest IPS face
-
-LAYER B — DIALOGUE (start proactive interaction)
-  All of these must pass:
-    - interaction_busy == false
-    - no RPC override active
-    - candidate social state eligible (IPS >= SS threshold)
-    - cooldown passed for this face
-    - executiveControl status != busy
-```
-
-### IPS score (Interest Priority Score)
-
-The IPS ranks how interesting each face is right now.
-
-**Step 1 — Normalize input signals**
-
-```text
-s_prox = clamp(bbox_height / image_height, 0, 1)     # closeness
-
-cx, cy = bbox center
-s_cent = clamp(1 - dist_to_image_center / max_dist, 0, 1)  # centrality
-
-s_vel  = clamp((area_now - area_prev) / (W*H) * 10, 0, 1)  # approach speed
-
-s_gaze = max(0, cos_angle)                           # looking toward camera
-```
-
-**Step 2 — Weighted sum (per-person or baseline)**
-
-```text
-baseline:  w_prox=0.5, w_cent=0.15, w_vel=0.3, w_gaze=0.5
-
-base_ips = w_prox*s_prox + w_cent*s_cent + w_vel*s_vel + w_gaze*s_gaze
-```
-
-If a person has been interacted with before, their learned weights replace the baseline.
-
-**Step 3 — Hysteresis bonus**
-
-```text
-if face.track_id == current_target:
-    ips += 0.3    # stabilizes current target, prevents noisy switching
-```
-
-**Step 4 — Habituation decay (conditional)**
-
-Applied only to the current tracked face and only when both are true:
-- interaction is not running (stops immediately when any proactive or responsive interaction begins)
-- more than one face is visible
-
-```text
-t_idle      = min(time_in_view, time_since_last_interaction)
-habituation = exp(-0.10 * t_idle)
-ips_current = ips_current * habituation
-```
-
-This gradually releases gaze lock toward a more novel face.
-
-**Step 5 — Eligibility thresholds by social state**
-
-```text
-ss1 (unknown)            IPS >= 1.10  (stricter threshold)
-ss2 (known, ungreeted)   IPS >= 0.90  (lowest proactive threshold)
-ss3 (greeted, no talk)   IPS >= 1.00  (still proactive, less than ss2)
-ss4 (fully talked)       IPS >= 99.0  (never proactively triggered)
-```
-
-**Tracking gate (look-only)**
-
-```text
-start/switch threshold     = min_track_ips (default 0.9)
-stop threshold             = min_track_ips - hysteresis (default 0.8)
-stop debounce              = 2.0 s
-keepalive resend           = every 0.5 s
-```
-
-### Adaptive learning
-
-After each interaction the weights of the involved person shift:
-
-```text
-success → increase prox/vel weights, decrease gaze weight
-          (reward proximity and approach behavior)
-
-failure → decrease prox/vel weights, increase gaze weight
-          (require stronger gaze signal before re-approaching)
-
-shift rate = ±0.15 per interaction
-saved to learning.json
-```
-
-### Social state assignment
-
-Social state determines which interaction tree runs and sets the IPS threshold.
-
-```text
-face_id == "unknown"                              → ss1
-face_id known, not in greeted_today.json          → ss2
-face_id known, greeted today, not in talked_today → ss3
-face_id known, greeted and talked today           → ss4
-```
-
-### Context-aware cooldown
-
-An optional STM context stream adjusts how long before re-approaching the same face:
-
-```text
-STM label = 1  (lively)   → short cooldown (3 s)
-STM label = 0  (calm)     → long cooldown (15 s)
-STM missing               → default cooldown (5 s)
-```
-
-### Ports and RPC
-
-| Direction | Port | Content |
-|---|---|---|
-| Input | `/alwayson/salienceNetwork/landmarks:i` | Face landmark bottles from vision |
-| Input | `/alwayson/salienceNetwork/context:i` | Optional STM context label |
-| Output | `/alwayson/salienceNetwork/targetCmd:o` | `[track_id, ips]` to vision |
-| Output | `/alwayson/salienceNetwork/debug:o` | Debug state bottle |
-| RPC server | `/salienceNetwork` | `set_track_id`, `reset_cooldown` |
-| RPC client | `/salienceNetwork/executiveControl:rpc` | `status`, `run` |
-| RPC client | `/salienceNetwork/faceTracker:rpc` | `run` on startup, `sus` on close |
-
----
-
-## 3.3 `executiveControl.py` — Interaction Engine
-
-### What it does
-
-- Executes social interaction trees for each social state (ss1–ss4)
-- Runs a hunger feeding tree when the robot is hungry
-- Handles responsive interactions (greeting detection from STT, opportunistic QR feeds)
-- Manages the `HungerModel` — a time-draining stomach level that persists across restarts
-- Supports `hunger_mode on|off` to enable/disable hunger-driven behavior globally
-- Publishes current hunger state to `chatBot`
-- Performs cross-channel personalization: looks up the face's name in the Telegram DB to personalize face-to-face conversation with learned preferences (likes, dislikes, topics, inside jokes)
-- Uses Azure OpenAI for name extraction and short conversational turns
-- Logs compact interaction analytics (e.g., replied-any, hunger context, turn depth, trigger mode) to SQLite
-
-### Behavior routing
-
-```text
-run(track_id, face_id, ss)
-  |
-  +--> ss4?  → no-operation success, return immediately
-  |
-  +--> resolve face_id (wait up to 5 s if still "recognizing")
-  |
-  +--> start target monitor (abort if face absent > 12 s)
-  |
-  +--> check hunger state:
-        HS3 (starving)          → hunger tree always
-        HS2 (hungry) + ss3      → hunger tree
-        otherwise               → social SS tree
-  |
-  +--> return compact result JSON to salienceNetwork
-```
+This README is an architecture summary rather than a usage tutorial. If you want, I can add a concise run / quickstart section next (YARP init, recommended RF config, and example yarp connect commands).
 
 ### Social interaction trees
 
@@ -398,6 +115,15 @@ No operation. Returns success immediately.
 
 ```text
 Drain rate:  100% over 5 hours (~0.0055%/s)
+
+**Recent Changes (last 4 commits)**
+
+- **executiveControl.py:** Added a thread-safe `HungerModel` with persistent hunger state and thresholds (HS0..HS3); introduced `LatencyTrace`, `SpeechCoordinator`, and a `LatestOnlyLlmWorker` to improve LLM turn latency and allow latest-request-wins execution; refined SS3 conversation flow, TTS timing heuristics, QR feeding and reactive greeting loops, and expanded interaction logging and persistence (last_greeted / greeted_today / hunger_state files).
+- **chatBot.py:** Telegram companion improvements: integrated Azure OpenAI client with warmup/chat/summarize flows, stronger per-user memory and summary injection, HS3 broadcast mechanics, session tracking, SQLite analytics views, and more robust long-polling / typing indications and error handling.
+- **prompts.json:** Expanded and reorganized prompts used by both modules — new hunger overlays, HS3 broadcast templates, system overrides, and specialized prompts for name extraction, conversation starters, follow-ups, and closings.
+- **salienceNetwork.py:** IPS and selection refinements: per-person adaptive weights, habituation decay, hysteresis bonuses, context-aware cooldowns, improved eligibility gating, and background IO/DB workers for learning and analytics persistence.
+
+These four commits collectively tighten end-to-end behaviour: attention scoring and gating are more adaptive, interactions (both face-to-face and Telegram) are more context-aware and hunger-sensitive, and LLM usage is optimized for responsiveness and safe fallbacks.
 Persists:    hunger_state.json (survives restarts)
 
 HS1: level >= 60%  (normal)

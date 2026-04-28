@@ -1,3 +1,24 @@
+# Copyright (c) 2026 Nima Abaeian
+#
+# Author: Nima Abaeian
+# Organization: Istituto Italiano di Tecnologia
+# Lab: Cognitive Architecture for Collaborative Technologies
+# License: GNU GPL v3
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
 """salienceNetwork.py - real-time face selection and interaction gating."""
 
 import fcntl
@@ -130,10 +151,10 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self.executive_control_rpc_name = "/executiveControl"
 
-        self.learning_path     = Path(_ALWAYSON_DIR) / "memory" / "learning.json"
-        self.greeted_path      = Path(_ALWAYSON_DIR) / "memory" / "greeted_today.json"
-        self.talked_path       = Path(_ALWAYSON_DIR) / "memory" / "talked_today.json"
-        self.last_greeted_path = Path(_ALWAYSON_DIR) / "memory" / "last_greeted.json"
+        self.learning_path     = Path(_MODULE_DIR) / "memory" / "learning.json"
+        self.greeted_path      = Path(_MODULE_DIR) / "memory" / "greeted_today.json"
+        self.talked_path       = Path(_MODULE_DIR) / "memory" / "talked_today.json"
+        self.last_greeted_path = Path(_MODULE_DIR) / "memory" / "last_greeted.json"
 
         # YARP ports
         self.landmarks_port: Optional[yarp.BufferedPortBottle] = None
@@ -213,7 +234,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
 
-        self.db_path = str(Path(_ALWAYSON_DIR) / "data_collection" / "salience_network.db")
+        self.db_path = str(Path(_MODULE_DIR) / "data_collection" / "salience_network.db")
         self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAXSIZE)
         self._db_thread: Optional[threading.Thread] = None
         self._context_connected_logged = False

@@ -1,3 +1,24 @@
+# Copyright (c) 2026 Nima Abaeian
+#
+# Author: Nima Abaeian
+# Organization: Istituto Italiano di Tecnologia
+# Lab: Cognitive Architecture for Collaborative Technologies
+# License: GNU GPL v3
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
 "executiveControl.py - iCub social interaction controller"
 
 from __future__ import annotations
@@ -31,7 +52,7 @@ _MODULE_DIR  = os.path.dirname(os.path.abspath(__file__))
 _ALWAYSON_DIR = os.path.dirname(_MODULE_DIR)
 
 load_dotenv()
-load_dotenv(os.path.join(_ALWAYSON_DIR, "memory", "llm.env"), override=False)
+load_dotenv(os.path.join(_MODULE_DIR, "llm.env"), override=False)
 
 import httpx                   
 from openai import AzureOpenAI 
@@ -834,10 +855,10 @@ class ExecutiveControlModule(yarp.RFModule):
         os.path.join(_MODULE_DIR,   "prompts.json"),
         os.path.join(_ALWAYSON_DIR, "prompts.json"),
     ]
-    DB_FILE             = os.path.join(_ALWAYSON_DIR, "data_collection", "executive_control.db")
-    LAST_GREETED_FILE   = os.path.join(_ALWAYSON_DIR, "memory", "last_greeted.json")
-    GREETED_TODAY_FILE  = os.path.join(_ALWAYSON_DIR, "memory", "greeted_today.json")
-    HUNGER_STATE_FILE   = os.path.join(_ALWAYSON_DIR, "memory", "hunger_state.json")
+    DB_FILE             = os.path.join(_MODULE_DIR, "data_collection", "executive_control.db")
+    LAST_GREETED_FILE   = os.path.join(_MODULE_DIR, "memory", "last_greeted.json")
+    GREETED_TODAY_FILE  = os.path.join(_MODULE_DIR, "memory", "greeted_today.json")
+    HUNGER_STATE_FILE   = os.path.join(_MODULE_DIR, "memory", "hunger_state.json")
 
     # Timeouts (seconds)
     SS1_STT_TIMEOUT          = 15.0

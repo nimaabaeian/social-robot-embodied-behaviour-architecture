@@ -1,5 +1,19 @@
+# Python
+__pycache__/
+*.pyc
 .vscode/
-memory/
-faces/
-.codex
-.claude/
+.venv/
+
+# Build artifacts
+build/
+
+# Project data
+modules/memory/
+modules/faces/
+modules/llm.env
+
+# Runtime databases
+modules/data_collection/
+
+# Downloaded model weights (auto-downloaded at runtime)
+modules/*.pt

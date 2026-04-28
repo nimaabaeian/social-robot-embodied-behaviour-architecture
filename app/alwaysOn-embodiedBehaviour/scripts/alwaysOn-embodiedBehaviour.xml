@@ -1,0 +1,118 @@
+<application>
+    <name>alwaysOn-embodiedBehaviour</name>
+
+    <authors>
+        <author email="nima.abaeian@iit.it">Nima Abaeian</author>
+    </authors>
+
+    <!-- ======== MODULES ======== -->
+    <module>
+        <name>alwayson_vision</name>
+        <parameters></parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <module>
+        <name>yarpview</name>
+        <parameters>--name /yarpview/vision_faces_view:i</parameters>
+        <node>localhost</node>
+    </module>
+
+    <module>
+        <name>alwayson_executiveControl</name>
+        <parameters></parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <module>
+        <name>alwayson_salienceNetwork</name>
+        <parameters></parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <module>
+        <name>faceTracker</name>
+        <parameters>--context faceTracker --from faceTracker.ini --platform berry</parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <module>
+        <name>alwayson_chatBot</name>
+        <parameters></parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <!-- ======== CONNECTIONS ======== -->
+    <connection>
+        <from>/icub/cam/left</from>
+        <to>/alwayson/vision/img:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/vision/faces_view:o</from>
+        <to>/yarpview/vision_faces_view:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/vision/landmarks:o</from>
+        <to>/alwayson/executiveControl/landmarks:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/speech2text/text:o</from>
+        <to>/alwayson/executiveControl/stt:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/executiveControl/speech:o</from>
+        <to>/acapelaSpeak/speech:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/vision/qr:o</from>
+        <to>/alwayson/executiveControl/qr:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/vision/landmarks:o</from>
+        <to>/alwayson/salienceNetwork/landmarks:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/acapelaSpeak/bookmark:o</from>
+        <to>/speech2text/bookmark:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/stm/context:o</from>
+        <to>/alwayson/salienceNetwork/context:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/salienceNetwork/targetCmd:o</from>
+        <to>/alwayson/vision/targetCmd:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/vision/targetBox:o</from>
+        <to>/faceTracker/faceCoordinate:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+    <connection>
+        <from>/alwayson/executiveControl/hunger:o</from>
+        <to>/alwayson/chatBot/hunger:i</to>
+        <protocol>tcp</protocol>
+    </connection>
+
+</application>
