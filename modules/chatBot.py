@@ -75,8 +75,7 @@ class ChatBotModule(yarp.RFModule):
     MAX_USER_CHARS: int = 500
     MAX_REPLY_CHARS: int = 4096  # Telegram limit
 
-    HS3_BROADCAST_COOLDOWN_SEC: int = 30 * 60  # per-subscriber cooldown
-    HS3_SKIP_RECENT_SEC: int = 10 * 60  # don't broadcast if user chatted recently
+    HS3_PROACTIVE_COOLDOWN_SEC: int = 15 * 60  # per-subscriber cooldown
 
     JOKE_CANDIDATE_TTL_SEC: int = 30 * 24 * 3600  # expire unconfirmed joke candidates after 30 days
     JOKE_CANDIDATE_MAX: int = 20  # max pending candidates per user
@@ -137,7 +136,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_api_version: str = ""
         self._llm_max_tokens: int = 1024
         self._llm_reply_max_tokens: int = 400
-        self._llm_hs3_broadcast_max_tokens: int = 200
+        self._llm_hs3_proactive_max_tokens: int = 200
         self._llm_summary_max_tokens: int = 600
         self._llm_reasoning_effort: str = "medium"
         self._llm_verbosity: str = "low"
@@ -189,7 +188,7 @@ class ChatBotModule(yarp.RFModule):
                     chat_id          INTEGER PRIMARY KEY,
                     started_at       INTEGER NOT NULL,
                     last_seen_at     INTEGER NOT NULL,
-                    last_broadcast_at INTEGER NOT NULL DEFAULT 0
+                    last_proactive_at INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS chat_memory (
                     chat_id       INTEGER PRIMARY KEY,
@@ -214,7 +213,7 @@ class ChatBotModule(yarp.RFModule):
                     assistant_chars INTEGER,
                     hunger_mentioned INTEGER,
                     llm_fallback INTEGER,
-                    broadcast_mode TEXT,
+                    proactive_mode TEXT,
                     note TEXT,
                     turn_count_at_event INTEGER,
                     session_id TEXT
@@ -225,7 +224,7 @@ class ChatBotModule(yarp.RFModule):
                 CREATE INDEX IF NOT EXISTS idx_chat_events_type ON chat_events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_session ON chat_events(session_id);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_seen ON subscribers(last_seen_at);
-                CREATE INDEX IF NOT EXISTS idx_subscribers_last_broadcast ON subscribers(last_broadcast_at);
+                CREATE INDEX IF NOT EXISTS idx_subscribers_last_proactive ON subscribers(last_proactive_at);
                 CREATE INDEX IF NOT EXISTS idx_chat_memory_updated ON chat_memory(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_user_memory_updated ON user_memory(updated_at);
                 """
@@ -263,8 +262,8 @@ class ChatBotModule(yarp.RFModule):
     def updateModule(self) -> bool:
         self._read_hunger()
         self._process_tg_updates(max_per_cycle=25)
-        self._maybe_hs3_broadcast()
-        self._maybe_hs_transition_broadcast()
+        self._maybe_hs3_proactive()
+        self._maybe_hs_transition_proactive()
         self._prev_effective_hs = self._effective_hs()
         return self._running
 
@@ -474,9 +473,9 @@ class ChatBotModule(yarp.RFModule):
     def _summarize_system_prompt(self) -> str:
         return self._prompts.get("summarize_system", "Summarize the conversation briefly.")
 
-    def _hs3_broadcast_prompts(self) -> Tuple[str, str]:
-        sys_p = self._prompts.get("hs3_broadcast_system", "")
-        usr_p = self._prompts.get("hs3_broadcast_user", "")
+    def _hs3_proactive_prompts(self) -> Tuple[str, str]:
+        sys_p = self._prompts.get("hs3_proactive_system", "")
+        usr_p = self._prompts.get("hs3_proactive_user", "")
         return sys_p, usr_p
 
     def _set_hs_state(self, hs: str, source: str) -> None:
@@ -825,7 +824,7 @@ class ChatBotModule(yarp.RFModule):
         self._db_commit()
 
     # ------------------------- HS3 Broadcast -------------------------
-    def _maybe_hs3_broadcast(self) -> None:
+    def _maybe_hs3_proactive(self) -> None:
         eff = self._effective_hs()
         if eff != "HS3":
             return
@@ -833,54 +832,80 @@ class ChatBotModule(yarp.RFModule):
         entering = self._prev_effective_hs != "HS3"
         now = int(time.time())
 
-        # on entry broadcast to all; otherwise apply per-user cooldown
+        # on entry send to all; otherwise apply per-user cooldown
         if entering:
             candidates = self._db_list_subscribers()
         else:
-            candidates = self._db_broadcast_candidates(now - self.HS3_BROADCAST_COOLDOWN_SEC)
+            candidates = self._db_proactive_candidates(now - self.HS3_PROACTIVE_COOLDOWN_SEC)
 
         if not candidates:
             return
 
-        text = self._llm_hs3_broadcast() or self._prompts.get("hs3_broadcast_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
+        text = self._llm_hs3_proactive() or self._prompts.get("hs3_proactive_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
 
         sent_any = False
         for chat_id in candidates:
-            # Skip-recent guard only applies to periodic cooldown re-broadcasts,
-            # NOT on entry: when the robot just became starving everyone must be notified.
-            if not entering:
-                last_seen = self._db_subscriber_last_seen(chat_id)
-                if last_seen and (now - last_seen) < self.HS3_SKIP_RECENT_SEC:
-                    self._log("DEBUG", f"HS3 broadcast skipped -> {chat_id} (chatted {now - last_seen:.0f}s ago)")
-                    continue
             self._tg_send(chat_id, text)
-            self._db_mark_broadcast(chat_id, commit=False)
+            self._db_mark_proactive(chat_id, commit=False)
             self._db_log_event(
-                event_type="hs3_broadcast",
+                event_type="hs3_proactive",
                 chat_id=chat_id,
                 hs="HS3",
                 assistant_chars=len(text),
                 hunger_mentioned=1,
-                broadcast_mode=("enter" if entering else "cooldown"),
-                note="broadcast_sent",
+                proactive_mode=("enter" if entering else "cooldown"),
+                note="proactive_sent",
                 commit=False,
             )
             sent_any = True
-            self._log("INFO", f"HS3 broadcast -> {chat_id} ({'enter' if entering else 'cooldown'})")
+            self._log("INFO", f"HS3 proactive -> {chat_id} ({'enter' if entering else 'cooldown'})")
 
         if sent_any:
             self._db_commit()
 
-    def _maybe_hs_transition_broadcast(self) -> None:
+    def _maybe_hs_transition_proactive(self) -> None:
         prev = self._prev_effective_hs
         curr = self._effective_hs()
         if prev == curr:
             return
         self._log("INFO", f"HS effective: {prev or 'none'} -> {curr or 'none'}")
         if prev == "HS3" and curr not in ("HS3", "HS0"):
-            self._broadcast_hs3_recovery(curr)
+            self._proactive_hs3_recovery(curr)
+        if prev == "HS1" and curr == "HS2":
+            self._proactive_hs2_entry()
 
-    def _broadcast_hs3_recovery(self, new_hs: str) -> None:
+    def _proactive_hs2_entry(self) -> None:
+        candidates = self._db_list_subscribers()
+        if not candidates:
+            return
+        msgs = [
+            {"role": "system", "content": self._system_prompt("HS2")},
+            {"role": "user", "content": self._prompts.get(
+                "hs2_entry_trigger",
+                "text your friends a very short casual message — you've started feeling a little peckish. offhand, not dramatic. one sentence max.",
+            )},
+        ]
+        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
+        text = text or self._prompts.get("hs2_entry_fallback", "hm. starting to feel a lil hungry ngl")
+        sent_any = False
+        for chat_id in candidates:
+            self._tg_send(chat_id, text)
+            self._db_log_event(
+                event_type="hs2_entry",
+                chat_id=chat_id,
+                hs="HS2",
+                assistant_chars=len(text),
+                hunger_mentioned=1,
+                proactive_mode="hs1_to_hs2",
+                note="hs2_entry_proactive_sent",
+                commit=False,
+            )
+            sent_any = True
+            self._log("INFO", f"HS2 entry proactive -> {chat_id}")
+        if sent_any:
+            self._db_commit()
+
+    def _proactive_hs3_recovery(self, new_hs: str) -> None:
         candidates = self._db_list_subscribers()
         if not candidates:
             return
@@ -891,7 +916,7 @@ class ChatBotModule(yarp.RFModule):
                 "send a short message to your friends about how you're feeling right now",
             )},
         ]
-        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_broadcast_max_tokens)
+        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
         text = text or self._prompts.get(
             "hs3_recovery_fallback",
             "omg they just fed me!! 😭❤️ feeling SO much better now, thank you",
@@ -905,12 +930,12 @@ class ChatBotModule(yarp.RFModule):
                 hs=new_hs,
                 assistant_chars=len(text),
                 hunger_mentioned=0,
-                broadcast_mode="hs3_exit",
-                note="hs3_recovery_sent",
+                proactive_mode="hs3_exit",
+                note="hs3_recovery_proactive_sent",
                 commit=False,
             )
             sent_any = True
-            self._log("INFO", f"HS3 recovery broadcast -> {chat_id}")
+            self._log("INFO", f"HS3 recovery proactive -> {chat_id}")
         if sent_any:
             self._db_commit()
 
@@ -961,7 +986,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_reply_max_tokens = int(
             self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "400"
         )
-        self._llm_hs3_broadcast_max_tokens = int(
+        self._llm_hs3_proactive_max_tokens = int(
             self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "200"
         )
         self._llm_summary_max_tokens = int(
@@ -973,7 +998,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_verbosity = "" if verbosity in {"", "none", "off"} else verbosity
 
         self._llm_reply_max_tokens = max(64, min(self._llm_reply_max_tokens, self._llm_max_tokens))
-        self._llm_hs3_broadcast_max_tokens = max(64, min(self._llm_hs3_broadcast_max_tokens, self._llm_max_tokens))
+        self._llm_hs3_proactive_max_tokens = max(64, min(self._llm_hs3_proactive_max_tokens, self._llm_max_tokens))
         self._llm_summary_max_tokens = max(128, min(self._llm_summary_max_tokens, self._llm_max_tokens))
 
         if self._llm_summary_max_tokens <= self._llm_reply_max_tokens:
@@ -987,7 +1012,7 @@ class ChatBotModule(yarp.RFModule):
             "LLM token caps: "
             f"global={self._llm_max_tokens}, "
             f"reply={self._llm_reply_max_tokens}, "
-            f"hs3_broadcast={self._llm_hs3_broadcast_max_tokens}, "
+            f"hs3_proactive={self._llm_hs3_proactive_max_tokens}, "
             f"summary={self._llm_summary_max_tokens}, "
             f"reasoning_effort={self._llm_reasoning_effort or 'off'}, "
             f"verbosity={self._llm_verbosity or 'off'}",
@@ -1116,12 +1141,12 @@ class ChatBotModule(yarp.RFModule):
         out = self._llm_chat(msgs, max_tokens=self._llm_summary_max_tokens)
         return (out or "")[:400].strip()
 
-    def _llm_hs3_broadcast(self) -> str:
-        sys_p, usr_p = self._hs3_broadcast_prompts()
+    def _llm_hs3_proactive(self) -> str:
+        sys_p, usr_p = self._hs3_proactive_prompts()
         if not sys_p or not usr_p:
             return ""
         msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}]
-        return self._llm_chat(msgs, max_tokens=self._llm_hs3_broadcast_max_tokens)
+        return self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
 
     def _fallback(self, hs: str) -> str:
         if hs == "HS3":
@@ -1747,7 +1772,7 @@ class ChatBotModule(yarp.RFModule):
                 CAST(COALESCE(assistant_chars, 0) AS INTEGER)   AS assistant_chars,
                 CAST(COALESCE(hunger_mentioned, 0) AS INTEGER)  AS hunger_mentioned,
                 CAST(COALESCE(llm_fallback, 0) AS INTEGER)      AS llm_fallback,
-                COALESCE(broadcast_mode, '')                    AS broadcast_mode,
+                COALESCE(proactive_mode, '')                    AS proactive_mode,
                 COALESCE(note, '')                              AS note,
                 turn_count_at_event,
                 session_id
@@ -1764,7 +1789,7 @@ class ChatBotModule(yarp.RFModule):
                 hs,
                 SUM(CASE WHEN event_type = 'user_message' THEN 1 ELSE 0 END) AS user_messages,
                 SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) AS bot_replies,
-                SUM(CASE WHEN event_type = 'hs3_broadcast' THEN 1 ELSE 0 END) AS hs3_broadcasts,
+                SUM(CASE WHEN event_type = 'hs3_proactive' THEN 1 ELSE 0 END) AS hs3_proactives,
                 COUNT(DISTINCT CASE WHEN event_type IN ('user_message','assistant_reply') THEN chat_id END) AS active_users,
                 CASE
                     WHEN SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) = 0 THEN 0.0
@@ -1840,7 +1865,7 @@ class ChatBotModule(yarp.RFModule):
         assistant_chars: Optional[int] = None,
         hunger_mentioned: Optional[int] = None,
         llm_fallback: Optional[int] = None,
-        broadcast_mode: Optional[str] = None,
+        proactive_mode: Optional[str] = None,
         note: str = "",
         turn_count_at_event: Optional[int] = None,
         session_id: Optional[str] = None,
@@ -1855,7 +1880,7 @@ class ChatBotModule(yarp.RFModule):
             INSERT INTO chat_events
             (timestamp, day_rome, chat_id, event_type, hs,
              user_chars, assistant_chars, hunger_mentioned, llm_fallback,
-             broadcast_mode, note, turn_count_at_event, session_id)
+             proactive_mode, note, turn_count_at_event, session_id)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
@@ -1868,7 +1893,7 @@ class ChatBotModule(yarp.RFModule):
                 int(assistant_chars) if assistant_chars is not None else None,
                 int(hunger_mentioned) if hunger_mentioned is not None else None,
                 int(llm_fallback) if llm_fallback is not None else None,
-                broadcast_mode,
+                proactive_mode,
                 note,
                 int(turn_count_at_event) if turn_count_at_event is not None else None,
                 session_id,
@@ -1928,20 +1953,20 @@ class ChatBotModule(yarp.RFModule):
         rows = self._db.execute("SELECT chat_id FROM subscribers").fetchall()
         return [int(r[0]) for r in rows]
 
-    def _db_broadcast_candidates(self, cutoff_ts: int) -> List[int]:
+    def _db_proactive_candidates(self, cutoff_ts: int) -> List[int]:
         if not self._db:
             return []
         rows = self._db.execute(
-            "SELECT chat_id FROM subscribers WHERE last_broadcast_at<=?",
+            "SELECT chat_id FROM subscribers WHERE last_proactive_at<=?",
             (int(cutoff_ts),),
         ).fetchall()
         return [int(r[0]) for r in rows]
 
-    def _db_mark_broadcast(self, chat_id: int, commit: bool = True) -> None:
+    def _db_mark_proactive(self, chat_id: int, commit: bool = True) -> None:
         if not self._db:
             return
         self._db.execute(
-            "UPDATE subscribers SET last_broadcast_at=? WHERE chat_id=?",
+            "UPDATE subscribers SET last_proactive_at=? WHERE chat_id=?",
             (int(time.time()), int(chat_id)),
         )
         if commit:

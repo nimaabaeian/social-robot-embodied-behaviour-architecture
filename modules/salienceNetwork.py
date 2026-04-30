@@ -121,7 +121,7 @@ class SalienceNetworkModule(yarp.RFModule):
     }
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
-    HABITUATION_LAMBDA = 0.10  # Habituation decay
+    HABITUATION_LAMBDA = 0.20  # Habituation decay
     WEIGHT_SHIFT_RATE = 0.15  # How much weights drift per interaction (+/-)
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15

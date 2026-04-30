@@ -946,6 +946,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self.qr_port:        Optional[yarp.BufferedPortBottle] = None
         self._selector_rpc:  Optional[yarp.RpcClient]   = None
         self._vision_rpc:    Optional[yarp.RpcClient]   = None
+        self._emotions_rpc:  Optional[yarp.RpcClient]   = None
         self.attach(self.handle_port)
 
         # Hunger
@@ -1058,6 +1059,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 f"Hunger drive {'enabled' if self.hunger_enabled else 'disabled'}; "
                 f"stored stomach={snap.level:.1f}% ({snap.state}), effective={self._effective_hunger_state()}",
             )
+            self._set_face_emotion(self._effective_hunger_state(snap))
 
             # Ports
             self.handle_port.open("/" + self.module_name)
@@ -1886,6 +1888,8 @@ class ExecutiveControlModule(yarp.RFModule):
                     result.last_meal_payload = payload
                     snap = self.hunger.snapshot()
                     self._log("INFO", f"Feed #{meals}: {payload} → stomach {snap.level:.1f}")
+                    if snap.state != hs_before:
+                        self._set_face_emotion(snap.state)
                     self._speak_wait(self._feed_ack(hs_before))
                     if snap.state == "HS1":
                         break
@@ -1981,6 +1985,8 @@ class ExecutiveControlModule(yarp.RFModule):
                 self.hunger.feed(delta, val, now)
                 snap          = self.hunger.snapshot()
                 self._log("INFO", f"QR: {val} (+{delta}) → stomach {snap.level:.1f} ({snap.state})")
+                if snap.state != hs_before:
+                    self._set_face_emotion(snap.state)
 
                 with self._feed_condition:
                     self._feed_condition.notify_all()
@@ -2614,6 +2620,46 @@ class ExecutiveControlModule(yarp.RFModule):
         except Exception as e:
             self._log("WARNING", f"selector_reset_cooldown failed: {e}")
 
+    def _get_emotions_rpc(self) -> yarp.RpcClient:
+        if self._emotions_rpc is None:
+            client = yarp.RpcClient()
+            lp     = f"/{self.module_name}/emotions/rpc"
+            if not client.open(lp):
+                raise RuntimeError(f"Failed to open {lp}")
+            if not client.addOutput("/icub/face/emotions/in"):
+                client.close()
+                raise RuntimeError("Failed to connect to /icub/face/emotions/in")
+            self._emotions_rpc = client
+        return self._emotions_rpc
+
+    def _set_face_emotion(self, hs: str) -> None:
+        _HS_EMOTIONS = {
+            "HS3": [("mou", "sad"), ("leb", "sad"), ("reb", "sad")],
+            "HS2": [("mou", "sad"), ("leb", "neu"), ("reb", "neu")],
+            "HS1": [("all", "hap")],
+        }
+        parts = _HS_EMOTIONS.get(hs)
+        if parts is None:
+            return
+
+        def _send():
+            try:
+                rpc = self._get_emotions_rpc()
+                for part, expr in parts:
+                    cmd = yarp.Bottle()
+                    cmd.addString("set")
+                    cmd.addString(part)
+                    cmd.addString(expr)
+                    rpc.write(cmd)
+                self._log("INFO", f"Face emotion set for {hs}")
+            except Exception as e:
+                self._log("WARNING", f"_set_face_emotion({hs}) failed: {e}")
+                if self._emotions_rpc:
+                    self._emotions_rpc.close()
+                    self._emotions_rpc = None
+
+        threading.Thread(target=_send, daemon=True).start()
+
     def _submit_face_name(self, track_id: int, name: str) -> bool:
         try:
             cmd = yarp.Bottle()
@@ -2639,7 +2685,7 @@ class ExecutiveControlModule(yarp.RFModule):
         endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().strip('"').strip("'")
         api_key    = os.getenv("AZURE_OPENAI_API_KEY",  "").strip().strip('"').strip("'")
         api_ver    = (os.getenv("OPENAI_API_VERSION", "") or os.getenv("AZURE_OPENAI_API_VERSION", "")).strip().strip('"').strip("'")
-        deployment = os.getenv("AZURE_DEPLOYMENT_GPT41_NANO", "contact-Yogaexperiment_gpt41nano")
+        deployment = os.getenv("AZURE_DEPLOYMENT_GPT41_MINI", "contact-Yogaexperiment_gpt41mini")
 
         if not all([endpoint, api_key, api_ver, deployment]):
             raise RuntimeError("Missing one or more Azure OpenAI env vars")

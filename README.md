@@ -100,7 +100,7 @@ flowchart LR
 
 ### alwayson_salienceNetwork
 - Computes IPS (Interaction Priority Score) from landmarks and context.
-- Selects target face; applies habituation and cooldown.
+- Selects target face; applies habituation (λ=0.20) and cooldown.
 - Triggers ExecutiveControl via RPC; drives FaceTracker.
 - Persists daily interaction memory and analytics.
 
@@ -112,6 +112,7 @@ flowchart LR
 ### alwayson_executiveControl
 - Social interaction state machine (SS1-SS4).
 - Hunger model and QR-based feeding flow.
+- Sets iCub face expression on HS transitions (HS1: happy, HS2: mouth sad, HS3: fully sad) and at startup.
 - Speech I/O and LLM-based turn management.
 - SQLite logging for interaction analytics.
 
@@ -126,7 +127,8 @@ flowchart LR
 
 ### alwayson_chatBot
 - Telegram integration for always-on conversational access.
-- Hunger-aware prompting and broadcasts.
+- Hunger-aware prompting and proactive messages: sends to all subscribers on HS1→HS2 entry and on HS3 entry (re-sent every 15 min while starving).
+- HS3→HS1/HS2 recovery message sent on feeding.
 - SQLite memory and event logging.
 
 **RPC port**: `/chatBot/rpc`  
