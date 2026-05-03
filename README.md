@@ -1,6 +1,8 @@
 ![Always On Embodied Behaviour](media/embodiedbehaviour.png)
 
-This is the **embodied behaviour module** of the [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git) for iCub. It implements the always-on social interaction stack.
+This repository provides the **embodied behaviour module** for the iCub humanoid robot, functioning as a core subsystem of the [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git). It serves as the foundation for the robot's always-on social interaction stack.
+
+At its core, the module synthesizes a primary internal homeostatic motivation, the **Orexigenic Drive**. By embedding this drive directly into the continuous cognitive architecture, it enables the iCub to exhibit autonomous, lifelike, and drive-regulated social behaviors over extended periods.
 
 ## Tech Stack
 
@@ -49,8 +51,8 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 **Core modules**
 - **alwayson_vision**: Perception pipeline (YOLO + MediaPipe + face ID). Produces landmarks, face view, QR data, and target boxes.
 - **alwayson_salienceNetwork**: Selects the most salient face, manages interaction gating and cooldowns, and drives face tracking.
-- **alwayson_executiveControl**: Orchestrates interaction flow, speech I/O, hunger model, and LLM-driven dialog.
-- **alwayson_chatBot**: Telegram interface driven by the same hunger state and prompts.
+- **alwayson_executiveControl**: Orchestrates interaction flow, speech I/O, Orexigenic drive model, and LLM-driven dialog.
+- **alwayson_chatBot**: Telegram interface driven by the same Orexigenic state and prompts.
 
 **External modules**
 - [speech2text](https://gitlab.iit.it/cognitiveInteraction/speech2text)
@@ -63,7 +65,7 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 2. SalienceNetwork ranks faces, selects a target, and streams `targetCmd` to vision.
 3. Vision streams `targetBox` to FaceTracker for gaze/pose control.
 4. ExecutiveControl consumes landmarks, STT, and QR, then dispatches speech and LLM-driven responses.
-5. ExecutiveControl publishes hunger state used by ChatBot for Telegram interactions.
+5. ExecutiveControl publishes Orexigenic state used by ChatBot for Telegram interactions.
 
 ### Module Interaction Map
 
@@ -111,23 +113,23 @@ flowchart LR
 
 ### alwayson_executiveControl
 - Social interaction state machine (SS1-SS4).
-- Hunger model and QR-based feeding flow.
+- Orexigenic drive model and QR-based feeding flow.
 - Sets iCub face expression on HS transitions (HS1: happy, HS2: mouth sad, HS3: fully sad) and at startup.
 - Speech I/O and LLM-based turn management.
 - SQLite logging for interaction analytics.
 
 **RPC port**: `/<module_name>` (default: `/executiveControl`)  
 **Commands**:
-- `status` or `ping` → module state and hunger
+- `status` or `ping` → module state
 - `help` → command list
-- `hunger_mode <on|off>` → enable/disable hunger drive
-- `hunger <hs0|hs1|hs2|hs3>` → set hunger level
+- `hunger_mode <on|off>` → enable/disable Orexigenic drive
+- `hunger <hs0|hs1|hs2|hs3>` → set Orexigenic drive level
 - `run <track_id> <face_id> <ss1|ss2|ss3|ss4>` → trigger interaction
 - `quit` → stop module
 
 ### alwayson_chatBot
 - Telegram integration for always-on conversational access.
-- Hunger-aware prompting and proactive messages: sends to all subscribers on HS1→HS2 entry and on HS3 entry (re-sent every 15 min while starving).
+- Orexigenic-drive-aware prompting and proactive messages: sends to all subscribers on HS1→HS2 entry and on HS3 entry (re-sent every 15 min while starving).
 - HS3→HS1/HS2 recovery message sent on feeding.
 - SQLite memory and event logging.
 
@@ -135,8 +137,8 @@ flowchart LR
 **Commands**:
 - `status` → module status
 - `help` → command list
-- `set_hs HS3` → force hunger state via RPC
-- `clear_hs` → clear forced hunger state
+- `set_hs HS3` → force Orexigenic state via RPC
+- `clear_hs` → clear forced Orexigenic state
 - `reload_prompts` → reload prompt JSON
 
 ## YARP Ports and Connections
