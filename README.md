@@ -230,10 +230,6 @@ make install
 - **Face models**: Vision auto-downloads the YOLO face model on first run; ensure network access or place the model file locally.
 - **Python deps**: `requirements.txt` is installed during the build; use a virtualenv if running modules manually.
 
-## Homeostatic Learning
-
-Salience learning is based on homeostatic reward, computed as `stomach_level_end − stomach_level_start`, and stored in `modules/memory/homeostatic_learning.json`. Interactions that reduce the drive (i.e., lead to feeding) produce positive reward and increase proximity and gaze weights, making individuals who feed the robot more visually salient over time. Costly or neutral interactions produce conservative or minimal weight changes.
-
 ## Data Collection
 
 Runtime SQLite databases are stored under `modules/data_collection/`.
