@@ -132,6 +132,8 @@ class SalienceNetworkModule(yarp.RFModule):
     MAX_WEIGHT_SHIFT_PER_INTERACTION = 0.08
     HOMEOSTATIC_REWARD_EPSILON = 0.2
     REWARD_EMA_ALPHA = 0.25
+    SHORT_INTERACTION_MIN_TURNS = 2
+    SHORT_INTERACTION_REWARD_THRESHOLD = 5.0
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15
     FACE_IPS_LOG_PERIOD_SEC = 0.5
@@ -1932,6 +1934,15 @@ class SalienceNetworkModule(yarp.RFModule):
             self._log_homeostatic_delta(
                 result, person_id, reward, "skipped", "hunger_disabled", old_weights, old_weights
             )
+            return
+
+        n_turns = self._result_int(result, "n_turns", 0)
+        if n_turns < self.SHORT_INTERACTION_MIN_TURNS and abs(reward) < self.SHORT_INTERACTION_REWARD_THRESHOLD:
+            old_weights = self._get_person_weights(person_id)
+            self._log_homeostatic_delta(
+                result, person_id, reward, "skipped", "short_interaction_noise", old_weights, old_weights
+            )
+            self._log("INFO", f"homeostatic learning skipped: {person_id} short interaction (turns={n_turns} reward={reward:.2f})")
             return
 
         with self._memory_lock:
