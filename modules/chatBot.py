@@ -82,7 +82,7 @@ class ChatBotModule(yarp.RFModule):
 
     DB_FILENAME: str = "chat_bot.db"
     PROMPTS_FILENAME: str = "prompts.json"
-    HS2_HUNGER_EVERY_N: int = 3  # force hunger comment after N messages without one
+    HS2_HUNGER_EVERY_N: int = 3  # force Orexigenic drive mention after N messages without one
     SESSION_GAP_SEC: float = 1800.0  # 30 min inactivity = new session
 
     # Compiled emoji regex (proper Unicode ranges — avoids false-positives from CJK/Arabic etc.)
@@ -111,7 +111,7 @@ class ChatBotModule(yarp.RFModule):
         self._hunger_port: Optional[yarp.BufferedPortBottle] = None
         self._rpc_port: Optional[yarp.Port] = None
 
-        # Hunger state
+        # Orexigenic drive state
         self._raw_hs: str = ""
         self._last_hs_update: float = 0.0
         self._hs_source: str = "none"
@@ -143,7 +143,7 @@ class ChatBotModule(yarp.RFModule):
 
         self._db: Optional[sqlite3.Connection] = None
         self._user_memory: Dict[str, Dict[str, Any]] = {}  # in-memory cache, persisted to SQLite
-        self._hs2_hunger_counters: Dict[str, int] = {}  # per-user hunger mention counter
+        self._hs2_hunger_counters: Dict[str, int] = {}  # per-user Orexigenic drive mention counter
         self._session_tracker: Dict[int, Dict[str, Any]] = {}  # chat_id -> {session_id, last_message_ts}
 
     # ------------------------- RFModule API -------------------------
@@ -374,7 +374,7 @@ class ChatBotModule(yarp.RFModule):
             reply.addString(str(exc))
             return True
 
-    # ------------------------- Hunger -------------------------
+    # ------------------------- Orexigenic drive -------------------------
     def _read_hunger(self) -> None:
         if not self._hunger_port:
             return
@@ -760,7 +760,7 @@ class ChatBotModule(yarp.RFModule):
             )
 
         hs2_forced = False
-        if hs == "HS2":  # force hunger comment if overdue
+        if hs == "HS2":  # force Orexigenic drive mention if overdue
             counter = self._hs2_hunger_counters.get(str(chat_id), 0)
             if counter >= self.HS2_HUNGER_EVERY_N:
                 messages.append({
@@ -788,7 +788,7 @@ class ChatBotModule(yarp.RFModule):
 
         self._tg_send(chat_id, reply_text)
 
-        if hs == "HS2":  # update hunger counter
+        if hs == "HS2":  # update Orexigenic drive counter
             key = str(chat_id)
             if hs2_forced or self._reply_mentions_hunger(reply_text):
                 self._hs2_hunger_counters[key] = 0
@@ -1211,15 +1211,9 @@ class ChatBotModule(yarp.RFModule):
             "tone": "",
         })
 
-        # Normalize jokes memory into a single map:
-        # inside_jokes: phrase -> {"count": int, "last_seen": int}
-        # Supports migration from older layouts:
-        # - inside_jokes as list (confirmed jokes)
-        # - joke_candidates as separate map
+        # Normalize jokes memory: inside_jokes: phrase -> {"count": int, "last_seen": int}
         jokes_raw = record.get("inside_jokes")
-        candidates_raw = record.pop("joke_candidates", None)
         merged_jokes: Dict[str, Dict[str, int]] = {}
-
         if isinstance(jokes_raw, dict):
             for phrase, meta in jokes_raw.items():
                 if not isinstance(phrase, str) or not phrase.strip():
@@ -1228,48 +1222,12 @@ class ChatBotModule(yarp.RFModule):
                 if isinstance(meta, dict):
                     count = int(meta.get("count", 1) or 1)
                     last_seen = int(meta.get("last_seen", 0) or 0)
-                elif isinstance(meta, list):
-                    count = int(meta[0]) if len(meta) > 0 else 1
-                    last_seen = int(meta[1]) if len(meta) > 1 else 0
-                elif isinstance(meta, int):
-                    count, last_seen = int(meta), 0
                 else:
                     count, last_seen = 1, 0
                 merged_jokes[key] = {
                     "count": max(1, count),
                     "last_seen": max(0, last_seen),
                 }
-        elif isinstance(jokes_raw, list):
-            for phrase in jokes_raw:
-                if isinstance(phrase, str) and phrase.strip():
-                    key = phrase.strip().lower()
-                    merged_jokes[key] = {"count": 2, "last_seen": 0}
-
-        if isinstance(candidates_raw, dict):
-            for phrase, meta in candidates_raw.items():
-                if not isinstance(phrase, str) or not phrase.strip():
-                    continue
-                key = phrase.strip().lower()
-                if isinstance(meta, list):
-                    count = int(meta[0]) if len(meta) > 0 else 1
-                    last_seen = int(meta[1]) if len(meta) > 1 else 0
-                elif isinstance(meta, int):
-                    count, last_seen = int(meta), 0
-                elif isinstance(meta, dict):
-                    count = int(meta.get("count", 1) or 1)
-                    last_seen = int(meta.get("last_seen", 0) or 0)
-                else:
-                    count, last_seen = 1, 0
-
-                prev = merged_jokes.get(key, {"count": 0, "last_seen": 0})
-                merged_jokes[key] = {
-                    "count": max(prev["count"], max(1, count)),
-                    "last_seen": max(prev["last_seen"], max(0, last_seen)),
-                }
-
-        # Drop removed keys if present in older records.
-        record.pop("relationship_style", None)
-        record.pop("trust_level", None)
         record["inside_jokes"] = merged_jokes
         return record
 
@@ -1594,8 +1552,6 @@ class ChatBotModule(yarp.RFModule):
                 key=lambda item: int(item[1].get("last_seen", 0) or 0),
             )
             jokes_confirmed = [self._clean_capture(p, max_len=80) for p, _ in ranked if self._is_meaningful(p, min_len=3)]
-        elif isinstance(jokes_raw, list):  # backward-compatible read of older records
-            jokes_confirmed = _safe_list(jokes_raw, max_items=3)
         if jokes_confirmed:
             parts.append(f"Inside joke: {jokes_confirmed[-1]}.")
 
@@ -1681,7 +1637,7 @@ class ChatBotModule(yarp.RFModule):
 
     @staticmethod
     def _reply_mentions_hunger(text: str) -> bool:
-        """Heuristic check: did the model already include a hunger mention?"""
+        """Heuristic check: did the model already include an Orexigenic drive mention?"""
         return bool(re.search(
             r"\b(?:hungry|hunger|starv|tummy|stomach|eat|food|snack|feed|fed)",
             text, re.IGNORECASE,
