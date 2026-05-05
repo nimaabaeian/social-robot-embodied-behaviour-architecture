@@ -591,19 +591,11 @@ class VisionAnalyzer(yarp.RFModule):
         if command.get(0).asString() == "quit":
             reply.addString("quitting")
             return False
-        if command.get(0).asString() == "process":
-            if command.size() < 2:
-                reply.addString("nack")
-                reply.addString("Usage: process on/off")
-                return True
-            # process flag not used in merged module, but keep for compat
-            reply.addString("ok")
-            return True
         if command.get(0).asString() == "name":
             self._handle_face_naming(command, reply)
             return True
         if command.get(0).asString() == "help":
-            reply.addString("Commands: quit | process on/off | name <person_name> id <track_id>")
+            reply.addString("Commands: quit | name <person_name> id <track_id>")
             return True
 
         reply.addString("nack")
@@ -1099,8 +1091,7 @@ class VisionAnalyzer(yarp.RFModule):
         if target_face is None:
             return
 
-        # Construct the exact YARP Bottle format used by the old salienceNetwork:
-        # ((class face) (score <ips_score>) (box (<xmin> <ymin> <xmax> <ymax>)))
+        # Build YARP Bottle: ((class face) (score <ips_score>) (box (<xmin> <ymin> <xmax> <ymax>)))
         x, y, w, h = target_face['bbox']
         x_min, y_min = float(x), float(y)
         x_max, y_max = float(x + w), float(y + h)
