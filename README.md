@@ -82,7 +82,7 @@ flowchart LR
   STT[speech2text] -->|text:o| E
   E -->|speech:o| TTS[acapelaSpeak]
   E -->|interaction_result RPC| S
-  E -->|emotions RPC| ICUB[/icub/face/emotions/in]
+  E -->|emotions RPC| ICUB["/icub/face/emotions/in"]
   STM[alwayson/stm/context:o] --> S
   E -->|hunger:o| C[alwayson_chatBot]
   V -->|faces_view:o| YV[yarpview]
