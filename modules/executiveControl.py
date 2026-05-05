@@ -59,7 +59,7 @@ from openai import AzureOpenAI
 import yarp                     
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Hunger model
+# Orexigenic drive model
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -182,6 +182,24 @@ class HungerModel:
             self._last_logged_pct  = int(self.level)
             self._save()
 
+    def exert(self, energy_cost: float, now: Optional[float] = None) -> None:
+        """
+        Apply passive Orexigenic drive drain first, then subtract an active energy cost.
+        Clamp the level to [0, 100] and persist atomically.
+        """
+        try:
+            cost = max(0.0, float(energy_cost))
+        except (TypeError, ValueError):
+            return
+        if cost <= 0.0:
+            return
+        now = now or time.time()
+        with self._lock:
+            self._drain(now)
+            self.level = max(0.0, min(100.0, self.level - cost))
+            self._last_logged_pct = int(self.level)
+            self._save()
+
     def set_level(self, level: float, now: Optional[float] = None) -> None:
         now = now or time.time()
         with self._lock:
@@ -235,6 +253,8 @@ class InteractionResult:
     stomach_level_end:    float           = 100.0
     meals_eaten_count:    int             = 0
     last_meal_payload:    Optional[str]   = None
+    active_energy_cost:   float           = 0.0
+    homeostatic_reward:   float           = 0.0
     n_turns:              int             = 0
     trigger_mode:         str             = "proactive"   # "proactive" | "reactive"
     logs:                 List[Dict]      = field(default_factory=list)
@@ -884,6 +904,15 @@ class ExecutiveControlModule(yarp.RFModule):
     SS3_LLM_STREAMING_ENABLED  = False
     SS3_LLM_WORKER_PARALLELISM = 3
 
+    # Active metabolic costs for meaningful robot actions.
+    CONVERSATION_TURN_ENERGY_COST = 3.6
+    GREETING_ENERGY_COST          = 0.8
+    NAME_QUESTION_ENERGY_COST     = 1.0
+    HUNGER_PROMPT_ENERGY_COST     = 1.0
+    STARTER_PROMPT_ENERGY_COST    = 1.2
+    FEED_ACK_ENERGY_COST          = 0.8
+    HUNGER_LEVEL_LOG_PERIOD_SEC   = 1.0
+
     # Target monitor
     MONITOR_HZ               = 15.0
     TARGET_LOST_TIMEOUT      = 12.0
@@ -949,7 +978,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self._emotions_rpc:  Optional[yarp.RpcClient]   = None
         self.attach(self.handle_port)
 
-        # Hunger
+        # Orexigenic drive
         self.hunger         = HungerModel(persist_file=self.HUNGER_STATE_FILE)
         self.hunger_enabled = True
         self._meal_mapping  = {"SMALL_MEAL": 10.0, "MEDIUM_MEAL": 25.0, "LARGE_MEAL": 45.0}
@@ -958,6 +987,8 @@ class ExecutiveControlModule(yarp.RFModule):
         self._last_scan_ts_mono     = 0.0
         self._feed_condition        = threading.Condition()
         self._hunger_tree_active    = threading.Event()
+        self._last_hunger_level_log_mono = 0.0
+        self._last_hunger_level_logged: Optional[float] = None
 
         # Landmark cache
         self._faces_lock:               threading.Lock      = threading.Lock()
@@ -1058,6 +1089,14 @@ class ExecutiveControlModule(yarp.RFModule):
                 "INFO",
                 f"Hunger drive {'enabled' if self.hunger_enabled else 'disabled'}; "
                 f"stored stomach={snap.level:.1f}% ({snap.state}), effective={self._effective_hunger_state()}",
+            )
+            self._log_hunger_level_event(
+                "configure",
+                stimulus_type="mode",
+                stimulus_label="enabled" if self.hunger_enabled else "disabled",
+                level_after=snap.level,
+                state_after=self._effective_hunger_state(snap),
+                force=True,
             )
             self._set_face_emotion(self._effective_hunger_state(snap))
 
@@ -1182,6 +1221,127 @@ class ExecutiveControlModule(yarp.RFModule):
         snap = snap or self.hunger.snapshot()
         return snap.state
 
+    def _mark_homeostasis_start(self, result: InteractionResult, social_state: str) -> None:
+        snap = self.hunger.snapshot() if self.hunger_enabled else None
+        hs = self._effective_hunger_state(snap)
+        result.hunger_state_start = hs
+        result.hunger_drive_enabled = self.hunger_enabled
+        result.stomach_level_start = snap.level if snap else 100.0
+        result.interaction_tag = f"{social_state.upper()}{hs}"
+
+    def _finalize_homeostasis_result(self, result: InteractionResult) -> None:
+        snap = self.hunger.snapshot() if self.hunger_enabled else None
+        result.hunger_state_end = self._effective_hunger_state(snap)
+        result.stomach_level_end = snap.level if snap else 100.0
+        result.homeostatic_reward = result.stomach_level_end - result.stomach_level_start
+
+    def _log_hunger_level_event(
+        self,
+        event_type: str,
+        *,
+        stimulus_type: str = "sample",
+        stimulus_label: Optional[str] = None,
+        level_before: Optional[float] = None,
+        level_after: Optional[float] = None,
+        state_before: Optional[str] = None,
+        state_after: Optional[str] = None,
+        delta: Optional[float] = None,
+        active_energy_cost: float = 0.0,
+        meal_delta: float = 0.0,
+        meal_payload: Optional[str] = None,
+        result: Optional[InteractionResult] = None,
+        reason: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        try:
+            snap = self.hunger.snapshot()
+            after = float(level_after if level_after is not None else snap.level)
+            before = float(level_before if level_before is not None else after)
+            state_to_log = state_after or self._effective_hunger_state(snap)
+            state_from_log = state_before or state_to_log
+            delta_to_log = float(delta if delta is not None else after - before)
+            now_mono = time.monotonic()
+            if not force and event_type == "sample":
+                if now_mono - self._last_hunger_level_log_mono < self.HUNGER_LEVEL_LOG_PERIOD_SEC:
+                    return
+            self._last_hunger_level_log_mono = now_mono
+            self._last_hunger_level_logged = after
+            self._db_enqueue(("hunger_level_event", {
+                "event_type": event_type,
+                "stimulus_type": stimulus_type,
+                "stimulus_label": stimulus_label,
+                "reason": reason,
+                "hunger_drive_enabled": int(bool(self.hunger_enabled)),
+                "hunger_state_before": state_from_log,
+                "hunger_state_after": state_to_log,
+                "stomach_level_before": before,
+                "stomach_level_after": after,
+                "level_delta": delta_to_log,
+                "active_energy_cost": float(active_energy_cost or 0.0),
+                "meal_delta": float(meal_delta or 0.0),
+                "meal_payload": meal_payload,
+                "trigger_mode": getattr(result, "trigger_mode", None) if result else None,
+                "social_state": getattr(result, "initial_state", None) if result else None,
+                "interaction_tag": getattr(result, "interaction_tag", None) if result else None,
+                "exec_interaction_id": self._get_iid(),
+            }))
+        except Exception as e:
+            self._log("WARNING", f"hunger_level_event log failed: {e}")
+
+    def _maybe_log_hunger_level_sample(self) -> None:
+        snap = self.hunger.snapshot()
+        previous = self._last_hunger_level_logged
+        before = snap.level if previous is None else previous
+        self._log_hunger_level_event(
+            "sample",
+            stimulus_type="passive_drain",
+            level_before=before,
+            level_after=snap.level,
+            state_before=self._effective_hunger_state(snap),
+            state_after=self._effective_hunger_state(snap),
+            delta=snap.level - before,
+        )
+
+    def _charge_energy(
+        self,
+        cost: float,
+        result: Optional[InteractionResult],
+        reason: str,
+    ) -> None:
+        """
+        Charge active metabolic energy for a meaningful robot action.
+        Does nothing when Orexigenic drive is disabled.
+        Records the cost in the interaction result when available.
+        """
+        if not self.hunger_enabled:
+            return
+        try:
+            cost_f = float(cost)
+        except (TypeError, ValueError):
+            return
+        if cost_f <= 0.0:
+            return
+        before = self.hunger.snapshot()
+        self.hunger.exert(cost_f)
+        after = self.hunger.snapshot()
+        if result is not None:
+            result.active_energy_cost += cost_f
+        self._log_hunger_level_event(
+            "active_cost",
+            stimulus_type="interaction_cost",
+            stimulus_label=reason,
+            level_before=before.level,
+            level_after=after.level,
+            state_before=before.state,
+            state_after=after.state,
+            delta=after.level - before.level,
+            active_energy_cost=cost_f,
+            result=result,
+            reason=reason,
+            force=True,
+        )
+        self._log("DEBUG", f"energy: -{cost_f:.2f} reason={reason}")
+
     def interruptModule(self) -> bool:
         self._log("INFO", "Interrupting…")
         self._running = False
@@ -1236,6 +1396,7 @@ class ExecutiveControlModule(yarp.RFModule):
         return self.period
 
     def updateModule(self) -> bool:
+        self._maybe_log_hunger_level_sample()
         if self.hunger_port:
             b = self.hunger_port.prepare()
             b.clear()
@@ -1307,12 +1468,25 @@ class ExecutiveControlModule(yarp.RFModule):
         arg = cmd.get(1).asString().strip().lower()
         if arg not in ("on", "off"):
             return self._rpc_error(reply, "Usage: hunger_mode <on|off>")
+        before = self.hunger.snapshot()
+        state_before = self._effective_hunger_state(before)
         self.hunger_enabled = arg == "on"
         self.hunger.set_level(100.0)
         if not self.hunger_enabled:
             with self._feed_condition:
                 self._feed_condition.notify_all()
         snap = self.hunger.snapshot()
+        self._log_hunger_level_event(
+            "mode",
+            stimulus_type="mode",
+            stimulus_label=arg,
+            level_before=before.level,
+            level_after=snap.level,
+            state_before=state_before,
+            state_after=self._effective_hunger_state(snap),
+            delta=snap.level - before.level,
+            force=True,
+        )
         self._log(
             "INFO",
             f"Hunger drive {'ON' if self.hunger_enabled else 'OFF'}; reset to 100%; "
@@ -1330,12 +1504,25 @@ class ExecutiveControlModule(yarp.RFModule):
             return self._rpc_error(reply, "Usage: hunger <hs0|hs1|hs2|hs3>")
         level_map = {"hs1": 100.0, "hs2": 59.0, "hs3": 24.0}
         arg = cmd.get(1).asString().lower()
+        before = self.hunger.snapshot()
+        state_before = self._effective_hunger_state(before)
         if arg == "hs0":
             self.hunger_enabled = False
             self.hunger.set_level(100.0)
             with self._feed_condition:
                 self._feed_condition.notify_all()
             snap = self.hunger.snapshot()
+            self._log_hunger_level_event(
+                "manual_set",
+                stimulus_type="mode",
+                stimulus_label=arg,
+                level_before=before.level,
+                level_after=snap.level,
+                state_before=state_before,
+                state_after=self.HUNGER_OFF_STATE,
+                delta=snap.level - before.level,
+                force=True,
+            )
             self._log("INFO", "Hunger drive manually disabled (HS0)")
             return self._rpc_ok(reply, {
                 "success": True,
@@ -1349,6 +1536,17 @@ class ExecutiveControlModule(yarp.RFModule):
         new_level = level_map[arg]
         self.hunger.set_level(new_level)
         snap = self.hunger.snapshot()
+        self._log_hunger_level_event(
+            "manual_set",
+            stimulus_type="manual_level",
+            stimulus_label=arg,
+            level_before=before.level,
+            level_after=snap.level,
+            state_before=state_before,
+            state_after=snap.state,
+            delta=snap.level - before.level,
+            force=True,
+        )
         self._log("INFO", f"Hunger drive enabled; manually set to {new_level}% ({snap.state})")
         return self._rpc_ok(reply, {
             "success": True,
@@ -1422,22 +1620,15 @@ class ExecutiveControlModule(yarp.RFModule):
     def _build_compact_result(
         self, iid: str, track_id: int, face_id: str, social_state: str, r: InteractionResult
     ) -> Dict[str, Any]:
-        ar = r.abort_reason
-        compact_abort = None
-        if ar:
-            if ar in ("target_lost", "target_not_biggest", "target_monitor_abort"):
-                if not r.talked:
-                    compact_abort = "face_disappeared"
-            elif not r.talked:
-                compact_abort = "not_responded"
-
         c: Dict[str, Any] = {
             "interaction_id": iid,
-            "success":        bool(r.success) or (r.talked and compact_abort is None),
+            "success":        bool(r.success) or (r.talked and r.abort_reason is None),
             "track_id":       track_id,
+            "face_id":        face_id,
+            "resolved_face_id": r.resolved_face_id or face_id,
             "name":           None,
             "name_extracted": False,
-            "abort_reason":   compact_abort,
+            "abort_reason":   r.abort_reason,
             "initial_state":  social_state,
             "final_state":    r.final_state,
             "replied_any":    r.replied_any,
@@ -1448,8 +1639,20 @@ class ExecutiveControlModule(yarp.RFModule):
         elif social_state in ("ss2", "ss3", "ss4"):
             c["name"] = r.resolved_face_id or face_id
 
-        for key in ("interaction_tag", "hunger_state_start", "hunger_state_end", "hunger_drive_enabled",
-                    "stomach_level_start", "stomach_level_end", "meals_eaten_count", "last_meal_payload"):
+        for key in (
+            "interaction_tag",
+            "hunger_state_start",
+            "hunger_state_end",
+            "hunger_drive_enabled",
+            "stomach_level_start",
+            "stomach_level_end",
+            "active_energy_cost",
+            "homeostatic_reward",
+            "meals_eaten_count",
+            "last_meal_payload",
+            "n_turns",
+            "trigger_mode",
+        ):
             val = getattr(r, key, None)
             if val is not None:
                 c[key] = val
@@ -1467,11 +1670,13 @@ class ExecutiveControlModule(yarp.RFModule):
         self._interaction_abort_event.clear()
         result = InteractionResult(initial_state=social_state, final_state=social_state)
         result.resolved_face_id = face_id
+        self._mark_homeostasis_start(result, social_state)
 
         if social_state == "ss4":
             result.success     = True
             result.final_state = "ss4"
             self._log("INFO", "ss4: no-op")
+            self._finalize_homeostasis_result(result)
             return result
 
         # Resolve unconfirmed face IDs
@@ -1481,21 +1686,16 @@ class ExecutiveControlModule(yarp.RFModule):
             result.resolved_face_id = face_id
             if not self._face_resolved(face_id):
                 result.abort_reason = "face_id_unresolved"
+                self._finalize_homeostasis_result(result)
                 return result
 
         self._start_monitor(track_id, face_id, result, interaction_id)
         self._selector_set_track(track_id)
 
         try:
-            snap = self.hunger.snapshot() if self.hunger_enabled else None
-            hs   = self._effective_hunger_state(snap)
-            lvl  = snap.level if snap else 100.0
-            result.hunger_state_start  = hs
-            result.hunger_drive_enabled = self.hunger_enabled
-            result.stomach_level_start = lvl
-            result.interaction_tag     = f"{social_state.upper()}{hs}"
+            hs = result.hunger_state_start
 
-            # Hunger overrides (HS3 only)
+            # Orexigenic drive overrides (HS3 only)
             if self.hunger_enabled and hs == "HS3":
                 self._run_hunger_tree(social_state, hs, result)
                 if social_state == "ss3" and not self._should_abort(result):
@@ -1508,16 +1708,13 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._run_ss2(track_id, face_id, result)
                 elif social_state == "ss3":
                     self._run_ss3(face_id, result)
-
-            snap2 = self.hunger.snapshot() if self.hunger_enabled else None
-            result.hunger_state_end  = self._effective_hunger_state(snap2)
-            result.stomach_level_end = snap2.level if snap2 else 100.0
         except Exception as e:
             self._log("ERROR", f"Tree execution error: {e}")
             result.abort_reason = f"exception: {e}"
         finally:
             self._stop_monitor()
             self._selector_set_track(-1)
+            self._finalize_homeostasis_result(result)
 
         return result
 
@@ -1534,6 +1731,7 @@ class ExecutiveControlModule(yarp.RFModule):
             result.abort_reason = "tts_dispatch_failed"
             self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
             return
+        self._charge_energy(self.GREETING_ENERGY_COST, result, "ss1_greeting")
         greet_trace.mark("listen_open")
         result.greeted = True
         if self._should_abort(result):
@@ -1558,7 +1756,12 @@ class ExecutiveControlModule(yarp.RFModule):
         result.extracted_name = name
         self._submit_face_name(track_id, name)
         self._write_last_greeted(track_id, face_id=face_id, code=name, person_key=name)
-        self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you"))
+        if self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you")):
+            self._charge_energy(self.GREETING_ENERGY_COST, result, "ss1_nice_to_meet")
+        else:
+            result.abort_reason = result.abort_reason or "tts_dispatch_failed"
+            self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
+            return
 
         result.success     = True
         result.final_state = "ss3"
@@ -1655,6 +1858,7 @@ class ExecutiveControlModule(yarp.RFModule):
             result.abort_reason = result.abort_reason or "tts_dispatch_failed"
             self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
             return
+        self._charge_energy(self.STARTER_PROMPT_ENERGY_COST, result, "ss3_starter")
 
         if self._should_abort(result):
             return
@@ -1844,6 +2048,11 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
                 break
 
+            self._charge_energy(
+                self.CONVERSATION_TURN_ENERGY_COST,
+                result,
+                "ss3_conversation_turn",
+            )
             history.append(("user", utterance))
             history.append(("assistant", reply))
 
@@ -1860,14 +2069,18 @@ class ExecutiveControlModule(yarp.RFModule):
 
         return turns
 
-    # ── hunger / QR feeding tree ──────────────────────────────────────────────
+    # ── Orexigenic drive / QR feeding tree ───────────────────────────────────
 
     def _run_hunger_tree(self, social_state: str, hs: str, result: InteractionResult) -> None:
         self._log("INFO", f"Hunger tree: {hs}")
         self._hunger_tree_active.set()
         try:
             self._stt_clear()
-            self._speak_wait(self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?"))
+            if self._speak_wait(self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")):
+                self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_ask_feed")
+            else:
+                result.abort_reason = result.abort_reason or "tts_dispatch_failed"
+                return
             result.talked = True
 
             meals, timeouts, max_timeouts = 0, 0, 2
@@ -1890,10 +2103,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._log("INFO", f"Feed #{meals}: {payload} → stomach {snap.level:.1f}")
                     if snap.state != hs_before:
                         self._set_face_emotion(snap.state)
-                    self._speak_wait(self._feed_ack(hs_before))
+                    if self._speak_wait(self._feed_ack(hs_before)):
+                        self._charge_energy(self.FEED_ACK_ENERGY_COST, result, "feed_ack")
                     if snap.state == "HS1":
                         break
-                    self._speak_wait(self._P.get("hunger_still_hungry", "I'm still hungry. Give me more please."))
+                    if self._speak_wait(self._P.get("hunger_still_hungry", "I'm still hungry. Give me more please.")):
+                        self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_still_hungry")
                     wait_since = new_ts
                     timeouts   = 0
                 else:
@@ -1908,7 +2123,8 @@ class ExecutiveControlModule(yarp.RFModule):
                         if not result.abort_reason:
                             result.abort_reason = "no_food_qr"
                         break
-                    self._speak_wait(self._P.get("hunger_look_around", "Take a look around, you will find some food for me."))
+                    if self._speak_wait(self._P.get("hunger_look_around", "Take a look around, you will find some food for me.")):
+                        self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_look_around")
                     wait_since = time.time()
 
             result.meals_eaten_count = meals
@@ -1981,9 +2197,24 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._last_scan_ts_mono = now_mono
                 now           = time.time()
                 delta         = self._meal_mapping[val]
-                hs_before     = self.hunger.snapshot().state
+                snap_before   = self.hunger.snapshot()
+                hs_before     = snap_before.state
                 self.hunger.feed(delta, val, now)
                 snap          = self.hunger.snapshot()
+                self._log_hunger_level_event(
+                    "feeding",
+                    stimulus_type="feeding",
+                    stimulus_label=val,
+                    level_before=snap_before.level,
+                    level_after=snap.level,
+                    state_before=hs_before,
+                    state_after=snap.state,
+                    delta=snap.level - snap_before.level,
+                    meal_delta=delta,
+                    meal_payload=val,
+                    reason="qr_feed",
+                    force=True,
+                )
                 self._log("INFO", f"QR: {val} (+{delta}) → stomach {snap.level:.1f} ({snap.state})")
                 if snap.state != hs_before:
                     self._set_face_emotion(snap.state)
@@ -1992,14 +2223,15 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._feed_condition.notify_all()
 
                 if not self._hunger_tree_active.is_set():
-                    self._speak(self._feed_ack(hs_before))
+                    if self._speak(self._feed_ack(hs_before)):
+                        self._charge_energy(self.FEED_ACK_ENERGY_COST, None, "ambient_feed_ack")
                     self._db_enqueue(("reactive", {
                         "type":                 "qr_feed",
                         "track_id":             None,
                         "name":                 None,
                         "payload":              val,
                         "hunger_state_before":  hs_before,
-                        "stomach_level_before": self.hunger.snapshot().level,
+                        "stomach_level_before": snap_before.level,
                         "hunger_state_after":   snap.state,
                         "stomach_level_after":  snap.level,
                     }))
@@ -2058,16 +2290,31 @@ class ExecutiveControlModule(yarp.RFModule):
         if not accepted:
             self._log("DEBUG", f"Reactive greeting skipped – {mode}: {reason}")
             return
+        interaction_id = uuid.uuid4().hex
+        dummy = InteractionResult(initial_state="ss3", final_state="ss3")
+        dummy.trigger_mode = "reactive"
+        dummy.resolved_face_id = name
+        self._mark_homeostasis_start(dummy, "ss3")
+        prev_iid = self._get_iid()
         try:
+            self._init_ilog(interaction_id)
+            self._set_iid(interaction_id)
             self._interaction_abort_event.clear()
             self._selector_set_track(track_id)
-            dummy = InteractionResult(initial_state="ss3", final_state="ss3")
-            dummy.trigger_mode = "reactive"
             self._start_monitor(track_id, name, dummy)
             tag = f"[RGREET|{name}]"
             try:
                 self._log("INFO", f"{tag} START (track={track_id})")
-                utterance = self._greet_known(name, timeout=self.SS3_STT_TIMEOUT, attempts=1, tag=tag)
+                utterance = self._greet_known(
+                    name,
+                    timeout=self.SS3_STT_TIMEOUT,
+                    attempts=1,
+                    tag=tag,
+                    result=dummy,
+                )
+                if not dummy.aborted:
+                    dummy.success = True
+                    dummy.final_state = "ss3"
 
                 if utterance:
                     greeting = self._P.get("reactive_greeting", "Hi {name}").format(name=name)
@@ -2076,18 +2323,41 @@ class ExecutiveControlModule(yarp.RFModule):
                         utterance,
                         face_id=name,
                         prior_assistant=greeting,
+                        result=dummy,
                     )
+                    dummy.n_turns = turns
+                    if turns > 0:
+                        dummy.success = True
+                        dummy.talked = True
+                        dummy.final_state = "ss4"
                     self._log("INFO", f"[RSS3|{name}] DONE turns={turns}")
 
                 if not self._abort_requested() and not dummy.aborted:
                     self._write_last_greeted(track_id, face_id=name, code=name, person_key=name)
                     self._mark_greeted_today(name)
-                    self._db_enqueue(("reactive", {"type": "greeting", "track_id": track_id, "name": name, "payload": None}))
+                    self._db_enqueue(("reactive", {
+                        "interaction_id": interaction_id,
+                        "type": "greeting",
+                        "track_id": track_id,
+                        "name": name,
+                        "payload": None,
+                    }))
             finally:
                 self._stop_monitor()
+                self._finalize_homeostasis_result(dummy)
+                self._selector_submit_interaction_result(
+                    dummy,
+                    track_id=track_id,
+                    face_id=name,
+                    social_state="ss3",
+                    person_id=name,
+                    interaction_id=interaction_id,
+                )
                 self._selector_reset_cooldown(name, track_id)
                 self._selector_set_track(-1)
         finally:
+            self._set_iid(prev_iid)
+            self._pop_ilog(interaction_id)
             self._end_interaction("reactive")
 
     def _run_reactive_unknown_intro(self, track_id: int, face_id: str) -> None:
@@ -2095,39 +2365,78 @@ class ExecutiveControlModule(yarp.RFModule):
         if not accepted:
             self._log("DEBUG", f"Reactive unknown skipped – {mode}: {reason}")
             return
+        interaction_id = uuid.uuid4().hex
+        dummy = InteractionResult(initial_state="ss1", final_state="ss1")
+        dummy.trigger_mode = "reactive"
+        dummy.resolved_face_id = face_id
+        self._mark_homeostasis_start(dummy, "ss1")
+        person_id: Optional[str] = None
+        prev_iid = self._get_iid()
         try:
+            self._init_ilog(interaction_id)
+            self._set_iid(interaction_id)
             self._interaction_abort_event.clear()
             self._selector_set_track(track_id)
-            dummy = InteractionResult(initial_state="ss1", final_state="ss1")
-            dummy.trigger_mode = "reactive"
             self._start_monitor(track_id, face_id, dummy)
             try:
                 self._log("INFO", f"Reactive unknown intro: track={track_id} face='{face_id}'")
 
                 # Greet without requiring a greeting response (they already said hi)
                 self._stt_clear()
-                self._speak_wait(self._P.get("ss1_greeting", "Hi there!"))
+                if self._speak_wait(self._P.get("ss1_greeting", "Hi there!")):
+                    self._charge_energy(self.GREETING_ENERGY_COST, dummy, "reactive_unknown_greeting")
+                    dummy.greeted = True
+                else:
+                    dummy.abort_reason = dummy.abort_reason or "tts_dispatch_failed"
+                    return
                 if self._abort_requested() or dummy.aborted:
                     return
 
-                name, reason2 = self._ask_name("[SS1|unknown]", result=None)
+                name, reason2 = self._ask_name("[SS1|unknown]", result=dummy)
                 if reason2 != "ok" or not name:
+                    dummy.abort_reason = dummy.abort_reason or reason2
                     self._log("INFO", f"Reactive unknown intro: {reason2}")
                     return
                 if self._abort_requested() or dummy.aborted:
                     return
 
                 self._log("INFO", f"Reactive unknown intro: name='{name}'")
+                person_id = name
+                dummy.extracted_name = name
+                dummy.resolved_face_id = name
                 self._submit_face_name(track_id, name)
                 self._write_last_greeted(track_id, name, name, name)
                 self._mark_greeted_today(name)
-                self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you"))
-                self._db_enqueue(("reactive", {"type": "unknown_intro", "track_id": track_id, "name": name, "payload": face_id}))
+                if self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you")):
+                    self._charge_energy(self.GREETING_ENERGY_COST, dummy, "reactive_nice_to_meet")
+                else:
+                    dummy.abort_reason = dummy.abort_reason or "tts_dispatch_failed"
+                    return
+                dummy.success = True
+                dummy.final_state = "ss3"
+                self._db_enqueue(("reactive", {
+                    "interaction_id": interaction_id,
+                    "type": "unknown_intro",
+                    "track_id": track_id,
+                    "name": name,
+                    "payload": face_id,
+                }))
             finally:
                 self._stop_monitor()
+                self._finalize_homeostasis_result(dummy)
+                self._selector_submit_interaction_result(
+                    dummy,
+                    track_id=track_id,
+                    face_id=face_id,
+                    social_state="ss1",
+                    person_id=person_id,
+                    interaction_id=interaction_id,
+                )
                 self._selector_reset_cooldown(face_id, track_id)
                 self._selector_set_track(-1)
         finally:
+            self._set_iid(prev_iid)
+            self._pop_ilog(interaction_id)
             self._end_interaction("reactive")
 
     # ── shared interaction helpers ─────────────────────────────────────────────
@@ -2148,7 +2457,10 @@ class ExecutiveControlModule(yarp.RFModule):
             self._stt_clear()
             greet_trace = LatencyTrace(self, label=f"{tag}|greet", turn_index=0)
             if self._speech.dispatch(tpl.format(name=name), label="known_greeting", trace=greet_trace) is None:
+                if result is not None:
+                    result.abort_reason = result.abort_reason or "tts_dispatch_failed"
                 return None
+            self._charge_energy(self.GREETING_ENERGY_COST, result, "known_greeting")
             greet_trace.mark("listen_open")
             if result is not None:
                 result.greeted = True
@@ -2168,7 +2480,10 @@ class ExecutiveControlModule(yarp.RFModule):
         """Ask for name with one retry; return (name, reason)."""
         self._stt_clear()
         self._speech.wait_until_idle(poll_sec=self.TTS_POLL_INTERVAL_SEC)
-        self._speak(self._P.get("ss1_ask_name", "We have not met, what's your name?"))
+        if self._speak(self._P.get("ss1_ask_name", "We have not met, what's your name?")):
+            self._charge_energy(self.NAME_QUESTION_ENERGY_COST, result, "ss1_ask_name")
+        else:
+            return None, "tts_dispatch_failed"
         if result is not None and self._should_abort(result):
             return None, "aborted"
 
@@ -2184,7 +2499,10 @@ class ExecutiveControlModule(yarp.RFModule):
             return None, "aborted"
         self._stt_clear()
         self._speech.wait_until_idle(poll_sec=self.TTS_POLL_INTERVAL_SEC)
-        self._speak(self._P.get("ss1_ask_name_retry", "Sorry, I didn't catch that. What's your name?"))
+        if self._speak(self._P.get("ss1_ask_name_retry", "Sorry, I didn't catch that. What's your name?")):
+            self._charge_energy(self.NAME_QUESTION_ENERGY_COST, result, "ss1_ask_name_retry")
+        else:
+            return None, "tts_dispatch_failed"
         utt2 = self._stt_wait(self.SS1_STT_TIMEOUT)
         if utt2:
             name = self._extract_name(utt2)
@@ -2619,6 +2937,39 @@ class ExecutiveControlModule(yarp.RFModule):
             self._get_selector_rpc().write(cmd, reply)
         except Exception as e:
             self._log("WARNING", f"selector_reset_cooldown failed: {e}")
+
+    def _selector_submit_interaction_result(
+        self,
+        result: InteractionResult,
+        track_id: int,
+        face_id: str,
+        social_state: str,
+        person_id: Optional[str] = None,
+        interaction_id: Optional[str] = None,
+    ) -> None:
+        """
+        Send completed reactive interaction results to salienceNetwork
+        so homeostatic learning is applied consistently.
+        """
+        try:
+            iid = interaction_id or self._get_iid() or uuid.uuid4().hex
+            payload = self._build_compact_result(iid, track_id, face_id, social_state, result)
+            if person_id:
+                payload["person_id"] = person_id
+            cmd = yarp.Bottle()
+            cmd.addString("interaction_result")
+            cmd.addString(json.dumps(payload, ensure_ascii=False))
+            reply = yarp.Bottle()
+            self._get_selector_rpc().write(cmd, reply)
+            if reply.size() > 0 and reply.get(0).asString() == "ok":
+                self._log("DEBUG", f"selector interaction_result submitted id={iid[:8]}")
+            else:
+                self._log("WARNING", f"selector interaction_result unexpected reply: {reply.toString()}")
+        except Exception as e:
+            self._log("WARNING", f"selector_submit_interaction_result failed: {e}")
+            if self._selector_rpc:
+                self._selector_rpc.close()
+                self._selector_rpc = None
 
     def _get_emotions_rpc(self) -> yarp.RpcClient:
         if self._emotions_rpc is None:
@@ -3154,6 +3505,8 @@ class ExecutiveControlModule(yarp.RFModule):
                 hunger_drive_enabled INTEGER,
                 stomach_level_start REAL, stomach_level_end REAL,
                 meals_eaten_count INTEGER, last_meal_payload TEXT,
+                active_energy_cost REAL NOT NULL DEFAULT 0.0,
+                homeostatic_reward REAL NOT NULL DEFAULT 0.0,
                 n_turns INTEGER NOT NULL DEFAULT 0,
                 trigger_mode TEXT NOT NULL DEFAULT 'proactive',
                 day_rome TEXT,
@@ -3170,9 +3523,27 @@ class ExecutiveControlModule(yarp.RFModule):
                 hunger_state_after   TEXT,
                 stomach_level_after  REAL
             )""")
-            interaction_cols = {row[1] for row in c.execute("PRAGMA table_info(interactions)")}
-            if "hunger_drive_enabled" not in interaction_cols:
-                c.execute("ALTER TABLE interactions ADD COLUMN hunger_drive_enabled INTEGER")
+            c.execute("""CREATE TABLE IF NOT EXISTS hunger_level_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                stimulus_type TEXT,
+                stimulus_label TEXT,
+                reason TEXT,
+                hunger_drive_enabled INTEGER,
+                hunger_state_before TEXT,
+                hunger_state_after TEXT,
+                stomach_level_before REAL,
+                stomach_level_after REAL,
+                level_delta REAL,
+                active_energy_cost REAL NOT NULL DEFAULT 0.0,
+                meal_delta REAL NOT NULL DEFAULT 0.0,
+                meal_payload TEXT,
+                trigger_mode TEXT,
+                social_state TEXT,
+                interaction_tag TEXT,
+                exec_interaction_id TEXT
+            )""")
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp)",
                 "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
@@ -3183,6 +3554,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
                 "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp)",
                 "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_time  ON hunger_level_events(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_event ON hunger_level_events(event_type, stimulus_type)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_iid   ON hunger_level_events(exec_interaction_id)",
             ]:
                 c.execute(idx_sql)
             self._create_analytics_views(conn)
@@ -3210,6 +3584,8 @@ class ExecutiveControlModule(yarp.RFModule):
                        CAST(COALESCE(hunger_drive_enabled, CASE WHEN hunger_state_start='HS0' THEN 0 ELSE 1 END) AS INTEGER) AS hunger_drive_enabled,
                        stomach_level_start, stomach_level_end,
                        meals_eaten_count, last_meal_payload,
+                       COALESCE(active_energy_cost, 0.0) AS active_energy_cost,
+                       COALESCE(homeostatic_reward, stomach_level_end - stomach_level_start) AS homeostatic_reward,
                        COALESCE(n_turns, 0) AS n_turns,
                        COALESCE(trigger_mode, 'proactive') AS trigger_mode
                 FROM interactions WHERE initial_state IN ('ss1','ss2','ss3')""",
@@ -3265,6 +3641,26 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM interactions
                 WHERE initial_state IN ('ss1', 'ss2', 'ss3')
                 GROUP BY day_rome, initial_state, hunger_state_start""",
+            "v_hunger_level_timeline": """
+                SELECT timestamp,
+                       event_type,
+                       stimulus_type,
+                       stimulus_label,
+                       reason,
+                       CAST(hunger_drive_enabled AS INTEGER) AS hunger_drive_enabled,
+                       hunger_state_before,
+                       hunger_state_after,
+                       stomach_level_before,
+                       stomach_level_after,
+                       level_delta,
+                       active_energy_cost,
+                       meal_delta,
+                       meal_payload,
+                       trigger_mode,
+                       social_state,
+                       interaction_tag,
+                       exec_interaction_id
+                FROM hunger_level_events""",
         }
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
@@ -3305,6 +3701,8 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._db_save_interaction(conn, data)
                 elif table == "reactive":
                     self._db_save_reactive(conn, data)
+                elif table == "hunger_level_event":
+                    self._db_save_hunger_level_event(conn, data)
             except Exception as e:
                 self._log("ERROR", f"DB write failed: {e}")
                 if conn:
@@ -3336,9 +3734,9 @@ class ExecutiveControlModule(yarp.RFModule):
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
                  hunger_drive_enabled,stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
-                 n_turns,trigger_mode,day_rome,
+                 active_energy_cost,homeostatic_reward,n_turns,trigger_mode,day_rome,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     datetime.now(self.TIMEZONE).isoformat(),
@@ -3353,6 +3751,8 @@ class ExecutiveControlModule(yarp.RFModule):
                     int(bool(r.get("hunger_drive_enabled", r.get("hunger_state_start") != self.HUNGER_OFF_STATE))),
                     r.get("stomach_level_start"),       r.get("stomach_level_end"),
                     r.get("meals_eaten_count"),         r.get("last_meal_payload"),
+                    r.get("active_energy_cost", 0.0),
+                    r.get("homeostatic_reward", 0.0),
                     r.get("n_turns", 0),
                     r.get("trigger_mode", "proactive"),
                     day_rome,
@@ -3387,6 +3787,41 @@ class ExecutiveControlModule(yarp.RFModule):
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_reactive failed: {e}")
+
+    def _db_save_hunger_level_event(self, conn: sqlite3.Connection, data: Dict) -> None:
+        try:
+            conn.cursor().execute(
+                """INSERT INTO hunger_level_events
+                (timestamp,event_type,stimulus_type,stimulus_label,reason,
+                 hunger_drive_enabled,hunger_state_before,hunger_state_after,
+                 stomach_level_before,stomach_level_after,level_delta,
+                 active_energy_cost,meal_delta,meal_payload,trigger_mode,
+                 social_state,interaction_tag,exec_interaction_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(self.TIMEZONE).isoformat(),
+                    data.get("event_type"),
+                    data.get("stimulus_type"),
+                    data.get("stimulus_label"),
+                    data.get("reason"),
+                    int(data.get("hunger_drive_enabled", 0)),
+                    data.get("hunger_state_before"),
+                    data.get("hunger_state_after"),
+                    data.get("stomach_level_before"),
+                    data.get("stomach_level_after"),
+                    data.get("level_delta"),
+                    data.get("active_energy_cost", 0.0),
+                    data.get("meal_delta", 0.0),
+                    data.get("meal_payload"),
+                    data.get("trigger_mode"),
+                    data.get("social_state"),
+                    data.get("interaction_tag"),
+                    data.get("exec_interaction_id"),
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            self._log("ERROR", f"DB save_hunger_level_event failed: {e}")
 
     # ── per-interaction log tracking ──────────────────────────────────────────
 
