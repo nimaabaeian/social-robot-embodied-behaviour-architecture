@@ -90,14 +90,19 @@ class SalienceNetworkModule(yarp.RFModule):
         is_proactive: int = 1
 
     @dataclass(frozen=True)
-    class LearningDelta:
+    class HomeostaticLearningDelta:
         person_id: str
         reward_delta: float
         outcome: str
         reason: str
-        success: int
-        abort_reason: Optional[str]
-        name_extracted: int
+        trigger_mode: Optional[str]
+        hunger_state_start: Optional[str]
+        hunger_state_end: Optional[str]
+        stomach_level_start: Optional[float]
+        stomach_level_end: Optional[float]
+        active_energy_cost: Optional[float]
+        meals_eaten_count: Optional[int]
+        n_turns: Optional[int]
         exec_interaction_id: Optional[str]
         old_prox: Optional[float]
         old_cent: Optional[float]
@@ -122,9 +127,15 @@ class SalienceNetworkModule(yarp.RFModule):
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
     HABITUATION_LAMBDA = 0.20  # Habituation decay
-    WEIGHT_SHIFT_RATE = 0.15  # How much weights drift per interaction (+/-)
+    HOMEOSTATIC_WEIGHT_SHIFT_RATE = 0.15
+    HOMEOSTATIC_REWARD_SCALE = 0.005
+    MAX_WEIGHT_SHIFT_PER_INTERACTION = 0.08
+    HOMEOSTATIC_REWARD_EPSILON = 0.2
+    REWARD_EMA_ALPHA = 0.25
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15
+    FACE_IPS_LOG_PERIOD_SEC = 0.5
+    FACE_IPS_LOG_DELTA = 0.03
     DB_QUEUE_MAXSIZE = 1024
     IO_QUEUE_MAXSIZE = 256
 
@@ -151,7 +162,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self.executive_control_rpc_name = "/executiveControl"
 
-        self.learning_path     = Path(_MODULE_DIR) / "memory" / "learning.json"
+        self.homeostatic_learning_path = Path(_MODULE_DIR) / "memory" / "homeostatic_learning.json"
         self.greeted_path      = Path(_MODULE_DIR) / "memory" / "greeted_today.json"
         self.talked_path       = Path(_MODULE_DIR) / "memory" / "talked_today.json"
         self.last_greeted_path = Path(_MODULE_DIR) / "memory" / "last_greeted.json"
@@ -208,7 +219,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self.greeted_today: Dict[str, str] = {}
         self.talked_today: Dict[str, str] = {}
-        self.learning_data: Dict[str, Dict] = {}
+        self.homeostatic_profiles: Dict[str, Dict] = {}
 
         self._last_greeted_snapshot: Dict[str, Dict[str, Any]] = {}
         self._last_greeted_lock = threading.Lock()
@@ -230,6 +241,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._last_target_log_key: Tuple[int, str, str, int] = (-2, "", "", -1)
         self._last_target_log_ips: float = -1.0
         self._last_target_log_ts: float = 0.0
+        self._last_face_ips_log: Dict[Tuple[int, str], Tuple[float, float, float]] = {}
 
         self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
@@ -255,8 +267,10 @@ class SalienceNetworkModule(yarp.RFModule):
                 self.executive_control_rpc_name = rf.find(
                     "executive_control_rpc"
                 ).asString()
-            if rf.check("learning_path"):
-                self.learning_path = Path(rf.find("learning_path").asString())
+            if rf.check("homeostatic_learning_path"):
+                self.homeostatic_learning_path = Path(
+                    rf.find("homeostatic_learning_path").asString()
+                )
             if rf.check("greeted_path"):
                 self.greeted_path = Path(rf.find("greeted_path").asString())
             if rf.check("talked_path"):
@@ -482,7 +496,7 @@ class SalienceNetworkModule(yarp.RFModule):
             self.interaction_thread.join(timeout=5.0)
         self._enqueue_save("greeted")
         self._enqueue_save("talked")
-        self._enqueue_save("learning")
+        self._enqueue_save("homeostatic_learning")
         self._queue_put_drop_oldest(self._io_queue, None, "IO queue close")
         if self._io_thread:
             self._io_thread.join(timeout=5.0)
@@ -535,6 +549,26 @@ class SalienceNetworkModule(yarp.RFModule):
             tid = cmd.get(2).asInt32()
             cd_key = self._cooldown_key(fid, tid)
             self.last_interaction_time[cd_key] = time.time()
+            reply.addString("ok")
+            return True
+
+        if command == "interaction_result":
+            if cmd.size() < 2:
+                reply.addString("error")
+                reply.addString("usage: interaction_result <json_payload>")
+                return True
+            try:
+                payload = json.loads(cmd.get(1).asString())
+            except json.JSONDecodeError as e:
+                reply.addString("error")
+                reply.addString(f"invalid json: {e}")
+                return True
+            if not isinstance(payload, dict):
+                reply.addString("error")
+                reply.addString("payload must be a JSON object")
+                return True
+            person_id = self._resolve_result_person_id(payload)
+            self._process_external_interaction_result(payload, person_id)
             reply.addString("ok")
             return True
 
@@ -894,6 +928,73 @@ class SalienceNetworkModule(yarp.RFModule):
 
         return False
 
+    def _should_log_face_ips_event(self, face: Dict[str, Any], now: float) -> bool:
+        track_id = int(face.get("track_id", -1))
+        if track_id < 0:
+            return False
+        face_id = str(face.get("face_id", "unknown"))
+        key = (track_id, face_id)
+        ips = float(face.get("ips", 0.0))
+        habituation_multiplier = float(face.get("habituation_multiplier", 1.0))
+        last = self._last_face_ips_log.get(key)
+        if last is None:
+            self._last_face_ips_log[key] = (now, ips, habituation_multiplier)
+            return True
+        last_ts, last_ips, last_habituation = last
+        if (
+            now - last_ts >= self.FACE_IPS_LOG_PERIOD_SEC
+            or abs(ips - last_ips) >= self.FACE_IPS_LOG_DELTA
+            or abs(habituation_multiplier - last_habituation) >= self.FACE_IPS_LOG_DELTA
+        ):
+            self._last_face_ips_log[key] = (now, ips, habituation_multiplier)
+            return True
+        return False
+
+    def _log_face_ips_events(self, faces: List[Dict[str, Any]]) -> None:
+        now = time.time()
+        active_track_id = self._active_attention_track_id()
+        for face in faces:
+            if not self._should_log_face_ips_event(face, now):
+                continue
+            person_id = str(face.get("person_id", face.get("face_id", "unknown")))
+            vars_norm = self._calculate_ips_variables(face)
+            weights = self._get_person_weights(person_id)
+            self._db_log(
+                "face_ips_event",
+                {
+                    "track_id": int(face.get("track_id", -1)),
+                    "face_id": str(face.get("face_id", "unknown")),
+                    "person_id": person_id,
+                    "social_state": str(face.get("social_state", "ss1")),
+                    "is_known": int(bool(face.get("is_known", False))),
+                    "eligible": int(bool(face.get("eligible", False))),
+                    "is_active_target": int(int(face.get("track_id", -1)) == active_track_id),
+                    "bbox_area": self._bbox_area(face),
+                    "ips": float(face.get("ips", 0.0)),
+                    "ips_before_habituation": float(
+                        face.get("ips_before_habituation", face.get("ips", 0.0))
+                    ),
+                    "habituation_applied": int(bool(face.get("habituation_applied", False))),
+                    "habituation_multiplier": float(face.get("habituation_multiplier", 1.0)),
+                    "habituation_elapsed_sec": float(face.get("habituation_elapsed_sec", 0.0)),
+                    "habituation_ips_delta": float(face.get("habituation_ips_delta", 0.0)),
+                    "stimulus_type": (
+                        "habituation_decay"
+                        if face.get("habituation_applied", False)
+                        else "visual_salience"
+                    ),
+                    "context_label": self.current_context_label,
+                    "prox_score": vars_norm["prox"],
+                    "cent_score": vars_norm["cent"],
+                    "vel_score": vars_norm["vel"],
+                    "gaze_score": vars_norm["gaze"],
+                    "weight_prox": weights["prox"],
+                    "weight_cent": weights["cent"],
+                    "weight_vel": weights["vel"],
+                    "weight_gaze": weights["gaze"],
+                },
+            )
+
     # ==================== Context-Aware Cooldown ====================
 
     def _effective_cooldown(self) -> float:
@@ -1045,6 +1146,11 @@ class SalienceNetworkModule(yarp.RFModule):
                 is_known, greeted_today, talked_today
             )
             face["ips"] = self._calculate_ips(face, person_id, apply_habituation=False)
+            face["habituation_applied"] = False
+            face["habituation_multiplier"] = 1.0
+            face["habituation_elapsed_sec"] = 0.0
+            face["ips_before_habituation"] = float(face.get("ips", 0.0))
+            face["habituation_ips_delta"] = 0.0
 
             new_area_history[track_id] = self._bbox_area(face)
 
@@ -1063,8 +1169,17 @@ class SalienceNetworkModule(yarp.RFModule):
                         "person_id", current_face.get("face_id", "unknown")
                     )
                 )
+                before_ips = float(current_face.get("ips", 0.0))
                 decay = self._habituation_multiplier(current_face, person_id)
-                current_face["ips"] = float(current_face.get("ips", 0.0)) * decay
+                after_ips = before_ips * decay
+                current_face["habituation_applied"] = True
+                current_face["habituation_multiplier"] = decay
+                current_face["habituation_elapsed_sec"] = max(
+                    0.0, time.time() - self._target_decay_started_at
+                )
+                current_face["ips_before_habituation"] = before_ips
+                current_face["habituation_ips_delta"] = after_ips - before_ips
+                current_face["ips"] = after_ips
             else:
                 self._target_decay_track_id = -1
                 self._target_decay_started_at = 0.0
@@ -1085,6 +1200,8 @@ class SalienceNetworkModule(yarp.RFModule):
         for face in faces:
             face["eligible"] = self._is_eligible(face)
 
+        self._log_face_ips_events(faces)
+
         active = {f["track_id"] for f in faces if f.get("track_id", -1) >= 0}
         self.track_to_person = {
             t: p for t, p in self.track_to_person.items() if t in active
@@ -1094,6 +1211,9 @@ class SalienceNetworkModule(yarp.RFModule):
         }
         self._decay_caps = {
             t: cap for t, cap in self._decay_caps.items() if t in active
+        }
+        self._last_face_ips_log = {
+            key: val for key, val in self._last_face_ips_log.items() if key[0] in active
         }
         self.area_history = new_area_history
         return faces
@@ -1124,7 +1244,7 @@ class SalienceNetworkModule(yarp.RFModule):
         if not face_id:
             return False
         norm = str(face_id).strip().lower()
-        if norm in ("unknown", "unmatched", "recognizing", ""):
+        if norm in ("unknown", "unmatched", "recognizing", "unresolved", ""):
             return False
         if norm.startswith("unknown:"):
             return False
@@ -1178,14 +1298,23 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # ==================== IPS & Habituation Math ====================
 
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
     def _get_person_weights(self, person_id: str) -> Dict[str, float]:
         """Fetch personalized weights, or fallback to baseline for strangers."""
-        if (
-            person_id in self.learning_data
-            and "weights" in self.learning_data[person_id]
-        ):
-            return self.learning_data[person_id]["weights"]
-        return self.BASELINE_WEIGHTS.copy()
+        profile = self.homeostatic_profiles.get(person_id, {})
+        raw_weights = profile.get("weights") if isinstance(profile, dict) else None
+        if not isinstance(raw_weights, dict):
+            return self.BASELINE_WEIGHTS.copy()
+        weights = self.BASELINE_WEIGHTS.copy()
+        for key in weights:
+            try:
+                weights[key] = self._clamp01(float(raw_weights.get(key, weights[key])))
+            except (TypeError, ValueError):
+                pass
+        return weights
 
     def _calculate_ips_variables(self, face: Dict[str, Any]) -> Dict[str, float]:
         """Converts raw landmark data into normalized 0.0-1.0 scoring variables."""
@@ -1599,6 +1728,9 @@ class SalienceNetworkModule(yarp.RFModule):
             person_id = str(
                 target.get("person_id") or target.get("face_id") or "unknown"
             )
+            resolved_person_id = self._resolve_result_person_id(result)
+            if self._is_face_known(resolved_person_id):
+                person_id = resolved_person_id
 
             if extracted_name:
                 person_id = str(extracted_name)
@@ -1622,7 +1754,7 @@ class SalienceNetworkModule(yarp.RFModule):
             if talked:
                 self._enqueue_save("talked")
 
-            self._update_learning_weights(result, person_id)
+            self._apply_homeostatic_learning(result, person_id)
 
             if initial_ss != final_ss:
                 self._db_log(
@@ -1637,65 +1769,239 @@ class SalienceNetworkModule(yarp.RFModule):
         except Exception as e:
             self._log("ERROR", f"process_interaction_result failed: {e}")
 
-    def _update_learning_weights(self, result: Dict, person_id: str):
-        """Continuously shifts a person's personality weights based on success."""
-        if not self._is_face_known(person_id):
-            return
+    def _resolve_result_person_id(self, result: Dict[str, Any]) -> str:
+        """Resolve a stable known person ID from an interaction result payload."""
+        for key in ("person_id", "name", "resolved_face_id", "face_id"):
+            value = result.get(key)
+            if value is None:
+                continue
+            candidate = str(value).strip()
+            if self._is_face_known(candidate):
+                return candidate
 
-        success = result.get("success", False)
-        name_extracted = result.get("name_extracted", False)
-        abort_reason = result.get("abort_reason")
+        try:
+            track_id = int(result.get("track_id", -1))
+        except (TypeError, ValueError):
+            track_id = -1
+        if track_id >= 0:
+            with self.state_lock:
+                candidate = self.track_to_person.get(track_id, "")
+            if self._is_face_known(candidate):
+                return str(candidate)
+        return "unknown"
 
-        weights = self._get_person_weights(person_id)
-        old_weights = dict(weights)
-        lr = self.WEIGHT_SHIFT_RATE
+    def _process_external_interaction_result(self, result: Dict[str, Any], person_id: str) -> None:
+        """Handle completed interactions submitted by executiveControl reactive paths."""
+        try:
+            try:
+                track_id = int(result.get("track_id", -1))
+            except (TypeError, ValueError):
+                track_id = -1
 
-        if success:
-            shift = lr * (2.0 if name_extracted else 1.0)
-            weights["prox"] = min(1.0, weights["prox"] + shift)
-            weights["vel"] = min(1.0, weights["vel"] + shift)
-            weights["gaze"] = max(0.0, weights["gaze"] - (shift * 0.5))
-            outcome = "success"
-            reason = "name_extracted" if name_extracted else "success"
-            self._log(
-                "INFO", f"Success! '{person_id}' weights shifted towards Proactive."
-            )
-        else:
-            shift = lr * (2.0 if abort_reason == "face_disappeared" else 1.0)
-            weights["prox"] = max(0.0, weights["prox"] - shift)
-            weights["vel"] = max(0.0, weights["vel"] - shift)
-            weights["gaze"] = min(1.0, weights["gaze"] + shift)
-            outcome = "failure"
-            reason = abort_reason or "failure"
-            self._log(
-                "INFO", f"Failure! '{person_id}' weights shifted towards Reactive."
-            )
+            initial_ss = str(result.get("initial_state", "ss1"))
+            final_ss = str(result.get("final_state", initial_ss))
+            greeted = final_ss in ("ss3", "ss4") and initial_ss != "ss4"
+            talked = final_ss == "ss4" and initial_ss != "ss4"
+            now_iso = datetime.now(self.TIMEZONE).isoformat()
 
-        now_iso = datetime.now(self.TIMEZONE).isoformat()
-        with self._memory_lock:
-            self.learning_data[person_id] = {"weights": weights, "updated_at": now_iso}
+            if self._is_face_known(person_id):
+                with self._memory_lock:
+                    with self.state_lock:
+                        if track_id >= 0:
+                            self.track_to_person[track_id] = person_id
+                        if greeted:
+                            self.greeted_today[person_id] = now_iso
+                        if talked:
+                            self.talked_today[person_id] = now_iso
+                if greeted:
+                    self._enqueue_save("greeted")
+                if talked:
+                    self._enqueue_save("talked")
 
-        self._enqueue_save("learning")
+            self._apply_homeostatic_learning(result, person_id)
+        except Exception as e:
+            self._log("ERROR", f"process_external_interaction_result failed: {e}")
 
-        delta = self.LearningDelta(
+    @staticmethod
+    def _result_bool(result: Dict[str, Any], key: str, default: bool = True) -> bool:
+        value = result.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", "disabled", "hs0"}
+        return default
+
+    @staticmethod
+    def _result_float(result: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        try:
+            return float(result.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _result_int(result: Dict[str, Any], key: str, default: int = 0) -> int:
+        try:
+            return int(result.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _homeostatic_reward_from_result(self, result: Dict[str, Any]) -> float:
+        if "homeostatic_reward" in result:
+            return self._result_float(result, "homeostatic_reward", 0.0)
+        return (
+            self._result_float(result, "stomach_level_end", 100.0)
+            - self._result_float(result, "stomach_level_start", 100.0)
+        )
+
+    def _homeostatic_reason(self, result: Dict[str, Any], outcome: str, reward: float) -> str:
+        if outcome == "neutral":
+            return "neutral_delta"
+        if outcome == "drive_reduced":
+            return "food_received"
+
+        abort_reason = str(result.get("abort_reason") or "")
+        if abort_reason in {"target_lost", "face_disappeared", "target_monitor_abort"}:
+            return "target_lost"
+        if self._result_int(result, "n_turns", 0) > 0:
+            return "conversation_energy_cost"
+        if self._result_int(result, "meals_eaten_count", 0) == 0:
+            return "no_food_qr"
+        return "conversation_energy_cost" if reward < 0.0 else "neutral_delta"
+
+    def _log_homeostatic_delta(
+        self,
+        result: Dict[str, Any],
+        person_id: str,
+        reward: float,
+        outcome: str,
+        reason: str,
+        old_weights: Optional[Dict[str, float]],
+        new_weights: Optional[Dict[str, float]],
+    ) -> None:
+        delta = self.HomeostaticLearningDelta(
             person_id=person_id,
-            reward_delta=shift if success else -shift,
+            reward_delta=reward,
             outcome=outcome,
             reason=reason,
-            success=int(bool(success)),
-            abort_reason=abort_reason,
-            name_extracted=int(bool(name_extracted)),
+            trigger_mode=result.get("trigger_mode"),
+            hunger_state_start=result.get("hunger_state_start"),
+            hunger_state_end=result.get("hunger_state_end"),
+            stomach_level_start=self._result_float(result, "stomach_level_start", 100.0),
+            stomach_level_end=self._result_float(result, "stomach_level_end", 100.0),
+            active_energy_cost=self._result_float(result, "active_energy_cost", 0.0),
+            meals_eaten_count=self._result_int(result, "meals_eaten_count", 0),
+            n_turns=self._result_int(result, "n_turns", 0),
             exec_interaction_id=result.get("interaction_id"),
-            old_prox=old_weights.get("prox"),
-            old_cent=old_weights.get("cent"),
-            old_vel=old_weights.get("vel"),
-            old_gaze=old_weights.get("gaze"),
-            new_prox=weights.get("prox"),
-            new_cent=weights.get("cent"),
-            new_vel=weights.get("vel"),
-            new_gaze=weights.get("gaze"),
+            old_prox=old_weights.get("prox") if old_weights else None,
+            old_cent=old_weights.get("cent") if old_weights else None,
+            old_vel=old_weights.get("vel") if old_weights else None,
+            old_gaze=old_weights.get("gaze") if old_weights else None,
+            new_prox=new_weights.get("prox") if new_weights else None,
+            new_cent=new_weights.get("cent") if new_weights else None,
+            new_vel=new_weights.get("vel") if new_weights else None,
+            new_gaze=new_weights.get("gaze") if new_weights else None,
         )
-        self._db_log("learning_change", asdict(delta))
+        self._db_log("homeostatic_learning_change", asdict(delta))
+
+    def _apply_homeostatic_learning(self, result: Dict[str, Any], person_id: str) -> None:
+        """
+        Update a person's IPS weights using homeostatic reward.
+        Positive reward makes the robot more proactive.
+        Negative reward makes the robot more conservative/reactive.
+        """
+        person_id = str(person_id or "").strip()
+        reward = max(-30.0, min(30.0, self._homeostatic_reward_from_result(result)))
+
+        if not self._is_face_known(person_id):
+            self._log_homeostatic_delta(
+                result, person_id or "unknown", reward, "skipped", "unknown_person", None, None
+            )
+            return
+
+        if not self._result_bool(result, "hunger_drive_enabled", True):
+            old_weights = self._get_person_weights(person_id)
+            self._log_homeostatic_delta(
+                result, person_id, reward, "skipped", "hunger_disabled", old_weights, old_weights
+            )
+            return
+
+        if str(result.get("hunger_state_start", "")).upper() == "HS0":
+            old_weights = self._get_person_weights(person_id)
+            self._log_homeostatic_delta(
+                result, person_id, reward, "skipped", "hunger_disabled", old_weights, old_weights
+            )
+            return
+
+        with self._memory_lock:
+            profile = self.homeostatic_profiles.get(person_id, {})
+            if not isinstance(profile, dict):
+                profile = {}
+            raw_homeostasis = profile.get("homeostasis", {})
+            homeostasis = raw_homeostasis if isinstance(raw_homeostasis, dict) else {}
+
+            old_weights = self._get_person_weights(person_id)
+            weights = dict(old_weights)
+            epsilon = self.HOMEOSTATIC_REWARD_EPSILON
+
+            if abs(reward) < epsilon:
+                outcome = "neutral"
+                reason = "neutral_delta"
+                shift = 0.0
+            else:
+                shift = min(
+                    self.MAX_WEIGHT_SHIFT_PER_INTERACTION,
+                    self.HOMEOSTATIC_WEIGHT_SHIFT_RATE
+                    * abs(reward)
+                    * self.HOMEOSTATIC_REWARD_SCALE,
+                )
+                if reward > epsilon:
+                    outcome = "drive_reduced"
+                    weights["prox"] = self._clamp01(weights["prox"] + shift)
+                    weights["vel"] = self._clamp01(weights["vel"] + shift)
+                    weights["cent"] = self._clamp01(weights["cent"] + shift * 0.25)
+                    weights["gaze"] = self._clamp01(weights["gaze"] - shift)
+                else:
+                    outcome = "drive_depleted"
+                    weights["prox"] = self._clamp01(weights["prox"] - shift)
+                    weights["vel"] = self._clamp01(weights["vel"] - shift)
+                    weights["cent"] = self._clamp01(weights["cent"] - shift * 0.15)
+                    weights["gaze"] = self._clamp01(weights["gaze"] + shift)
+                reason = self._homeostatic_reason(result, outcome, reward)
+
+            interactions_prev = self._result_int(homeostasis, "interactions", 0)
+            total_reward_prev = self._result_float(homeostasis, "total_reward", 0.0)
+            ema_prev = self._result_float(homeostasis, "reward_ema", 0.0)
+            reward_ema = (
+                reward
+                if interactions_prev <= 0
+                else self.REWARD_EMA_ALPHA * reward + (1.0 - self.REWARD_EMA_ALPHA) * ema_prev
+            )
+            now_iso = datetime.now(self.TIMEZONE).isoformat()
+            self.homeostatic_profiles[person_id] = {
+                "weights": weights,
+                "homeostasis": {
+                    "interactions": interactions_prev + 1,
+                    "total_reward": total_reward_prev + reward,
+                    "reward_ema": reward_ema,
+                    "last_reward": reward,
+                    "last_stomach_level_start": self._result_float(result, "stomach_level_start", 100.0),
+                    "last_stomach_level_end": self._result_float(result, "stomach_level_end", 100.0),
+                    "last_active_energy_cost": self._result_float(result, "active_energy_cost", 0.0),
+                    "last_meals_eaten_count": self._result_int(result, "meals_eaten_count", 0),
+                    "last_trigger_mode": str(result.get("trigger_mode", "proactive")),
+                    "last_outcome": outcome,
+                },
+                "updated_at": now_iso,
+            }
+
+        self._enqueue_save("homeostatic_learning")
+        self._log_homeostatic_delta(result, person_id, reward, outcome, reason, old_weights, weights)
+        self._log(
+            "INFO",
+            f"homeostatic learning: {person_id} reward={reward:.2f} outcome={outcome} shift={shift:.4f}",
+        )
 
     # ==================== Last Greeted (fresh read) ====================
 
@@ -1782,13 +2088,17 @@ class SalienceNetworkModule(yarp.RFModule):
             self.talked_today = self._prune_to_today(
                 self._load_json(self.talked_path, {})
             )
-            learning_raw = self._load_json(self.learning_path, {"people": {}})
-            self.learning_data = learning_raw.get("people", {})
+            learning_raw = self._load_json(
+                self.homeostatic_learning_path,
+                {"schema_version": 1, "people": {}},
+            )
+            people = learning_raw.get("people", {}) if isinstance(learning_raw, dict) else {}
+            self.homeostatic_profiles = people if isinstance(people, dict) else {}
         self._log(
             "INFO",
             f"{log_prefix} – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
-            f"learning:{len(self.learning_data)}",
+            f"homeostatic_profiles:{len(self.homeostatic_profiles)}",
         )
 
     def _load_all_json_files(self):
@@ -1843,10 +2153,10 @@ class SalienceNetworkModule(yarp.RFModule):
             data = dict(self.talked_today)
         self._save_json_atomic(self.talked_path, data)
 
-    def _save_learning_json(self):
+    def _save_homeostatic_learning_json(self):
         with self._memory_lock:
-            data = {"people": dict(self.learning_data)}
-        self._save_json_atomic(self.learning_path, data)
+            data = {"schema_version": 1, "people": dict(self.homeostatic_profiles)}
+        self._save_json_atomic(self.homeostatic_learning_path, data)
 
     def _prune_to_today(self, d: Dict[str, str]) -> Dict[str, str]:
         today = self._get_today_date()
@@ -1882,8 +2192,8 @@ class SalienceNetworkModule(yarp.RFModule):
                     self._save_greeted_json()
                 elif item == "talked":
                     self._save_talked_json()
-                elif item == "learning":
-                    self._save_learning_json()
+                elif item == "homeostatic_learning":
+                    self._save_homeostatic_learning_json()
             except Exception as e:
                 self._log("ERROR", f"IO worker save failed ({item}): {e}")
 
@@ -1901,21 +2211,54 @@ class SalienceNetworkModule(yarp.RFModule):
                 ss TEXT, eligible INTEGER, context_label INTEGER, reason TEXT,
                 last_greeted_ts TEXT
             )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS face_ips_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                track_id INTEGER,
+                face_id TEXT,
+                person_id TEXT,
+                social_state TEXT,
+                is_known INTEGER,
+                eligible INTEGER,
+                is_active_target INTEGER,
+                bbox_area REAL,
+                ips REAL,
+                ips_before_habituation REAL,
+                habituation_applied INTEGER,
+                habituation_multiplier REAL,
+                habituation_elapsed_sec REAL,
+                habituation_ips_delta REAL,
+                stimulus_type TEXT,
+                context_label INTEGER,
+                prox_score REAL,
+                cent_score REAL,
+                vel_score REAL,
+                gaze_score REAL,
+                weight_prox REAL,
+                weight_cent REAL,
+                weight_vel REAL,
+                weight_gaze REAL
+            )""")
 
             c.execute("""CREATE TABLE IF NOT EXISTS ss_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT, person_id TEXT, old_ss TEXT, new_ss TEXT
             )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS learning_changes (
+            c.execute("""CREATE TABLE IF NOT EXISTS homeostatic_learning_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
                 person_id TEXT,
                 reward_delta REAL,
                 outcome TEXT,
                 reason TEXT,
-                success INTEGER,
-                abort_reason TEXT,
-                name_extracted INTEGER,
+                trigger_mode TEXT,
+                hunger_state_start TEXT,
+                hunger_state_end TEXT,
+                stomach_level_start REAL,
+                stomach_level_end REAL,
+                active_energy_cost REAL,
+                meals_eaten_count INTEGER,
+                n_turns INTEGER,
                 exec_interaction_id TEXT,
                 old_prox REAL,
                 old_cent REAL,
@@ -1952,6 +2295,15 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_person ON target_selections(person_id)"
             )
             c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_track ON face_ips_events(track_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_person ON face_ips_events(person_id)"
+            )
+            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_time ON interaction_attempts(timestamp)"
             )
             c.execute(
@@ -1964,10 +2316,10 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_ia_hs_day ON interaction_attempts(hunger_state, timestamp)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_learning_changes_time ON learning_changes(timestamp)"
+                "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_time ON homeostatic_learning_changes(timestamp)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_learning_changes_person ON learning_changes(person_id)"
+                "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_person ON homeostatic_learning_changes(person_id)"
             )
 
             self._create_analytics_views(conn)
@@ -2021,6 +2373,40 @@ class SalienceNetworkModule(yarp.RFModule):
                 AVG(duration_sec)                                                 AS avg_duration_sec
             FROM v_interaction_attempts_clean
             GROUP BY day_rome, hunger_state, start_ss
+            """
+        )
+
+        c.execute("DROP VIEW IF EXISTS v_face_ips_timeline")
+        c.execute(
+            """
+            CREATE VIEW v_face_ips_timeline AS
+            SELECT
+                timestamp,
+                track_id,
+                face_id,
+                person_id,
+                social_state,
+                CAST(is_known AS INTEGER)                    AS is_known,
+                CAST(eligible AS INTEGER)                    AS eligible,
+                CAST(is_active_target AS INTEGER)            AS is_active_target,
+                bbox_area,
+                ips,
+                ips_before_habituation,
+                CAST(habituation_applied AS INTEGER)         AS habituation_applied,
+                habituation_multiplier,
+                habituation_elapsed_sec,
+                habituation_ips_delta,
+                stimulus_type,
+                context_label,
+                prox_score,
+                cent_score,
+                vel_score,
+                gaze_score,
+                weight_prox,
+                weight_cent,
+                weight_vel,
+                weight_gaze
+            FROM face_ips_events
             """
         )
 
@@ -2085,6 +2471,44 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("last_greeted_ts"),
                         ),
                     )
+                elif table == "face_ips_event":
+                    c.execute(
+                        """INSERT INTO face_ips_events
+                        (timestamp,track_id,face_id,person_id,social_state,is_known,eligible,
+                         is_active_target,bbox_area,ips,ips_before_habituation,
+                         habituation_applied,habituation_multiplier,habituation_elapsed_sec,
+                         habituation_ips_delta,stimulus_type,context_label,
+                         prox_score,cent_score,vel_score,gaze_score,
+                         weight_prox,weight_cent,weight_vel,weight_gaze)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            data["timestamp"],
+                            data.get("track_id"),
+                            data.get("face_id"),
+                            data.get("person_id"),
+                            data.get("social_state"),
+                            int(data.get("is_known", 0)),
+                            int(data.get("eligible", 0)),
+                            int(data.get("is_active_target", 0)),
+                            data.get("bbox_area"),
+                            data.get("ips"),
+                            data.get("ips_before_habituation"),
+                            int(data.get("habituation_applied", 0)),
+                            data.get("habituation_multiplier"),
+                            data.get("habituation_elapsed_sec"),
+                            data.get("habituation_ips_delta"),
+                            data.get("stimulus_type"),
+                            data.get("context_label"),
+                            data.get("prox_score"),
+                            data.get("cent_score"),
+                            data.get("vel_score"),
+                            data.get("gaze_score"),
+                            data.get("weight_prox"),
+                            data.get("weight_cent"),
+                            data.get("weight_vel"),
+                            data.get("weight_gaze"),
+                        ),
+                    )
                 elif table == "ss_change":
                     c.execute(
                         "INSERT INTO ss_changes (timestamp,person_id,old_ss,new_ss) VALUES (?,?,?,?)",
@@ -2095,23 +2519,29 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["new_ss"],
                         ),
                     )
-                elif table == "learning_change":
+                elif table == "homeostatic_learning_change":
                     c.execute(
-                        """INSERT INTO learning_changes
-                        (timestamp,person_id,reward_delta,outcome,reason,success,abort_reason,
-                         name_extracted,exec_interaction_id,
+                        """INSERT INTO homeostatic_learning_changes
+                        (timestamp,person_id,reward_delta,outcome,reason,trigger_mode,
+                         hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
+                         active_energy_cost,meals_eaten_count,n_turns,exec_interaction_id,
                          old_prox,old_cent,old_vel,old_gaze,
                          new_prox,new_cent,new_vel,new_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp"],
                             data["person_id"],
                             data["reward_delta"],
                             data.get("outcome"),
                             data.get("reason"),
-                            data.get("success"),
-                            data.get("abort_reason"),
-                            data.get("name_extracted"),
+                            data.get("trigger_mode"),
+                            data.get("hunger_state_start"),
+                            data.get("hunger_state_end"),
+                            data.get("stomach_level_start"),
+                            data.get("stomach_level_end"),
+                            data.get("active_energy_cost"),
+                            data.get("meals_eaten_count"),
+                            data.get("n_turns"),
                             data.get("exec_interaction_id"),
                             data.get("old_prox"),
                             data.get("old_cent"),
