@@ -49,7 +49,7 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 ## Architecture Overview
 
 **Core modules**
-- **alwayson_vision**: Perception pipeline (YOLO + MediaPipe + face ID). Produces landmarks, annotated face view, QR data, and target bounding boxes.
+- **alwayson_embodiedBehaviour_vision**: Perception pipeline (YOLO + MediaPipe + face ID). Produces landmarks, annotated face view, QR data, and target bounding boxes.
 - **alwayson_salienceNetwork**: Selects the most salient face via IPS, manages interaction gating and cooldowns, and drives face tracking.
 - **alwayson_executiveControl**: Orchestrates the interaction state machine, speech I/O, Orexigenic drive model, QR-based feeding, and LLM-driven dialogue.
 - **alwayson_chatBot**: Telegram interface driven by the same Orexigenic state and prompts.
@@ -72,7 +72,7 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 
 ```mermaid
 flowchart LR
-  cam[/icub/cam/left/] --> V[alwayson_vision]
+  cam[/icub/cam/left/] --> V[alwayson_embodiedBehaviour_vision]
   V -->|landmarks:o| S[alwayson_salienceNetwork]
   V -->|landmarks:o| E[alwayson_executiveControl]
   V -->|qr:o| E
@@ -90,7 +90,7 @@ flowchart LR
 
 ## Modules and Features
 
-### alwayson_vision
+### alwayson_embodiedBehaviour_vision
 
 - Real-time face detection (YOLO v11) and tracking (ByteTrack) with a 10% bounding box expansion for better crop quality.
 - MediaPipe face landmark estimation: head pose via PnP (pitch, yaw, roll), gaze direction vector, and attention classification (`MUTUAL_GAZE` / `NEAR_GAZE` / `AWAY`).
@@ -117,6 +117,7 @@ flowchart LR
 - **Habituation**: per-person IPS is attenuated exponentially (λ=0.20) the longer a face is continuously targeted, driving the robot toward novel faces.
 - **Adaptive IPS weights**: per-person proximity/centrality/velocity/gaze weights shift based on homeostatic reward after each interaction (reward-weighted gradient, max shift 0.08 per interaction).
 - **Context-aware cooldown**: STM context label (1=lively → short cooldown; 0=calm → long cooldown; −1=default) adjusts interaction frequency.
+- **Unknown person dwell gate**: an unresolved (SS1) face must be continuously present for at least 7.5 seconds before an interaction can be triggered; resolving to a known identity clears the timer immediately.
 - Sends `run` to FaceTracker at startup and `sus` at shutdown.
 - Persists daily memory to JSON: `greeted_today.json`, `talked_today.json`, `last_greeted.json`, `homeostatic_learning.json`.
 
@@ -134,7 +135,7 @@ flowchart LR
 - **Orexigenic drive model** (`HungerModel`): stomach level drains continuously over 5 hours. Thresholds: ≥60% = HS1 (full), 25–60% = HS2 (hungry), <25% = HS3 (starving). Level and timestamps persist atomically to `memory/hunger_state.json`.
 - **Active energy costs**: each meaningful robot action (greeting, name question, conversation turn, feed acknowledgment) exerts a metabolic cost that accelerates stomach drain.
 - **QR-based feeding**: reads QR codes from vision (`/alwayson/executiveControl/qr:i`). Recognized payloads: `SMALL_MEAL` (+10%), `MEDIUM_MEAL` (+25%), `LARGE_MEAL` (+45%). Speaks a context-aware acknowledgment and logs a `qr_feed` reactive event.
-- **Reactive greeting path**: independently listens to STT for greeting utterances (hello, hi, ciao, etc.). When idle, responds reactively without requiring the proactive interaction flow to be triggered.
+- **Reactive greeting path**: independently listens to STT for greeting utterances (hello, hi, ciao, etc.). When idle, responds reactively without requiring the proactive interaction flow to be triggered. At HS3, the reactive response skips the normal greeting and immediately delivers a combined greeting + hunger request ("Hello, I'm so hungry, would you feed me please?").
 - **Face emotion**: sets iCub facial expression via `/icub/face/emotions/in` on HS transitions and at startup (HS1: all happy; HS2: mouth sad, eyebrows neutral; HS3: mouth + eyebrows fully sad).
 - **`LatestOnlyLlmWorker`**: bounded parallel LLM execution (up to 3 concurrent calls) with cancel-on-supersede semantics and streaming support.
 - **`SpeechCoordinator`**: non-blocking TTS timing tracker that allows the dialogue loop to continue without hard waits.
@@ -179,7 +180,7 @@ flowchart LR
 
 | Module | Type | Node |
 |---|---|---|
-| `alwayson_vision` | core | icubsrv |
+| `alwayson_alwayson_embodiedBehaviour_vision` | core | icubsrv |
 | `alwayson_salienceNetwork` | core | icubsrv |
 | `alwayson_executiveControl` | core | icubsrv |
 | `alwayson_chatBot` | core | icubsrv |
@@ -227,7 +228,7 @@ make install
 
 - **YARP**: Ensure `yarpserver` is running and network is configured.
 - **LLM config**: Copy `modules/llm.env.template` to `modules/llm.env` and fill in your Azure OpenAI credentials (used by ExecutiveControl and ChatBot).
-- **Face models**: Vision auto-downloads the YOLO face model on first run; ensure network access or place the model file locally.
+- **Face models**: Vision auto-downloads the YOLO face model on first run; ensure network access or place the model file locally. The MediaPipe `face_landmarker.task` model is bundled in the repository and installed automatically into the `alwaysOn` YARP context during `make install`.
 - **Python deps**: `requirements.txt` is installed during the build; use a virtualenv if running modules manually.
 
 ## Data Collection

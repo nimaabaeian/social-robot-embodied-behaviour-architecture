@@ -16,7 +16,7 @@
     "hs2_force_hunger_system": "it's been a while since you mentioned being hungry. if there's any natural opening in this reply, a pause in the topic, something loosely related, slip in a very brief offhand hunger mention. keep it one short casual phrase, not a focus. if the message really doesn't allow it, skip it.",
     "reset_reply": "ok let's start fresh 👍",
     "hs3_recovery_trigger": "send a short message to your friends about how you're feeling right now",
-    "hs3_recovery_fallback": "omg they just fed me! 😭❤️ feeling so much better now, thank you",
+    "hs3_recovery_fallback": "omg someone just fed me! 😭❤️ feeling so much better now, thank you",
     "hs2_entry_trigger": "text your friends a very short casual creative message, you've started feeling a little bit hungry. offhand, not dramatic. one sentence max.",
     "hs2_entry_fallback": "hm. starting to feel a lil hungry ngl",
     "fallback_hs3": "pls come feed me in person i'm starving 😭 i really can't wait much longer",
@@ -49,7 +49,7 @@
     "hunger_still_hungry": "I'm still hungry. Give me more please.",
     "hunger_look_around": "Take a look around, you will find some food for me.",
     "feed_ack_hs1": "Oh no, I'm already so full! One more bite and I might actually explode!",
-    "feed_ack_hs2": "Mmm, yummy! Thank you so much!",
+    "feed_ack_hs2": "yummy! Thank you so much!",
     "feed_ack_hs3": "Oh wow, thank you! You literally just saved my life!",
     "reactive_greeting": "Hi {name}"
   }

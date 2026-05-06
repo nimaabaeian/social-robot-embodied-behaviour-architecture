@@ -205,12 +205,12 @@ class SalienceNetworkModule(yarp.RFModule):
         self.cooldown_lively: float = 3.0
         self.cooldown_calm: float = 15.0
         self.cooldown_default: float = 5.0
-        self.min_track_ips: float = 0.9
+        self.min_track_ips: float = 0.6
         self.track_stop_hysteresis: float = 0.1
         self.track_switch_hysteresis: float = 0.05
         self.track_stop_debounce_sec: float = 2.0
         self.exec_rpc_retry_sec: float = 1.0
-        self.unknown_ss1_wait_sec: float = 5.0
+        self.unknown_ss1_wait_sec: float = 7.5
 
         self.current_context_label: int = -1
 
@@ -597,8 +597,8 @@ class SalienceNetworkModule(yarp.RFModule):
                 self.facetracker_rpc.write(cmd, reply)
 
                 # FaceTracker.cpp replies with VOCAB_OK or VOCAB_FAILED
-                if reply.size() > 0 and reply.get(0).asVocab32() == yarp.Vocab32_encode(
-                    "ok"
+                if reply.size() > 0 and reply.get(0).asVocab32() == yarp.createVocab32(
+                    'o', 'k'
                 ):
                     self._log("INFO", f"Sent '{command}' to /faceTracker successfully")
                     return

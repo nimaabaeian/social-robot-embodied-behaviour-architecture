@@ -116,7 +116,9 @@ function(easy_python_module_install MODULE_NAME PYTHON_FILE)
 endfunction()
 
 # ==========================================================================
-easy_python_module_install(alwayson_vision vision.py)
+easy_python_module_install(alwayson_embodiedBehaviour_vision vision.py)
 easy_python_module_install(alwayson_executiveControl executiveControl.py)
 easy_python_module_install(alwayson_salienceNetwork salienceNetwork.py)
 easy_python_module_install(alwayson_chatBot chatBot.py)
+
+yarp_install(FILES face_landmarker.task DESTINATION ${ICUBCONTRIB_CONTEXTS_INSTALL_DIR}/alwaysOn)

@@ -881,9 +881,9 @@ class ExecutiveControlModule(yarp.RFModule):
     HUNGER_STATE_FILE   = os.path.join(_MODULE_DIR, "memory", "hunger_state.json")
 
     # Timeouts (seconds)
-    SS1_STT_TIMEOUT          = 15.0
-    SS2_GREET_TIMEOUT        = 15.0
-    SS3_STT_TIMEOUT          = 15.0
+    SS1_STT_TIMEOUT          = 18.0
+    SS2_GREET_TIMEOUT        = 18.0
+    SS3_STT_TIMEOUT          = 18.0
     LLM_TIMEOUT              = 8.0
     SS3_MAX_TURNS            = 3
     STT_POLL_INTERVAL_SEC    = 0.05
@@ -2071,12 +2071,14 @@ class ExecutiveControlModule(yarp.RFModule):
 
     # ── Orexigenic drive / QR feeding tree ───────────────────────────────────
 
-    def _run_hunger_tree(self, social_state: str, hs: str, result: InteractionResult) -> None:
+    def _run_hunger_tree(self, social_state: str, hs: str, result: InteractionResult,
+                         intro_text: Optional[str] = None) -> None:
         self._log("INFO", f"Hunger tree: {hs}")
         self._hunger_tree_active.set()
         try:
             self._stt_clear()
-            if self._speak_wait(self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")):
+            ask = intro_text if intro_text is not None else self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")
+            if self._speak_wait(ask):
                 self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_ask_feed")
             else:
                 result.abort_reason = result.abort_reason or "tts_dispatch_failed"
@@ -2161,7 +2163,7 @@ class ExecutiveControlModule(yarp.RFModule):
             return self._P.get("feed_ack_hs1", "Oh no, I'm already so full! One more bite and I might actually explode!")
         if hs_before == "HS3":
             return self._P.get("feed_ack_hs3", "Oh wow, thank you! You literally just saved my life!")
-        return self._P.get("feed_ack_hs2", "Mmm, yummy! Thank you so much!")
+        return self._P.get("feed_ack_hs2", "yummy! Thank you so much!")
 
     # ── QR reader loop ────────────────────────────────────────────────────────
 
@@ -2305,6 +2307,15 @@ class ExecutiveControlModule(yarp.RFModule):
             tag = f"[RGREET|{name}]"
             try:
                 self._log("INFO", f"{tag} START (track={track_id})")
+                hs = self._effective_hunger_state()
+                if self.hunger_enabled and hs == "HS3":
+                    hunger_ask = self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")
+                    intro = f"Hello, {hunger_ask}"
+                    self._run_hunger_tree("ss3", hs, dummy, intro_text=intro)
+                    dummy.success = not dummy.aborted
+                    dummy.final_state = "ss3"
+                    return
+
                 utterance = self._greet_known(
                     name,
                     timeout=self.SS3_STT_TIMEOUT,
@@ -2316,7 +2327,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     dummy.success = True
                     dummy.final_state = "ss3"
 
-                if utterance:
+                if utterance and not self._should_abort(dummy):
                     greeting = self._P.get("reactive_greeting", "Hi {name}").format(name=name)
                     turns    = self._run_conversation(
                         f"[RSS3|{name}]",
@@ -2389,6 +2400,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 else:
                     dummy.abort_reason = dummy.abort_reason or "tts_dispatch_failed"
                     return
+                if self._abort_requested() or dummy.aborted:
+                    return
+
+                hs = self._effective_hunger_state()
+                if self.hunger_enabled and hs == "HS3" and not self._should_abort(dummy):
+                    self._run_hunger_tree("ss1", hs, dummy)
+
                 if self._abort_requested() or dummy.aborted:
                     return
 
@@ -2676,13 +2694,11 @@ class ExecutiveControlModule(yarp.RFModule):
 
         candidates: List[Tuple[int, str, float, bool]] = []
         for f in faces:
-            if f.get("attention", "") not in self._REACTIVE_GAZE_STATES:
-                continue
             fid      = str(f.get("face_id", "")).strip()
             tid      = f.get("track_id")
             bbox     = f.get("bbox", [0, 0, 0, 0])
             area     = (bbox[2] * bbox[3]) if isinstance(bbox, (list, tuple)) and len(bbox) >= 4 else 0
-            if not isinstance(tid, int):
+            if not isinstance(tid, int) or tid < 0:
                 continue
             is_known = bool(fid and fid.lower() not in ("unknown", "unmatched", "recognizing") and not fid.isdigit())
             candidates.append((tid, fid, area, is_known))
@@ -2837,17 +2853,11 @@ class ExecutiveControlModule(yarp.RFModule):
         try:
             if bottle.size() >= 1:
                 raw = bottle.get(0).toString()
-                if raw.startswith('"'):
-                    end = raw.find('"', 1)
-                    if end > 1:
-                        t = raw[1:end]
-                        return t.strip() or None
-                elif ' ""' in raw:
-                    t = raw.split(' ""')[0].strip()
-                    return t or None
+                if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+                    t = raw[1:-1]
                 else:
-                    t = bottle.get(0).asString()
-                    return t.strip() or None
+                    t = raw
+                return t.strip() or None
         except Exception as e:
             self._log("WARNING", f"STT parse error: {e}")
         return None
