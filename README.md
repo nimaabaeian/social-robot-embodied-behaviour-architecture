@@ -237,17 +237,48 @@ Runtime SQLite databases are stored under `modules/data_collection/`.
 
 | Database | Contents |
 |---|---|
-| `executive_control.db` | Proactive interactions, reactive events (greetings, QR feeds), and continuous `hunger_level_events` timeline |
-| `salience_network.db` | Target selections, face IPS events with habituation data, social state changes, homeostatic learning deltas, and interaction attempts |
-| `chat_bot.db` | Telegram chat events, per-user memory snapshots, subscriber registry, and Orexigenic state at each message |
+| `executive_control.db` | Interaction outcomes, normalized interaction turns, latency events, reactive events (greetings, QR feeds), and continuous `hunger_level_events` timeline |
+| `salience_network.db` | Raw face observations, target selections, face IPS events with habituation data, interaction start/end events, social state changes, homeostatic learning deltas, and interaction attempts |
+| `chat_bot.db` | Complete Telegram message history, chat events, per-user memory snapshots, subscriber registry, and Orexigenic state at each message |
 
 **Analysis views**
 
-*executive_control.db*: `v_proactive_interactions`, `v_metric_ss3_daily`, `v_metric_response_rate_daily`, `v_metric_repeat_users_daily`, `v_metric_depth_progression`, `v_hunger_level_timeline`
+*executive_control.db*
 
-*salience_network.db*: `v_face_ips_timeline`, `v_interaction_attempts_clean`, `v_interaction_attempts_daily`
+| View | Description |
+|---|---|
+| `v_interactions` | All interactions (proactive and reactive) with `trigger_mode`, `abort_category`, and computed fields. Base view for all metrics. |
+| `v_metric_ss3_daily` | Daily SS3→SS4 completion rate, grouped by day and hunger state |
+| `v_metric_response_rate_daily` | Daily proactive response rate broken down by outcome: `replied`, `ignored` (no_response), `target_lost`, `system_abort`, `errors` |
+| `v_metric_repeat_users_daily` | Daily repeat-visitor rate per recognised user |
+| `v_metric_depth_progression` | Interaction depth by initial social state: launched, reached SS4, avg turns, deep interactions (≥3 turns) |
+| `v_hunger_level_timeline` | Full Orexigenic drive timeline with per-event stomach deltas and state transitions |
+| `v_interaction_turns` | Normalized user/robot turns with STT, LLM, fallback, interruption, and TTS timing fields |
+| `v_latency_events` | Structured per-turn latency trace events |
 
-*chat_bot.db*: `v_chat_events_clean`, `v_chat_daily_metrics`, `v_chat_user_daily`
+*salience_network.db*
+
+| View | Description |
+|---|---|
+| `v_interaction_attempts_clean` | Cleaned interaction attempts with `abort_category` (`no_response` / `target_lost` / `system_abort` / `error`) |
+| `v_interaction_attempts_daily` | Daily aggregates: launched, completed, SS4 rate, proactive count, abort breakdown by category |
+| `v_face_ips_timeline` | Per-frame IPS values with habituation and eligibility flags |
+| `v_face_observations` | Raw landmark-derived face observations while at least one face is visible, including bbox, gaze, pose, attention, and interaction-active flags |
+| `v_interaction_state_events` | Start/end timestamps for salience-triggered interactions |
+
+*chat_bot.db*: `v_chat_events_clean`, `v_chat_messages_clean`, `v_chat_daily_metrics`, `v_chat_user_daily`, `v_chat_session_metrics`
+
+Raw/event analysis tables include UTC, Rome-local, epoch, monotonic, and run-relative timestamp fields.
+
+**`abort_category` values** (available in all interaction views)
+
+| Value | Meaning |
+|---|---|
+| `no_response` | Person was present but did not reply (`no_response_greeting`, `no_response_conversation`, `no_response_name`) |
+| `target_lost` | Person walked away before or during the interaction (`target_lost`, `face_disappeared`, `target_monitor_abort`) |
+| `system_abort` | Internal system abort — TTS, LLM, or pipeline failure |
+| `error` | Unhandled exception |
+| `NULL` | Successful interaction |
 
 ## Running
 

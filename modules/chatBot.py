@@ -142,6 +142,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_verbosity: str = "low"
 
         self._db: Optional[sqlite3.Connection] = None
+        self._run_started_mono: float = time.monotonic()
         self._user_memory: Dict[str, Dict[str, Any]] = {}  # in-memory cache, persisted to SQLite
         self._hs2_hunger_counters: Dict[str, int] = {}  # per-user Orexigenic drive mention counter
         self._session_tracker: Dict[int, Dict[str, Any]] = {}  # chat_id -> {session_id, last_message_ts}
@@ -173,13 +174,18 @@ class ChatBotModule(yarp.RFModule):
             self.attach(self._rpc_port)
 
             # DB
-            db_path = os.path.join(self._script_dir, "memory", self.DB_FILENAME)
+            db_path = os.path.join(self._script_dir, "data_collection", self.DB_FILENAME)
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             self._db = sqlite3.connect(db_path, check_same_thread=False)
+            self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA busy_timeout=5000")
             self._db.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS schema_info (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -204,11 +210,19 @@ class ChatBotModule(yarp.RFModule):
                 );
                 CREATE TABLE IF NOT EXISTS chat_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER NOT NULL,
+                    timestamp_utc TEXT NOT NULL,
+                    timestamp_local TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    timestamp_epoch REAL NOT NULL,
+                    monotonic_sec REAL NOT NULL,
+                    run_elapsed_sec REAL NOT NULL,
                     day_rome TEXT NOT NULL,
                     chat_id INTEGER,
-                    event_type TEXT NOT NULL,
-                    hs TEXT,
+                    event_type TEXT NOT NULL CHECK (event_type IN (
+                        'start','reset','user_message','assistant_reply',
+                        'hs3_proactive','hs2_entry','hs3_recovery'
+                    )),
+                    hs TEXT CHECK (hs IS NULL OR hs IN ('HS0','HS1','HS2','HS3')),
                     user_chars INTEGER,
                     assistant_chars INTEGER,
                     hunger_mentioned INTEGER,
@@ -218,16 +232,47 @@ class ChatBotModule(yarp.RFModule):
                     turn_count_at_event INTEGER,
                     session_id TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_chat_events_ts ON chat_events(timestamp);
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc TEXT NOT NULL,
+                    timestamp_local TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    timestamp_epoch REAL NOT NULL,
+                    monotonic_sec REAL NOT NULL,
+                    run_elapsed_sec REAL NOT NULL,
+                    day_rome TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    role TEXT NOT NULL CHECK (role IN ('user','assistant','system','proactive')),
+                    hs TEXT CHECK (hs IS NULL OR hs IN ('HS0','HS1','HS2','HS3')),
+                    text TEXT NOT NULL,
+                    text_chars INTEGER NOT NULL,
+                    telegram_message_ts_utc TEXT,
+                    telegram_message_epoch REAL,
+                    llm_fallback INTEGER NOT NULL DEFAULT 0,
+                    hunger_mentioned INTEGER NOT NULL DEFAULT 0,
+                    proactive_mode TEXT,
+                    note TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_events_ts ON chat_events(timestamp_utc);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_day ON chat_events(day_rome);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_chat_id ON chat_events(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_type ON chat_events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_session ON chat_events(session_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_ts ON chat_messages(timestamp_utc);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_role ON chat_messages(role);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_seen ON subscribers(last_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_proactive ON subscribers(last_proactive_at);
                 CREATE INDEX IF NOT EXISTS idx_chat_memory_updated ON chat_memory(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_user_memory_updated ON user_memory(updated_at);
                 """
+            )
+            self._db.execute(
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','2') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             self._create_analytics_views()
             self._db.commit()
@@ -669,12 +714,24 @@ class ChatBotModule(yarp.RFModule):
         self._db_clear_memory(chat_id, commit=False)
         reset_reply = self._prompts.get("reset_reply", "ok let's start fresh 👍")
         self._tg_send(chat_id, reset_reply)
+        sid = self._get_or_create_session(chat_id, time.time())
+        self._db_log_message(
+            chat_id=chat_id,
+            session_id=sid,
+            turn_index=0,
+            role="assistant",
+            hs=self._effective_hs(),
+            text=reset_reply,
+            note="command:/reset",
+            commit=False,
+        )
         self._db_log_event(
             event_type="reset",
             chat_id=chat_id,
             hs=self._effective_hs(),
             assistant_chars=len(reset_reply),
             note="command:/reset",
+            session_id=sid,
             commit=False,
         )
         self._db_commit()
@@ -709,6 +766,17 @@ class ChatBotModule(yarp.RFModule):
             note="incoming_text",
             turn_count_at_event=turn_count,
             session_id=sid,
+            commit=False,
+        )
+        self._db_log_message(
+            chat_id=chat_id,
+            session_id=sid,
+            turn_index=turn_count + 1,
+            role="user",
+            hs=hs,
+            text=user_text,
+            telegram_message_epoch=float(msg_date) if msg_date else None,
+            note="incoming_text",
             commit=False,
         )
 
@@ -819,6 +887,18 @@ class ChatBotModule(yarp.RFModule):
             session_id=sid,
             commit=False,
         )
+        self._db_log_message(
+            chat_id=chat_id,
+            session_id=sid,
+            turn_index=turn_count,
+            role="assistant",
+            hs=hs,
+            text=reply_text,
+            llm_fallback=1 if used_fallback else 0,
+            hunger_mentioned=hunger_mentioned,
+            note=("hs2_forced" if hs2_forced else ""),
+            commit=False,
+        )
 
         self._db_save_memory(chat_id, summary, history, turn_count, commit=False)
         self._db_commit()
@@ -855,6 +935,18 @@ class ChatBotModule(yarp.RFModule):
                 hunger_mentioned=1,
                 proactive_mode=("enter" if entering else "cooldown"),
                 note="proactive_sent",
+                commit=False,
+            )
+            self._db_log_message(
+                chat_id=chat_id,
+                session_id=None,
+                turn_index=None,
+                role="proactive",
+                hs="HS3",
+                text=text,
+                hunger_mentioned=1,
+                proactive_mode=("enter" if entering else "cooldown"),
+                note="hs3_proactive",
                 commit=False,
             )
             sent_any = True
@@ -900,6 +992,18 @@ class ChatBotModule(yarp.RFModule):
                 note="hs2_entry_proactive_sent",
                 commit=False,
             )
+            self._db_log_message(
+                chat_id=chat_id,
+                session_id=None,
+                turn_index=None,
+                role="proactive",
+                hs="HS2",
+                text=text,
+                hunger_mentioned=1,
+                proactive_mode="hs1_to_hs2",
+                note="hs2_entry",
+                commit=False,
+            )
             sent_any = True
             self._log("INFO", f"HS2 entry proactive -> {chat_id}")
         if sent_any:
@@ -932,6 +1036,18 @@ class ChatBotModule(yarp.RFModule):
                 hunger_mentioned=0,
                 proactive_mode="hs3_exit",
                 note="hs3_recovery_proactive_sent",
+                commit=False,
+            )
+            self._db_log_message(
+                chat_id=chat_id,
+                session_id=None,
+                turn_index=None,
+                role="proactive",
+                hs=new_hs,
+                text=text,
+                hunger_mentioned=0,
+                proactive_mode="hs3_exit",
+                note="hs3_recovery",
                 commit=False,
             )
             sent_any = True
@@ -1719,7 +1835,12 @@ class ChatBotModule(yarp.RFModule):
             CREATE VIEW v_chat_events_clean AS
             SELECT
                 id,
-                timestamp,
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
                 day_rome,
                 chat_id,
                 event_type,
@@ -1797,16 +1918,61 @@ class ChatBotModule(yarp.RFModule):
                 MAX(turn_count_at_event)                                    AS session_depth,
                 SUM(CASE WHEN hunger_mentioned = 1 THEN 1 ELSE 0 END)      AS hunger_mentions,
                 SUM(llm_fallback)                                           AS fallback_count,
-                MIN(timestamp)                                              AS session_start_ts,
-                MAX(timestamp) - MIN(timestamp)                             AS session_duration_sec
+                MIN(timestamp_utc)                                          AS session_start_utc,
+                MAX(timestamp_utc)                                          AS session_end_utc,
+                MAX(timestamp_epoch) - MIN(timestamp_epoch)                 AS session_duration_sec
             FROM v_chat_events_clean
             WHERE session_id IS NOT NULL
               AND event_type IN ('user_message', 'assistant_reply')
             GROUP BY session_id
             """
         )
+        self._db.execute("DROP VIEW IF EXISTS v_chat_messages_clean")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_messages_clean AS
+            SELECT
+                id,
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
+                day_rome,
+                chat_id,
+                session_id,
+                turn_index,
+                role,
+                hs,
+                text,
+                text_chars,
+                telegram_message_ts_utc,
+                telegram_message_epoch,
+                llm_fallback,
+                hunger_mentioned,
+                proactive_mode,
+                note
+            FROM chat_messages
+            """
+        )
 
     # ------------------------- DB helpers -------------------------
+    def _time_fields(self, epoch: Optional[float] = None) -> Dict[str, Any]:
+        ts_epoch = float(time.time() if epoch is None else epoch)
+        utc_dt = datetime.fromtimestamp(ts_epoch, timezone.utc)
+        local_dt = utc_dt.astimezone(ZoneInfo(self.DEFAULT_TZ))
+        mono = time.monotonic()
+        return {
+            "timestamp_utc": utc_dt.isoformat(),
+            "timestamp_local": local_dt.isoformat(),
+            "timezone": self.DEFAULT_TZ,
+            "timestamp_epoch": ts_epoch,
+            "monotonic_sec": mono,
+            "run_elapsed_sec": mono - self._run_started_mono,
+            "day_rome": local_dt.date().isoformat(),
+        }
+
     def _db_commit(self) -> None:
         if not self._db:
             return
@@ -1829,19 +1995,25 @@ class ChatBotModule(yarp.RFModule):
     ) -> None:
         if not self._db:
             return
-        now = int(time.time())
-        day_rome = datetime.now(ZoneInfo(self.DEFAULT_TZ)).date().isoformat()
+        ts = self._time_fields()
         self._db.execute(
             """
             INSERT INTO chat_events
-            (timestamp, day_rome, chat_id, event_type, hs,
+            (timestamp_utc, timestamp_local, timezone, timestamp_epoch,
+             monotonic_sec, run_elapsed_sec, day_rome,
+             chat_id, event_type, hs,
              user_chars, assistant_chars, hunger_mentioned, llm_fallback,
              proactive_mode, note, turn_count_at_event, session_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                now,
-                day_rome,
+                ts["timestamp_utc"],
+                ts["timestamp_local"],
+                ts["timezone"],
+                ts["timestamp_epoch"],
+                ts["monotonic_sec"],
+                ts["run_elapsed_sec"],
+                ts["day_rome"],
                 int(chat_id) if chat_id is not None else None,
                 event_type,
                 hs,
@@ -1853,6 +2025,65 @@ class ChatBotModule(yarp.RFModule):
                 note,
                 int(turn_count_at_event) if turn_count_at_event is not None else None,
                 session_id,
+            ),
+        )
+        if commit:
+            self._db_commit()
+
+    def _db_log_message(
+        self,
+        *,
+        chat_id: int,
+        session_id: Optional[str],
+        turn_index: Optional[int],
+        role: str,
+        hs: Optional[str],
+        text: str,
+        telegram_message_epoch: Optional[float] = None,
+        llm_fallback: int = 0,
+        hunger_mentioned: int = 0,
+        proactive_mode: Optional[str] = None,
+        note: str = "",
+        commit: bool = True,
+    ) -> None:
+        if not self._db:
+            return
+        ts = self._time_fields()
+        tg_ts_utc = None
+        if telegram_message_epoch is not None:
+            tg_ts_utc = datetime.fromtimestamp(float(telegram_message_epoch), timezone.utc).isoformat()
+        safe_text = text or ""
+        self._db.execute(
+            """
+            INSERT INTO chat_messages
+            (timestamp_utc, timestamp_local, timezone, timestamp_epoch,
+             monotonic_sec, run_elapsed_sec, day_rome,
+             chat_id, session_id, turn_index, role, hs, text, text_chars,
+             telegram_message_ts_utc, telegram_message_epoch,
+             llm_fallback, hunger_mentioned, proactive_mode, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                ts["timestamp_utc"],
+                ts["timestamp_local"],
+                ts["timezone"],
+                ts["timestamp_epoch"],
+                ts["monotonic_sec"],
+                ts["run_elapsed_sec"],
+                ts["day_rome"],
+                int(chat_id),
+                session_id,
+                int(turn_index) if turn_index is not None else None,
+                role,
+                hs,
+                safe_text,
+                len(safe_text),
+                tg_ts_utc,
+                float(telegram_message_epoch) if telegram_message_epoch is not None else None,
+                int(llm_fallback),
+                int(hunger_mentioned),
+                proactive_mode,
+                note,
             ),
         )
         if commit:
@@ -1927,15 +2158,6 @@ class ChatBotModule(yarp.RFModule):
         )
         if commit:
             self._db_commit()
-
-    def _db_subscriber_last_seen(self, chat_id: int) -> int:
-        if not self._db:
-            return 0
-        row = self._db.execute(
-            "SELECT last_seen_at FROM subscribers WHERE chat_id=?",
-            (int(chat_id),),
-        ).fetchone()
-        return int(row[0]) if row else 0
 
     def _db_count_subscribers(self) -> int:
         if not self._db:

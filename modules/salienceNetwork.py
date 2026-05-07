@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -138,7 +138,6 @@ class SalienceNetworkModule(yarp.RFModule):
     TARGET_LOG_IPS_DELTA = 0.15
     FACE_IPS_LOG_PERIOD_SEC = 0.5
     FACE_IPS_LOG_DELTA = 0.03
-    DB_QUEUE_MAXSIZE = 1024
     IO_QUEUE_MAXSIZE = 256
 
     # Social-state labels
@@ -158,6 +157,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self.module_name = "salienceNetwork"
         self.period = 0.05  # 20 Hz
         self._running = True
+        self._run_started_mono: float = time.monotonic()
 
         self._consecutive_errors = 0
         self._max_consecutive_errors = 10
@@ -249,11 +249,14 @@ class SalienceNetworkModule(yarp.RFModule):
         self._io_thread: Optional[threading.Thread] = None
 
         self.db_path = str(Path(_MODULE_DIR) / "data_collection" / "salience_network.db")
-        self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAXSIZE)
+        self._db_queue: queue.Queue = queue.Queue()
         self._db_thread: Optional[threading.Thread] = None
         self._context_connected_logged = False
         self._unknown_ss1_since: Dict[int, float] = {}
         self._last_hunger_state: str = "HS0"
+        self._active_interaction_attempt_id: Optional[str] = None
+        self._active_interaction_track_id: int = -1
+        self._active_interaction_person_id: str = ""
 
     # ------------------------------------------------------------------ configure
     def configure(self, rf: yarp.ResourceFinder) -> bool:
@@ -502,7 +505,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._queue_put_drop_oldest(self._io_queue, None, "IO queue close")
         if self._io_thread:
             self._io_thread.join(timeout=5.0)
-        self._queue_put_drop_oldest(self._db_queue, None, "DB queue close")
+        self._db_queue.put(None)
         if self._db_thread:
             self._db_thread.join(timeout=3.0)
         if self.facetracker_rpc and self._running:
@@ -660,6 +663,9 @@ class SalienceNetworkModule(yarp.RFModule):
 
             with self.state_lock:
                 self.current_faces = self._compute_face_states(faces)
+                faces_for_logging = [dict(face) for face in self.current_faces]
+
+            self._log_face_observations(faces_for_logging)
 
             current_time = time.time()
             pending_exec_check = None
@@ -994,6 +1000,68 @@ class SalienceNetworkModule(yarp.RFModule):
                     "weight_cent": weights["cent"],
                     "weight_vel": weights["vel"],
                     "weight_gaze": weights["gaze"],
+                },
+            )
+
+    def _log_face_observations(self, faces: List[Dict[str, Any]]) -> None:
+        """Persist raw landmark-derived observations whenever at least one face is visible."""
+        if not faces:
+            return
+        active_track_id = self._active_attention_track_id()
+        with self._interaction_lock:
+            active_attempt_id = self._active_interaction_attempt_id
+            interaction_busy = int(bool(self.interaction_busy))
+            active_interaction_track_id = self._active_interaction_track_id
+            active_interaction_person_id = self._active_interaction_person_id
+
+        for face in faces:
+            bbox = face.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            gaze = face.get("gaze_direction", (0.0, 0.0, 1.0))
+            try:
+                x, y, w, h = [float(v) for v in bbox]
+            except Exception:
+                x = y = w = h = 0.0
+            try:
+                gaze_x, gaze_y, gaze_z = [float(v) for v in gaze]
+            except Exception:
+                gaze_x, gaze_y, gaze_z = 0.0, 0.0, 1.0
+            track_id = int(face.get("track_id", -1))
+            person_id = str(face.get("person_id", face.get("face_id", "unknown")))
+            self._db_log(
+                "face_observation",
+                {
+                    "track_id": track_id,
+                    "face_id": str(face.get("face_id", "unknown")),
+                    "person_id": person_id,
+                    "bbox_x": x,
+                    "bbox_y": y,
+                    "bbox_w": w,
+                    "bbox_h": h,
+                    "bbox_area": w * h,
+                    "distance": str(face.get("distance", "UNKNOWN")),
+                    "attention": str(face.get("attention", "AWAY")),
+                    "gaze_x": gaze_x,
+                    "gaze_y": gaze_y,
+                    "gaze_z": gaze_z,
+                    "pitch": float(face.get("pitch", 0.0)),
+                    "yaw": float(face.get("yaw", 0.0)),
+                    "roll": float(face.get("roll", 0.0)),
+                    "cos_angle": float(face.get("cos_angle", 0.0)),
+                    "is_talking": int(face.get("is_talking", 0)),
+                    "time_in_view": float(face.get("time_in_view", 0.0)),
+                    "social_state": str(face.get("social_state", "ss1")),
+                    "is_known": int(bool(face.get("is_known", False))),
+                    "eligible": int(bool(face.get("eligible", False))),
+                    "ips": float(face.get("ips", 0.0)),
+                    "context_label": self.current_context_label,
+                    "interaction_busy": interaction_busy,
+                    "active_attempt_id": active_attempt_id,
+                    "active_interaction_track_id": active_interaction_track_id,
+                    "active_interaction_person_id": active_interaction_person_id,
+                    "is_attention_target": int(track_id == active_track_id),
+                    "is_interaction_target": int(
+                        interaction_busy and track_id == active_interaction_track_id
+                    ),
                 },
             )
 
@@ -1570,6 +1638,26 @@ class SalienceNetworkModule(yarp.RFModule):
             )
         )
         ss = target.get("social_state", "ss1")
+        with self._interaction_lock:
+            self._active_interaction_attempt_id = attempt_id
+            self._active_interaction_track_id = int(track_id)
+            self._active_interaction_person_id = face_id
+        self._db_log(
+            "interaction_state_event",
+            {
+                "event_type": "start",
+                "attempt_id": attempt_id,
+                "exec_interaction_id": None,
+                "track_id": track_id,
+                "face_id": raw_face_id,
+                "person_id": face_id,
+                "social_state": ss,
+                "success": None,
+                "abort_reason": None,
+                "duration_sec": 0.0,
+                "hunger_state": self._last_hunger_state,
+            },
+        )
         try:
             self._log("INFO", f"talk: start t{track_id} {face_id} {ss}")
 
@@ -1605,10 +1693,29 @@ class SalienceNetworkModule(yarp.RFModule):
                 is_proactive=1,
             )
             self._db_log("interaction_attempt", asdict(attempt))
+            self._db_log(
+                "interaction_state_event",
+                {
+                    "event_type": "end",
+                    "attempt_id": attempt_id,
+                    "exec_interaction_id": exec_interaction_id,
+                    "track_id": track_id,
+                    "face_id": raw_face_id,
+                    "person_id": face_id,
+                    "social_state": ss,
+                    "success": int(bool(result and result.get("success"))),
+                    "abort_reason": abort_reason,
+                    "duration_sec": duration_sec,
+                    "hunger_state": self._last_hunger_state,
+                },
+            )
             with self._interaction_lock:
                 with self.state_lock:
                     self.interaction_busy = False
                     self.selected_target = None
+                    self._active_interaction_attempt_id = None
+                    self._active_interaction_track_id = -1
+                    self._active_interaction_person_id = ""
                     final_id = str(
                         self.track_to_person.get(
                             target.get("track_id", -1), target.get("face_id", "unknown")
@@ -2214,24 +2321,88 @@ class SalienceNetworkModule(yarp.RFModule):
         try:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA foreign_keys=ON")
             c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS schema_info (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS target_selections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, track_id INTEGER, face_id TEXT,
-                person_id TEXT, bbox_area REAL, ips REAL,
-                ss TEXT, eligible INTEGER, context_label INTEGER, reason TEXT,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                track_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                bbox_area REAL,
+                ips REAL,
+                ss TEXT NOT NULL CHECK (ss IN ('ss1','ss2','ss3','ss4')),
+                eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
+                context_label INTEGER,
+                reason TEXT,
                 last_greeted_ts TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS face_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                track_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                bbox_x REAL NOT NULL,
+                bbox_y REAL NOT NULL,
+                bbox_w REAL NOT NULL,
+                bbox_h REAL NOT NULL,
+                bbox_area REAL NOT NULL,
+                distance TEXT,
+                attention TEXT,
+                gaze_x REAL,
+                gaze_y REAL,
+                gaze_z REAL,
+                pitch REAL,
+                yaw REAL,
+                roll REAL,
+                cos_angle REAL,
+                is_talking INTEGER NOT NULL CHECK (is_talking IN (0,1)),
+                time_in_view REAL,
+                social_state TEXT NOT NULL CHECK (social_state IN ('ss1','ss2','ss3','ss4')),
+                is_known INTEGER NOT NULL CHECK (is_known IN (0,1)),
+                eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
+                ips REAL,
+                context_label INTEGER,
+                interaction_busy INTEGER NOT NULL CHECK (interaction_busy IN (0,1)),
+                active_attempt_id TEXT,
+                active_interaction_track_id INTEGER,
+                active_interaction_person_id TEXT,
+                is_attention_target INTEGER NOT NULL CHECK (is_attention_target IN (0,1)),
+                is_interaction_target INTEGER NOT NULL CHECK (is_interaction_target IN (0,1))
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS face_ips_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
                 track_id INTEGER,
                 face_id TEXT,
                 person_id TEXT,
-                social_state TEXT,
-                is_known INTEGER,
-                eligible INTEGER,
-                is_active_target INTEGER,
+                social_state TEXT CHECK (social_state IS NULL OR social_state IN ('ss1','ss2','ss3','ss4')),
+                is_known INTEGER CHECK (is_known IS NULL OR is_known IN (0,1)),
+                eligible INTEGER CHECK (eligible IS NULL OR eligible IN (0,1)),
+                is_active_target INTEGER CHECK (is_active_target IS NULL OR is_active_target IN (0,1)),
                 bbox_area REAL,
                 ips REAL,
                 ips_before_habituation REAL,
@@ -2253,18 +2424,33 @@ class SalienceNetworkModule(yarp.RFModule):
 
             c.execute("""CREATE TABLE IF NOT EXISTS ss_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, person_id TEXT, old_ss TEXT, new_ss TEXT
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                old_ss TEXT NOT NULL CHECK (old_ss IN ('ss1','ss2','ss3','ss4')),
+                new_ss TEXT NOT NULL CHECK (new_ss IN ('ss1','ss2','ss3','ss4'))
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS homeostatic_learning_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                person_id TEXT,
-                reward_delta REAL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                reward_delta REAL NOT NULL,
                 outcome TEXT,
                 reason TEXT,
-                trigger_mode TEXT,
-                hunger_state_start TEXT,
-                hunger_state_end TEXT,
+                trigger_mode TEXT CHECK (trigger_mode IS NULL OR trigger_mode IN ('proactive','reactive')),
+                hunger_state_start TEXT CHECK (hunger_state_start IS NULL OR hunger_state_start IN ('HS0','HS1','HS2','HS3')),
+                hunger_state_end TEXT CHECK (hunger_state_end IS NULL OR hunger_state_end IN ('HS0','HS1','HS2','HS3')),
                 stomach_level_start REAL,
                 stomach_level_end REAL,
                 active_energy_cost REAL,
@@ -2282,22 +2468,53 @@ class SalienceNetworkModule(yarp.RFModule):
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS interaction_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                attempt_id TEXT,
-                track_id INTEGER,
-                face_id TEXT,
-                person_id TEXT,
-                start_ss TEXT,
-                success INTEGER,
-                final_state TEXT,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                attempt_id TEXT NOT NULL UNIQUE,
+                track_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                start_ss TEXT NOT NULL CHECK (start_ss IN ('ss1','ss2','ss3','ss4')),
+                success INTEGER NOT NULL CHECK (success IN (0,1)),
+                final_state TEXT CHECK (final_state IS NULL OR final_state IN ('ss1','ss2','ss3','ss4')),
                 abort_reason TEXT,
                 exec_interaction_id TEXT,
                 duration_sec REAL,
-                hunger_state TEXT,
-                is_proactive INTEGER NOT NULL DEFAULT 1
+                hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3')),
+                is_proactive INTEGER NOT NULL DEFAULT 1 CHECK (is_proactive IN (0,1))
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS interaction_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK (event_type IN ('start','end')),
+                attempt_id TEXT NOT NULL,
+                exec_interaction_id TEXT,
+                track_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                person_id TEXT NOT NULL,
+                social_state TEXT NOT NULL CHECK (social_state IN ('ss1','ss2','ss3','ss4')),
+                success INTEGER CHECK (success IS NULL OR success IN (0,1)),
+                abort_reason TEXT,
+                duration_sec REAL,
+                hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3'))
             )""")
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_target_selections_time ON target_selections(timestamp)"
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','2') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_target_selections_time ON target_selections(timestamp_utc)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_track ON target_selections(track_id)"
@@ -2306,7 +2523,16 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_person ON target_selections(person_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp)"
+                "CREATE INDEX IF NOT EXISTS idx_face_observations_time ON face_observations(timestamp_utc)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_observations_track ON face_observations(track_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_observations_attempt ON face_observations(active_attempt_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp_utc)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_track ON face_ips_events(track_id)"
@@ -2315,7 +2541,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_person ON face_ips_events(person_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_time ON interaction_attempts(timestamp)"
+                "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_time ON interaction_attempts(timestamp_utc)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_attempts_exec_id ON interaction_attempts(exec_interaction_id)"
@@ -2324,10 +2550,13 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_ia_hunger ON interaction_attempts(hunger_state)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_hs_day ON interaction_attempts(hunger_state, timestamp)"
+                "CREATE INDEX IF NOT EXISTS idx_ia_hs_day ON interaction_attempts(hunger_state, timestamp_utc)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_time ON homeostatic_learning_changes(timestamp)"
+                "CREATE INDEX IF NOT EXISTS idx_interaction_state_events_attempt ON interaction_state_events(attempt_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_time ON homeostatic_learning_changes(timestamp_utc)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_person ON homeostatic_learning_changes(person_id)"
@@ -2348,8 +2577,13 @@ class SalienceNetworkModule(yarp.RFModule):
             CREATE VIEW v_interaction_attempts_clean AS
             SELECT
                 attempt_id,
-                timestamp,
-                substr(timestamp, 1, 10) AS day_rome,
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
+                day_rome,
                 track_id,
                 face_id,
                 person_id,
@@ -2357,6 +2591,13 @@ class SalienceNetworkModule(yarp.RFModule):
                 CAST(success AS INTEGER) AS success,
                 final_state,
                 abort_reason,
+                CASE
+                    WHEN abort_reason IS NULL THEN NULL
+                    WHEN abort_reason IN ('no_response_greeting','no_response_conversation','no_response_name') THEN 'no_response'
+                    WHEN abort_reason IN ('target_lost','face_disappeared','target_monitor_abort') THEN 'target_lost'
+                    WHEN abort_reason LIKE 'exception:%' THEN 'error'
+                    ELSE 'system_abort'
+                END AS abort_category,
                 exec_interaction_id,
                 duration_sec,
                 COALESCE(hunger_state, 'HS0')        AS hunger_state,
@@ -2380,6 +2621,10 @@ class SalienceNetworkModule(yarp.RFModule):
                 1.0 * SUM(CASE WHEN final_state = 'ss4' THEN 1 ELSE 0 END)
                       / MAX(COUNT(*), 1)                                          AS ss4_rate,
                 SUM(CASE WHEN is_proactive = 1 THEN 1 ELSE 0 END)                AS proactive_count,
+                SUM(CASE WHEN abort_category='no_response'  THEN 1 ELSE 0 END)   AS ignored_count,
+                SUM(CASE WHEN abort_category='target_lost'  THEN 1 ELSE 0 END)   AS target_lost_count,
+                SUM(CASE WHEN abort_category='system_abort' THEN 1 ELSE 0 END)   AS system_abort_count,
+                SUM(CASE WHEN abort_category='error'        THEN 1 ELSE 0 END)   AS error_count,
                 SUM(CASE WHEN abort_reason IS NOT NULL THEN 1 ELSE 0 END)        AS aborted_count,
                 AVG(duration_sec)                                                 AS avg_duration_sec
             FROM v_interaction_attempts_clean
@@ -2392,7 +2637,13 @@ class SalienceNetworkModule(yarp.RFModule):
             """
             CREATE VIEW v_face_ips_timeline AS
             SELECT
-                timestamp,
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
+                day_rome,
                 track_id,
                 face_id,
                 person_id,
@@ -2420,12 +2671,104 @@ class SalienceNetworkModule(yarp.RFModule):
             FROM face_ips_events
             """
         )
+        c.execute("DROP VIEW IF EXISTS v_face_observations")
+        c.execute(
+            """
+            CREATE VIEW v_face_observations AS
+            SELECT
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
+                day_rome,
+                track_id,
+                face_id,
+                person_id,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                bbox_area,
+                distance,
+                attention,
+                gaze_x,
+                gaze_y,
+                gaze_z,
+                pitch,
+                yaw,
+                roll,
+                cos_angle,
+                is_talking,
+                time_in_view,
+                social_state,
+                is_known,
+                eligible,
+                ips,
+                context_label,
+                interaction_busy,
+                active_attempt_id,
+                active_interaction_track_id,
+                active_interaction_person_id,
+                is_attention_target,
+                is_interaction_target
+            FROM face_observations
+            """
+        )
+        c.execute("DROP VIEW IF EXISTS v_interaction_state_events")
+        c.execute(
+            """
+            CREATE VIEW v_interaction_state_events AS
+            SELECT
+                timestamp_utc,
+                timestamp_local,
+                timezone,
+                timestamp_epoch,
+                monotonic_sec,
+                run_elapsed_sec,
+                day_rome,
+                event_type,
+                attempt_id,
+                exec_interaction_id,
+                track_id,
+                face_id,
+                person_id,
+                social_state,
+                success,
+                abort_reason,
+                duration_sec,
+                hunger_state
+            FROM interaction_state_events
+            """
+        )
+
+    def _time_fields(
+        self,
+        *,
+        epoch: Optional[float] = None,
+        monotonic_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        now_epoch = time.time()
+        now_mono = time.monotonic()
+        mono = float(now_mono if monotonic_sec is None else monotonic_sec)
+        ts_epoch = float(now_epoch - (now_mono - mono) if epoch is None else epoch)
+        utc_dt = datetime.fromtimestamp(ts_epoch, timezone.utc)
+        local_dt = utc_dt.astimezone(self.TIMEZONE)
+        return {
+            "timestamp_utc": utc_dt.isoformat(),
+            "timestamp_local": local_dt.isoformat(),
+            "timezone": str(self.TIMEZONE),
+            "timestamp_epoch": ts_epoch,
+            "monotonic_sec": mono,
+            "run_elapsed_sec": mono - self._run_started_mono,
+            "day_rome": local_dt.date().isoformat(),
+        }
 
     def _db_log(self, table: str, data: Dict):
-        data["timestamp"] = datetime.now(self.TIMEZONE).isoformat()
-        self._queue_put_drop_oldest(
-            self._db_queue, (table, data), f"DB queue (table={table})"
-        )
+        for key, value in self._time_fields().items():
+            data.setdefault(key, value)
+        self._db_queue.put((table, data))
 
     def _queue_put_drop_oldest(self, q: queue.Queue, item: Any, label: str):
         try:
@@ -2444,6 +2787,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def _open_db_connection(self, timeout: float) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=timeout)
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
@@ -2467,9 +2811,20 @@ class SalienceNetworkModule(yarp.RFModule):
                 c = conn.cursor()
                 if table == "target_selection":
                     c.execute(
-                        "INSERT INTO target_selections (timestamp,track_id,face_id,person_id,bbox_area,ips,ss,eligible,context_label,reason,last_greeted_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        """INSERT INTO target_selections
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,track_id,face_id,
+                         person_id,bbox_area,ips,ss,eligible,context_label,reason,
+                         last_greeted_ts)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            data["timestamp"],
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
                             data["track_id"],
                             data["face_id"],
                             data["person_id"],
@@ -2482,18 +2837,78 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("last_greeted_ts"),
                         ),
                     )
+                elif table == "face_observation":
+                    c.execute(
+                        """INSERT INTO face_observations
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,track_id,face_id,
+                         person_id,bbox_x,bbox_y,bbox_w,bbox_h,bbox_area,distance,
+                         attention,gaze_x,gaze_y,gaze_z,pitch,yaw,roll,cos_angle,
+                         is_talking,time_in_view,social_state,is_known,eligible,ips,
+                         context_label,interaction_busy,active_attempt_id,
+                         active_interaction_track_id,active_interaction_person_id,
+                         is_attention_target,is_interaction_target)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
+                            data.get("track_id"),
+                            data.get("face_id"),
+                            data.get("person_id"),
+                            data.get("bbox_x"),
+                            data.get("bbox_y"),
+                            data.get("bbox_w"),
+                            data.get("bbox_h"),
+                            data.get("bbox_area"),
+                            data.get("distance"),
+                            data.get("attention"),
+                            data.get("gaze_x"),
+                            data.get("gaze_y"),
+                            data.get("gaze_z"),
+                            data.get("pitch"),
+                            data.get("yaw"),
+                            data.get("roll"),
+                            data.get("cos_angle"),
+                            int(data.get("is_talking", 0)),
+                            data.get("time_in_view"),
+                            data.get("social_state"),
+                            int(data.get("is_known", 0)),
+                            int(data.get("eligible", 0)),
+                            data.get("ips"),
+                            data.get("context_label"),
+                            int(data.get("interaction_busy", 0)),
+                            data.get("active_attempt_id"),
+                            data.get("active_interaction_track_id"),
+                            data.get("active_interaction_person_id"),
+                            int(data.get("is_attention_target", 0)),
+                            int(data.get("is_interaction_target", 0)),
+                        ),
+                    )
                 elif table == "face_ips_event":
                     c.execute(
                         """INSERT INTO face_ips_events
-                        (timestamp,track_id,face_id,person_id,social_state,is_known,eligible,
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,
+                         track_id,face_id,person_id,social_state,is_known,eligible,
                          is_active_target,bbox_area,ips,ips_before_habituation,
                          habituation_applied,habituation_multiplier,habituation_elapsed_sec,
                          habituation_ips_delta,stimulus_type,context_label,
                          prox_score,cent_score,vel_score,gaze_score,
                          weight_prox,weight_cent,weight_vel,weight_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            data["timestamp"],
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
                             data.get("track_id"),
                             data.get("face_id"),
                             data.get("person_id"),
@@ -2522,9 +2937,18 @@ class SalienceNetworkModule(yarp.RFModule):
                     )
                 elif table == "ss_change":
                     c.execute(
-                        "INSERT INTO ss_changes (timestamp,person_id,old_ss,new_ss) VALUES (?,?,?,?)",
+                        """INSERT INTO ss_changes
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,person_id,old_ss,new_ss)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            data["timestamp"],
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
                             data["person_id"],
                             data["old_ss"],
                             data["new_ss"],
@@ -2533,14 +2957,22 @@ class SalienceNetworkModule(yarp.RFModule):
                 elif table == "homeostatic_learning_change":
                     c.execute(
                         """INSERT INTO homeostatic_learning_changes
-                        (timestamp,person_id,reward_delta,outcome,reason,trigger_mode,
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,
+                         person_id,reward_delta,outcome,reason,trigger_mode,
                          hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
                          active_energy_cost,meals_eaten_count,n_turns,exec_interaction_id,
                          old_prox,old_cent,old_vel,old_gaze,
                          new_prox,new_cent,new_vel,new_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            data["timestamp"],
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
                             data["person_id"],
                             data["reward_delta"],
                             data.get("outcome"),
@@ -2567,12 +2999,20 @@ class SalienceNetworkModule(yarp.RFModule):
                 elif table == "interaction_attempt":
                     c.execute(
                         """INSERT INTO interaction_attempts
-                        (timestamp,attempt_id,track_id,face_id,person_id,start_ss,
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,
+                         attempt_id,track_id,face_id,person_id,start_ss,
                          success,final_state,abort_reason,exec_interaction_id,duration_sec,
                          hunger_state,is_proactive)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            data["timestamp"],
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
                             data.get("attempt_id"),
                             data.get("track_id"),
                             data.get("face_id"),
@@ -2585,6 +3025,35 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("duration_sec"),
                             data.get("hunger_state", "HS0"),
                             int(data.get("is_proactive", 1)),
+                        ),
+                    )
+                elif table == "interaction_state_event":
+                    c.execute(
+                        """INSERT INTO interaction_state_events
+                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                         monotonic_sec,run_elapsed_sec,day_rome,event_type,attempt_id,
+                         exec_interaction_id,track_id,face_id,person_id,social_state,
+                         success,abort_reason,duration_sec,hunger_state)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            data["timestamp_utc"],
+                            data["timestamp_local"],
+                            data["timezone"],
+                            data["timestamp_epoch"],
+                            data["monotonic_sec"],
+                            data["run_elapsed_sec"],
+                            data["day_rome"],
+                            data.get("event_type"),
+                            data.get("attempt_id"),
+                            data.get("exec_interaction_id"),
+                            data.get("track_id"),
+                            data.get("face_id"),
+                            data.get("person_id"),
+                            data.get("social_state"),
+                            int(data["success"]) if data.get("success") is not None else None,
+                            data.get("abort_reason"),
+                            data.get("duration_sec"),
+                            data.get("hunger_state"),
                         ),
                     )
                 conn.commit()

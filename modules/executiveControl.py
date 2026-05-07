@@ -42,7 +42,7 @@ import uuid
 
 sys.setswitchinterval(0.05)
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -257,6 +257,7 @@ class InteractionResult:
     homeostatic_reward:   float           = 0.0
     n_turns:              int             = 0
     trigger_mode:         str             = "proactive"   # "proactive" | "reactive"
+    turns:                List[Dict]      = field(default_factory=list)
     logs:                 List[Dict]      = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -382,6 +383,15 @@ class LatencyTrace:
                 parts.append(f"{key}={value:.3f}")
             else:
                 parts.append(f"{key}={value}")
+        module._record_latency_event(
+            label=label,
+            turn_index=turn_index,
+            event_type=event,
+            at_mono=at_mono,
+            started_mono=started_mono,
+            request_id=request_id,
+            fields=fields,
+        )
         module._log("INFO", "LATENCY " + " ".join(parts))
 
 
@@ -926,7 +936,6 @@ class ExecutiveControlModule(yarp.RFModule):
 
     VALID_STATES    = {"ss1", "ss2", "ss3", "ss4"}
     HUNGER_OFF_STATE = "HS0"
-    DB_QUEUE_MAX    = 512
     TIMEZONE        = ZoneInfo("Europe/Rome")
 
     # Prompts (loaded from prompts.json at configure time)
@@ -1024,6 +1033,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self.log_buffer:        List[Dict]           = []
         self._log_lock          = threading.Lock()
         self._interaction_logs: Dict[str, List[Dict]] = {}
+        self._interaction_latency_events: Dict[str, List[Dict]] = {}
         self._interaction_logs_lock = threading.Lock()
         self._thread_ctx        = threading.local()
         self._log_throttle_lock = threading.Lock()
@@ -1033,7 +1043,8 @@ class ExecutiveControlModule(yarp.RFModule):
         }
 
         # DB queue
-        self._db_queue: queue.Queue = queue.Queue(maxsize=self.DB_QUEUE_MAX)
+        self._run_started_mono: float = time.monotonic()
+        self._db_queue: queue.Queue = queue.Queue()
 
         # Stop events
         self._landmarks_stop = threading.Event()
@@ -1588,8 +1599,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 f"target='{face_id}' track={track_id} id={interaction_id[:8]} ━━━")
 
             result = self._execute_interaction(track_id, face_id, social_state, interaction_id)
-            d      = result.to_dict()
-            d["interaction_id"] = interaction_id
             resolved = result.resolved_face_id or face_id
 
             if result.abort_reason:
@@ -1601,21 +1610,42 @@ class ExecutiveControlModule(yarp.RFModule):
                     f"━━━ INTERACTION END   OK final={result.final_state} "
                     f"replied={result.replied_any} talked={result.talked} ━━━")
 
-            d["logs"] = self._pop_ilog(interaction_id)
-            self._db_enqueue(("interaction", asdict(self.InteractionAttempt(
-                interaction_id = interaction_id,
-                track_id       = track_id,
-                face_id        = resolved,
-                initial_state  = social_state,
-                result         = d,
-            ))))
+            self._enqueue_interaction_result(
+                interaction_id=interaction_id,
+                track_id=track_id,
+                face_id=resolved,
+                social_state=social_state,
+                result=result,
+            )
 
             compact = self._build_compact_result(interaction_id, track_id, face_id, social_state, result)
             return self._rpc_ok(reply, compact)
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
+            self._pop_latency_events(interaction_id)
             self._end_interaction("proactive")
+
+    def _enqueue_interaction_result(
+        self,
+        *,
+        interaction_id: str,
+        track_id: int,
+        face_id: str,
+        social_state: str,
+        result: InteractionResult,
+    ) -> None:
+        d = result.to_dict()
+        d["interaction_id"] = interaction_id
+        d["logs"] = self._pop_ilog(interaction_id)
+        d["latency_events"] = self._pop_latency_events(interaction_id)
+        self._db_enqueue(("interaction", asdict(self.InteractionAttempt(
+            interaction_id=interaction_id,
+            track_id=track_id,
+            face_id=face_id,
+            initial_state=social_state,
+            result=d,
+        ))))
 
     def _build_compact_result(
         self, iid: str, track_id: int, face_id: str, social_state: str, r: InteractionResult
@@ -1928,8 +1958,15 @@ class ExecutiveControlModule(yarp.RFModule):
             self._log("INFO", f"{tag} turn {next_turn}/{self.SS3_MAX_TURNS}: '{utterance}'")
 
             reply: Optional[str] = None
+            request_id: Optional[int] = None
+            response_source = "none"
+            fallback_reason: Optional[str] = None
+            interrupted = 0
+            superseded = 0
             if self._is_greeting(utterance):
                 reply = self._local_reply_fallback(utterance, is_last, face_id)
+                response_source = "local"
+                fallback_reason = "greeting_detected"
                 now = time.monotonic()
                 trace.mark_at(
                     "first_token_received",
@@ -1988,10 +2025,13 @@ class ExecutiveControlModule(yarp.RFModule):
                                 )
                             trace.mark_at("last_token_received", event.at_mono, text_chars=len(event.text))
                             reply = event.text.strip()
+                            response_source = "llm"
                             break
                         if event.kind == "error":
                             trace.mark_at("llm_error", event.at_mono, error=event.error or "unknown")
                             reply = self._local_reply_fallback(utterance, is_last, face_id)
+                            response_source = "local_fallback"
+                            fallback_reason = event.error or "llm_error"
                             fallback_mono = time.monotonic()
                             if not trace.has("first_token_received"):
                                 trace.mark_at(
@@ -2010,6 +2050,8 @@ class ExecutiveControlModule(yarp.RFModule):
                             break
                         if event.kind == "cancelled":
                             trace.mark_at("llm_cancelled", event.at_mono, reason="superseded")
+                            interrupted = 1
+                            superseded = 1
                             break
 
                     newer = self._stt_read_once()
@@ -2017,9 +2059,27 @@ class ExecutiveControlModule(yarp.RFModule):
                         superseding_utterance = newer
                         superseding_mono = time.monotonic()
                         trace.mark("interruption", reason="new_user_utterance_before_reply", utterance_chars=len(newer))
+                        interrupted = 1
+                        superseded = 1
                         break
 
                 if superseding_utterance:
+                    if result is not None:
+                        result.turns.append(self._build_turn_record(
+                            interaction_id=interaction_id,
+                            turn_index=next_turn,
+                            tag=tag,
+                            result=result,
+                            user_utterance=utterance,
+                            assistant_utterance=None,
+                            request_id=request_id,
+                            response_source=response_source,
+                            fallback_reason=fallback_reason,
+                            interrupted=interrupted,
+                            superseded=superseded,
+                            trace=trace,
+                            dispatch=None,
+                        ))
                     utterance = superseding_utterance
                     utterance_mono = superseding_mono or time.monotonic()
                     continue
@@ -2053,6 +2113,22 @@ class ExecutiveControlModule(yarp.RFModule):
                 result,
                 "ss3_conversation_turn",
             )
+            if result is not None:
+                result.turns.append(self._build_turn_record(
+                    interaction_id=interaction_id,
+                    turn_index=next_turn,
+                    tag=tag,
+                    result=result,
+                    user_utterance=utterance,
+                    assistant_utterance=reply,
+                    request_id=request_id,
+                    response_source=response_source,
+                    fallback_reason=fallback_reason,
+                    interrupted=interrupted,
+                    superseded=superseded,
+                    trace=trace,
+                    dispatch=dispatch,
+                ))
             history.append(("user", utterance))
             history.append(("assistant", reply))
 
@@ -2068,6 +2144,63 @@ class ExecutiveControlModule(yarp.RFModule):
                 break
 
         return turns
+
+    def _build_turn_record(
+        self,
+        *,
+        interaction_id: Optional[str],
+        turn_index: int,
+        tag: str,
+        result: InteractionResult,
+        user_utterance: str,
+        assistant_utterance: Optional[str],
+        request_id: Optional[int],
+        response_source: str,
+        fallback_reason: Optional[str],
+        interrupted: int,
+        superseded: int,
+        trace: LatencyTrace,
+        dispatch: Optional[SpeechDispatch],
+    ) -> Dict[str, Any]:
+        first_token = trace.get("first_token_received")
+        last_token = trace.get("last_token_received")
+        stt_final = trace.get("stt_final_received")
+        tts_dispatch = dispatch.dispatch_mono if dispatch is not None else None
+        return {
+            "interaction_id": interaction_id,
+            "turn_index": int(turn_index),
+            "label": tag,
+            "social_state": result.initial_state,
+            "trigger_mode": result.trigger_mode,
+            "hunger_state": self._current_hs(),
+            "user_utterance": user_utterance,
+            "assistant_utterance": assistant_utterance,
+            "user_chars": len(user_utterance or ""),
+            "assistant_chars": len(assistant_utterance or "") if assistant_utterance is not None else None,
+            "llm_request_id": request_id,
+            "response_source": response_source,
+            "fallback_reason": fallback_reason,
+            "interrupted": int(interrupted),
+            "superseded": int(superseded),
+            "turn_started_mono": trace.started_mono,
+            "stt_final_mono": stt_final,
+            "llm_first_token_mono": first_token,
+            "llm_last_token_mono": last_token,
+            "tts_dispatch_mono": tts_dispatch,
+            "tts_estimated_done_mono": dispatch.estimated_done_mono if dispatch is not None else None,
+            "tts_estimated_sec": dispatch.estimated_wait_sec if dispatch is not None else None,
+            "time_to_first_response_sec": (
+                first_token - trace.started_mono if first_token is not None else None
+            ),
+            "response_total_sec": (
+                last_token - trace.started_mono if last_token is not None else None
+            ),
+            "stt_to_tts_dispatch_sec": (
+                tts_dispatch - stt_final
+                if tts_dispatch is not None and stt_final is not None
+                else None
+            ),
+        }
 
     # ── Orexigenic drive / QR feeding tree ───────────────────────────────────
 
@@ -2366,9 +2499,17 @@ class ExecutiveControlModule(yarp.RFModule):
                 )
                 self._selector_reset_cooldown(name, track_id)
                 self._selector_set_track(-1)
+                self._enqueue_interaction_result(
+                    interaction_id=interaction_id,
+                    track_id=track_id,
+                    face_id=name,
+                    social_state="ss3",
+                    result=dummy,
+                )
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
+            self._pop_latency_events(interaction_id)
             self._end_interaction("reactive")
 
     def _run_reactive_unknown_intro(self, track_id: int, face_id: str) -> None:
@@ -2452,9 +2593,17 @@ class ExecutiveControlModule(yarp.RFModule):
                 )
                 self._selector_reset_cooldown(face_id, track_id)
                 self._selector_set_track(-1)
+                self._enqueue_interaction_result(
+                    interaction_id=interaction_id,
+                    track_id=track_id,
+                    face_id=dummy.resolved_face_id or face_id,
+                    social_state="ss1",
+                    result=dummy,
+                )
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
+            self._pop_latency_events(interaction_id)
             self._end_interaction("reactive")
 
     # ── shared interaction helpers ─────────────────────────────────────────────
@@ -3264,53 +3413,6 @@ class ExecutiveControlModule(yarp.RFModule):
             history=history,
         )
 
-    def _llm_text_with_fallback(
-        self,
-        *,
-        prompt: str,
-        system: str,
-        max_tokens: int,
-        timeout: float,
-        max_len: int,
-        log_tag: str,
-        retry_on_empty: bool = True,
-    ) -> Optional[str]:
-        if self._abort_requested():
-            return None
-        res = self._llm_call(
-            prompt,
-            system=system,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            deployment=self._llm_deployment,
-        )
-
-        clean = res.text.strip("\"'").strip() if res.ok else ""
-        if clean and len(clean) < max_len:
-            return clean
-
-        if res.empty and retry_on_empty:
-            retry_tokens = min(max_tokens * 2, 512)
-            if retry_tokens > max_tokens and not self._abort_requested():
-                self._log("WARNING", f"{log_tag}: empty response, retrying with {retry_tokens} tokens")
-                res_retry = self._llm_call(
-                    prompt,
-                    system=system,
-                    max_tokens=retry_tokens,
-                    timeout=timeout,
-                    deployment=self._llm_deployment,
-                )
-                clean_retry = res_retry.text.strip("\"'").strip() if res_retry.ok else ""
-                if clean_retry and len(clean_retry) < max_len:
-                    return clean_retry
-                if not res_retry.ok:
-                    self._log("WARNING", f"{log_tag}: retry failed: {res_retry.error}")
-            return None
-
-        if not res.ok:
-            self._log("WARNING", f"{log_tag}: failed: {res.error}")
-        return None
-
     @staticmethod
     def _strip_json(text: str) -> str:
         text = text.strip()
@@ -3501,48 +3603,131 @@ class ExecutiveControlModule(yarp.RFModule):
         try:
             os.makedirs(os.path.dirname(self.DB_FILE), exist_ok=True)
             conn = sqlite3.connect(self.DB_FILE)
+            conn.execute("PRAGMA foreign_keys=ON")
             c    = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS schema_info (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                interaction_id TEXT,
-                timestamp TEXT, track_id INTEGER, face_id TEXT,
-                initial_state TEXT, final_state TEXT,
-                success INTEGER, abort_reason TEXT,
+                interaction_id TEXT NOT NULL UNIQUE,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                track_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                initial_state TEXT NOT NULL CHECK (initial_state IN ('ss1','ss2','ss3','ss4')),
+                final_state TEXT NOT NULL CHECK (final_state IN ('ss1','ss2','ss3','ss4')),
+                success INTEGER NOT NULL CHECK (success IN (0,1)),
+                abort_reason TEXT,
                 greeted INTEGER, talked INTEGER, replied_any INTEGER,
                 extracted_name TEXT, target_stayed_biggest INTEGER,
                 interaction_tag TEXT,
-                hunger_state_start TEXT, hunger_state_end TEXT,
-                hunger_drive_enabled INTEGER,
+                hunger_state_start TEXT CHECK (hunger_state_start IS NULL OR hunger_state_start IN ('HS0','HS1','HS2','HS3')),
+                hunger_state_end TEXT CHECK (hunger_state_end IS NULL OR hunger_state_end IN ('HS0','HS1','HS2','HS3')),
+                hunger_drive_enabled INTEGER NOT NULL CHECK (hunger_drive_enabled IN (0,1)),
                 stomach_level_start REAL, stomach_level_end REAL,
                 meals_eaten_count INTEGER, last_meal_payload TEXT,
                 active_energy_cost REAL NOT NULL DEFAULT 0.0,
                 homeostatic_reward REAL NOT NULL DEFAULT 0.0,
                 n_turns INTEGER NOT NULL DEFAULT 0,
-                trigger_mode TEXT NOT NULL DEFAULT 'proactive',
-                day_rome TEXT,
+                trigger_mode TEXT NOT NULL CHECK (trigger_mode IN ('proactive','reactive')),
                 transcript TEXT, full_result TEXT
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS interaction_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_id TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                label TEXT,
+                social_state TEXT NOT NULL CHECK (social_state IN ('ss1','ss2','ss3','ss4')),
+                trigger_mode TEXT NOT NULL CHECK (trigger_mode IN ('proactive','reactive')),
+                hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3')),
+                user_utterance TEXT NOT NULL,
+                assistant_utterance TEXT,
+                user_chars INTEGER NOT NULL,
+                assistant_chars INTEGER,
+                llm_request_id INTEGER,
+                response_source TEXT NOT NULL CHECK (response_source IN ('llm','local','local_fallback','none')),
+                fallback_reason TEXT,
+                interrupted INTEGER NOT NULL CHECK (interrupted IN (0,1)),
+                superseded INTEGER NOT NULL CHECK (superseded IN (0,1)),
+                turn_started_mono REAL,
+                stt_final_mono REAL,
+                llm_first_token_mono REAL,
+                llm_last_token_mono REAL,
+                tts_dispatch_mono REAL,
+                tts_estimated_done_mono REAL,
+                tts_estimated_sec REAL,
+                time_to_first_response_sec REAL,
+                response_total_sec REAL,
+                stt_to_tts_dispatch_sec REAL,
+                FOREIGN KEY(interaction_id) REFERENCES interactions(interaction_id) ON DELETE CASCADE
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS latency_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_id TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                label TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                request_id INTEGER,
+                at_mono REAL NOT NULL,
+                started_mono REAL NOT NULL,
+                elapsed_sec REAL NOT NULL,
+                fields_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(interaction_id) REFERENCES interactions(interaction_id) ON DELETE CASCADE
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS reactive_interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 interaction_id TEXT,
-                timestamp TEXT NOT NULL,
-                type TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('greeting','unknown_intro','qr_feed')),
                 track_id INTEGER, name TEXT, payload TEXT,
-                hunger_state_before TEXT,
+                hunger_state_before TEXT CHECK (hunger_state_before IS NULL OR hunger_state_before IN ('HS0','HS1','HS2','HS3')),
                 stomach_level_before REAL,
-                hunger_state_after   TEXT,
+                hunger_state_after   TEXT CHECK (hunger_state_after IS NULL OR hunger_state_after IN ('HS0','HS1','HS2','HS3')),
                 stomach_level_after  REAL
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS hunger_level_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 stimulus_type TEXT,
                 stimulus_label TEXT,
                 reason TEXT,
-                hunger_drive_enabled INTEGER,
-                hunger_state_before TEXT,
-                hunger_state_after TEXT,
+                hunger_drive_enabled INTEGER NOT NULL CHECK (hunger_drive_enabled IN (0,1)),
+                hunger_state_before TEXT CHECK (hunger_state_before IS NULL OR hunger_state_before IN ('HS0','HS1','HS2','HS3')),
+                hunger_state_after TEXT CHECK (hunger_state_after IS NULL OR hunger_state_after IN ('HS0','HS1','HS2','HS3')),
                 stomach_level_before REAL,
                 stomach_level_after REAL,
                 level_delta REAL,
@@ -3554,17 +3739,25 @@ class ExecutiveControlModule(yarp.RFModule):
                 interaction_tag TEXT,
                 exec_interaction_id TEXT
             )""")
+            c.execute(
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','2') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
             for idx_sql in [
-                "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
                 "CREATE INDEX IF NOT EXISTS idx_i_iid     ON interactions(interaction_id)",
                 "CREATE INDEX IF NOT EXISTS idx_i_state   ON interactions(initial_state, final_state, success)",
                 "CREATE INDEX IF NOT EXISTS idx_i_hs      ON interactions(hunger_state_start)",
                 "CREATE INDEX IF NOT EXISTS idx_i_day_rome ON interactions(day_rome)",
                 "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
-                "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_turn_iid  ON interaction_turns(interaction_id)",
+                "CREATE INDEX IF NOT EXISTS idx_turn_time ON interaction_turns(timestamp_utc)",
+                "CREATE INDEX IF NOT EXISTS idx_lat_iid   ON latency_events(interaction_id)",
+                "CREATE INDEX IF NOT EXISTS idx_lat_event ON latency_events(event_type)",
+                "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
-                "CREATE INDEX IF NOT EXISTS idx_hle_time  ON hunger_level_events(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_time  ON hunger_level_events(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_event ON hunger_level_events(event_type, stimulus_type)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_iid   ON hunger_level_events(exec_interaction_id)",
             ]:
@@ -3579,9 +3772,15 @@ class ExecutiveControlModule(yarp.RFModule):
     def _create_analytics_views(self, conn: sqlite3.Connection) -> None:
         c = conn.cursor()
         views = {
-            "v_proactive_interactions": """
-                SELECT interaction_id, timestamp,
-                       COALESCE(day_rome, substr(timestamp,1,10)) AS day_rome,
+            "v_interactions": """
+                SELECT interaction_id,
+                       timestamp_utc,
+                       timestamp_local,
+                       timezone,
+                       timestamp_epoch,
+                       monotonic_sec,
+                       run_elapsed_sec,
+                       day_rome,
                        track_id, face_id,
                        COALESCE(NULLIF(extracted_name,''),face_id) AS user_key,
                        initial_state, final_state,
@@ -3589,7 +3788,15 @@ class ExecutiveControlModule(yarp.RFModule):
                        CAST(greeted AS INTEGER) AS greeted,
                        CAST(talked AS INTEGER) AS talked,
                        CAST(COALESCE(replied_any,0) AS INTEGER) AS replied_any,
-                       abort_reason, interaction_tag,
+                       abort_reason,
+                       CASE
+                           WHEN abort_reason IS NULL THEN NULL
+                           WHEN abort_reason IN ('no_response_greeting','no_response_conversation','no_response_name') THEN 'no_response'
+                           WHEN abort_reason IN ('target_lost','face_disappeared','target_monitor_abort') THEN 'target_lost'
+                           WHEN abort_reason LIKE 'exception:%' THEN 'error'
+                           ELSE 'system_abort'
+                       END AS abort_category,
+                       interaction_tag,
                        hunger_state_start, hunger_state_end,
                        CAST(COALESCE(hunger_drive_enabled, CASE WHEN hunger_state_start='HS0' THEN 0 ELSE 1 END) AS INTEGER) AS hunger_drive_enabled,
                        stomach_level_start, stomach_level_end,
@@ -3604,14 +3811,18 @@ class ExecutiveControlModule(yarp.RFModule):
                        COUNT(*) AS launched,
                        SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END) AS reached_ss4,
                        1.0*SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
-                FROM v_proactive_interactions WHERE initial_state='ss3'
+                FROM v_interactions WHERE initial_state='ss3'
                 GROUP BY day_rome, hunger_state_start""",
             "v_metric_response_rate_daily": """
                 SELECT day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END) AS replied,
-                       1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
-                FROM v_proactive_interactions GROUP BY day_rome, hunger_state_start""",
+                       1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate,
+                       SUM(CASE WHEN abort_category='no_response'  THEN 1 ELSE 0 END) AS ignored,
+                       SUM(CASE WHEN abort_category='target_lost'  THEN 1 ELSE 0 END) AS target_lost,
+                       SUM(CASE WHEN abort_category='system_abort' THEN 1 ELSE 0 END) AS system_abort,
+                       SUM(CASE WHEN abort_category='error'        THEN 1 ELSE 0 END) AS errors
+                FROM v_interactions GROUP BY day_rome, hunger_state_start""",
             "v_metric_repeat_users_daily": """
                 SELECT
                     day_rome,
@@ -3637,7 +3848,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 GROUP BY day_rome, hunger_state_start""",
             "v_metric_depth_progression": """
                 SELECT
-                    COALESCE(day_rome, substr(timestamp,1,10))                               AS day_rome,
+                    day_rome                                                                 AS day_rome,
                     initial_state,
                     hunger_state_start,
                     COUNT(*)                                                                  AS launched,
@@ -3652,7 +3863,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 WHERE initial_state IN ('ss1', 'ss2', 'ss3')
                 GROUP BY day_rome, initial_state, hunger_state_start""",
             "v_hunger_level_timeline": """
-                SELECT timestamp,
+                SELECT timestamp_utc,
+                       timestamp_local,
+                       timezone,
+                       timestamp_epoch,
+                       monotonic_sec,
+                       run_elapsed_sec,
+                       day_rome,
                        event_type,
                        stimulus_type,
                        stimulus_label,
@@ -3669,25 +3886,65 @@ class ExecutiveControlModule(yarp.RFModule):
                        trigger_mode,
                        social_state,
                        interaction_tag,
-                       exec_interaction_id
-                FROM hunger_level_events""",
+	                       exec_interaction_id
+	                FROM hunger_level_events""",
+            "v_interaction_turns": """
+                SELECT interaction_id,
+                       timestamp_utc,
+                       timestamp_local,
+                       timezone,
+                       timestamp_epoch,
+                       monotonic_sec,
+                       run_elapsed_sec,
+                       day_rome,
+                       turn_index,
+                       label,
+                       social_state,
+                       trigger_mode,
+                       hunger_state,
+                       user_utterance,
+                       assistant_utterance,
+                       user_chars,
+                       assistant_chars,
+                       llm_request_id,
+                       response_source,
+                       fallback_reason,
+                       interrupted,
+                       superseded,
+                       time_to_first_response_sec,
+                       response_total_sec,
+                       stt_to_tts_dispatch_sec,
+                       tts_estimated_sec
+                FROM interaction_turns""",
+            "v_latency_events": """
+                SELECT interaction_id,
+                       timestamp_utc,
+                       timestamp_local,
+                       timezone,
+                       timestamp_epoch,
+                       monotonic_sec,
+                       run_elapsed_sec,
+                       day_rome,
+                       label,
+                       turn_index,
+                       event_type,
+                       request_id,
+                       at_mono,
+                       started_mono,
+                       elapsed_sec,
+                       fields_json
+                FROM latency_events""",
         }
+        c.execute("DROP VIEW IF EXISTS v_proactive_interactions")  # legacy name — renamed to v_interactions
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
             c.execute(f"CREATE VIEW {name} AS {body}")
 
     def _db_enqueue(self, item: Any) -> None:
-        try:
-            self._db_queue.put_nowait(item)
-        except queue.Full:
-            try:
-                self._db_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._db_queue.put_nowait(item)
-            except queue.Full:
-                self._log("WARNING", "DB queue full, dropping item")
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+            for key, value in self._time_fields().items():
+                item[1].setdefault(key, value)
+        self._db_queue.put(item)
 
     def _db_worker(self) -> None:
         conn: Optional[sqlite3.Connection] = None
@@ -3704,6 +3961,7 @@ class ExecutiveControlModule(yarp.RFModule):
             try:
                 if conn is None:
                     conn = sqlite3.connect(self.DB_FILE, timeout=10.0)
+                    conn.execute("PRAGMA foreign_keys=ON")
                     conn.execute("PRAGMA journal_mode=WAL")
                     conn.execute("PRAGMA synchronous=NORMAL")
                     conn.execute("PRAGMA temp_store=MEMORY")
@@ -3731,25 +3989,38 @@ class ExecutiveControlModule(yarp.RFModule):
         try:
             r    = data["result"]
             logs = r.get("logs", [])
+            turns = r.get("turns", []) if isinstance(r.get("turns", []), list) else []
+            latency_events = r.get("latency_events", []) if isinstance(r.get("latency_events", []), list) else []
             transcript = json.dumps(
                 [l["message"] for l in logs
                  if any(kw in l.get("message", "") for kw in ("User:", "Robot:", "Asking", "Response"))],
                 ensure_ascii=False,
             )
-            r_compact = {k: v for k, v in r.items() if k != "logs"}
-            day_rome  = datetime.now(self.TIMEZONE).date().isoformat()
+            r_compact = {k: v for k, v in r.items() if k not in {"logs", "turns", "latency_events"}}
+            ts = {**self._time_fields(), **{k: data[k] for k in (
+                "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
+                "monotonic_sec", "run_elapsed_sec", "day_rome"
+            ) if k in data}}
             conn.cursor().execute(
                 """INSERT INTO interactions
-                (interaction_id,timestamp,track_id,face_id,initial_state,final_state,
+                (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                 monotonic_sec,run_elapsed_sec,day_rome,
+                 track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
                  hunger_drive_enabled,stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
-                 active_energy_cost,homeostatic_reward,n_turns,trigger_mode,day_rome,
+                 active_energy_cost,homeostatic_reward,n_turns,trigger_mode,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
-                    datetime.now(self.TIMEZONE).isoformat(),
+                    ts["timestamp_utc"],
+                    ts["timestamp_local"],
+                    ts["timezone"],
+                    ts["timestamp_epoch"],
+                    ts["monotonic_sec"],
+                    ts["run_elapsed_sec"],
+                    ts["day_rome"],
                     data["track_id"], data["face_id"], data["initial_state"],
                     r.get("final_state",""),
                     int(r.get("success", False)),      r.get("abort_reason"),
@@ -3765,25 +4036,125 @@ class ExecutiveControlModule(yarp.RFModule):
                     r.get("homeostatic_reward", 0.0),
                     r.get("n_turns", 0),
                     r.get("trigger_mode", "proactive"),
-                    day_rome,
                     transcript,
                     json.dumps(r_compact, ensure_ascii=False),
                 ),
             )
+            for turn in turns:
+                self._db_save_interaction_turn(conn, data.get("interaction_id"), turn)
+            for event in latency_events:
+                self._db_save_latency_event(conn, data.get("interaction_id"), event)
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_interaction failed: {e}")
 
+    def _db_save_interaction_turn(
+        self,
+        conn: sqlite3.Connection,
+        interaction_id: Optional[str],
+        turn: Dict[str, Any],
+    ) -> None:
+        ts = self._time_fields(monotonic_sec=turn.get("turn_started_mono"))
+        conn.cursor().execute(
+            """INSERT INTO interaction_turns
+            (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+             monotonic_sec,run_elapsed_sec,day_rome,turn_index,label,social_state,
+             trigger_mode,hunger_state,user_utterance,assistant_utterance,user_chars,
+             assistant_chars,llm_request_id,response_source,fallback_reason,interrupted,
+             superseded,turn_started_mono,stt_final_mono,llm_first_token_mono,
+             llm_last_token_mono,tts_dispatch_mono,tts_estimated_done_mono,
+             tts_estimated_sec,time_to_first_response_sec,response_total_sec,
+             stt_to_tts_dispatch_sec)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                interaction_id or turn.get("interaction_id"),
+                ts["timestamp_utc"],
+                ts["timestamp_local"],
+                ts["timezone"],
+                ts["timestamp_epoch"],
+                ts["monotonic_sec"],
+                ts["run_elapsed_sec"],
+                ts["day_rome"],
+                int(turn.get("turn_index", 0)),
+                turn.get("label"),
+                turn.get("social_state") or "ss3",
+                turn.get("trigger_mode") or "proactive",
+                turn.get("hunger_state"),
+                turn.get("user_utterance") or "",
+                turn.get("assistant_utterance"),
+                int(turn.get("user_chars", len(turn.get("user_utterance") or ""))),
+                turn.get("assistant_chars"),
+                turn.get("llm_request_id"),
+                turn.get("response_source") or "none",
+                turn.get("fallback_reason"),
+                int(turn.get("interrupted", 0)),
+                int(turn.get("superseded", 0)),
+                turn.get("turn_started_mono"),
+                turn.get("stt_final_mono"),
+                turn.get("llm_first_token_mono"),
+                turn.get("llm_last_token_mono"),
+                turn.get("tts_dispatch_mono"),
+                turn.get("tts_estimated_done_mono"),
+                turn.get("tts_estimated_sec"),
+                turn.get("time_to_first_response_sec"),
+                turn.get("response_total_sec"),
+                turn.get("stt_to_tts_dispatch_sec"),
+            ),
+        )
+
+    def _db_save_latency_event(
+        self,
+        conn: sqlite3.Connection,
+        interaction_id: Optional[str],
+        event: Dict[str, Any],
+    ) -> None:
+        conn.cursor().execute(
+            """INSERT INTO latency_events
+            (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+             monotonic_sec,run_elapsed_sec,day_rome,label,turn_index,event_type,
+             request_id,at_mono,started_mono,elapsed_sec,fields_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                interaction_id or event.get("interaction_id"),
+                event.get("timestamp_utc"),
+                event.get("timestamp_local"),
+                event.get("timezone"),
+                event.get("timestamp_epoch"),
+                event.get("monotonic_sec"),
+                event.get("run_elapsed_sec"),
+                event.get("day_rome"),
+                event.get("label"),
+                int(event.get("turn_index", 0)),
+                event.get("event_type"),
+                event.get("request_id"),
+                event.get("at_mono"),
+                event.get("started_mono"),
+                event.get("elapsed_sec"),
+                event.get("fields_json") or "{}",
+            ),
+        )
+
     def _db_save_reactive(self, conn: sqlite3.Connection, data: Dict) -> None:
         try:
+            ts = {**self._time_fields(), **{k: data[k] for k in (
+                "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
+                "monotonic_sec", "run_elapsed_sec", "day_rome"
+            ) if k in data}}
             conn.cursor().execute(
                 """INSERT INTO reactive_interactions
-                (interaction_id,timestamp,type,track_id,name,payload,
+                (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                 monotonic_sec,run_elapsed_sec,day_rome,type,track_id,name,payload,
                  hunger_state_before,stomach_level_before,hunger_state_after,stomach_level_after)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
-                    datetime.now().astimezone().isoformat(),
+                    ts["timestamp_utc"],
+                    ts["timestamp_local"],
+                    ts["timezone"],
+                    ts["timestamp_epoch"],
+                    ts["monotonic_sec"],
+                    ts["run_elapsed_sec"],
+                    ts["day_rome"],
                     data.get("type"),
                     data.get("track_id"),
                     data.get("name"),
@@ -3800,16 +4171,28 @@ class ExecutiveControlModule(yarp.RFModule):
 
     def _db_save_hunger_level_event(self, conn: sqlite3.Connection, data: Dict) -> None:
         try:
+            ts = {**self._time_fields(), **{k: data[k] for k in (
+                "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
+                "monotonic_sec", "run_elapsed_sec", "day_rome"
+            ) if k in data}}
             conn.cursor().execute(
                 """INSERT INTO hunger_level_events
-                (timestamp,event_type,stimulus_type,stimulus_label,reason,
+                (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
+                 monotonic_sec,run_elapsed_sec,day_rome,
+                 event_type,stimulus_type,stimulus_label,reason,
                  hunger_drive_enabled,hunger_state_before,hunger_state_after,
                  stomach_level_before,stomach_level_after,level_delta,
                  active_energy_cost,meal_delta,meal_payload,trigger_mode,
                  social_state,interaction_tag,exec_interaction_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    datetime.now(self.TIMEZONE).isoformat(),
+                    ts["timestamp_utc"],
+                    ts["timestamp_local"],
+                    ts["timezone"],
+                    ts["timestamp_epoch"],
+                    ts["monotonic_sec"],
+                    ts["run_elapsed_sec"],
+                    ts["day_rome"],
                     data.get("event_type"),
                     data.get("stimulus_type"),
                     data.get("stimulus_label"),
@@ -3838,10 +4221,68 @@ class ExecutiveControlModule(yarp.RFModule):
     def _init_ilog(self, iid: str) -> None:
         with self._interaction_logs_lock:
             self._interaction_logs[iid] = []
+            self._interaction_latency_events[iid] = []
 
     def _pop_ilog(self, iid: str) -> List[Dict]:
         with self._interaction_logs_lock:
             return self._interaction_logs.pop(iid, [])
+
+    def _pop_latency_events(self, iid: str) -> List[Dict]:
+        with self._interaction_logs_lock:
+            return self._interaction_latency_events.pop(iid, [])
+
+    def _time_fields(
+        self,
+        *,
+        epoch: Optional[float] = None,
+        monotonic_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        now_epoch = time.time()
+        now_mono = time.monotonic()
+        mono = float(now_mono if monotonic_sec is None else monotonic_sec)
+        ts_epoch = float(now_epoch - (now_mono - mono) if epoch is None else epoch)
+        utc_dt = datetime.fromtimestamp(ts_epoch, timezone.utc)
+        local_dt = utc_dt.astimezone(self.TIMEZONE)
+        return {
+            "timestamp_utc": utc_dt.isoformat(),
+            "timestamp_local": local_dt.isoformat(),
+            "timezone": str(self.TIMEZONE),
+            "timestamp_epoch": ts_epoch,
+            "monotonic_sec": mono,
+            "run_elapsed_sec": mono - self._run_started_mono,
+            "day_rome": local_dt.date().isoformat(),
+        }
+
+    def _record_latency_event(
+        self,
+        *,
+        label: str,
+        turn_index: int,
+        event_type: str,
+        at_mono: float,
+        started_mono: float,
+        request_id: Optional[int],
+        fields: Dict[str, Any],
+    ) -> None:
+        iid = self._get_iid()
+        if not iid:
+            return
+        event = self._time_fields(monotonic_sec=at_mono)
+        event.update({
+            "interaction_id": iid,
+            "label": label,
+            "turn_index": int(turn_index),
+            "event_type": event_type,
+            "request_id": request_id,
+            "at_mono": float(at_mono),
+            "started_mono": float(started_mono),
+            "elapsed_sec": float(at_mono - started_mono),
+            "fields_json": json.dumps(fields, ensure_ascii=False, default=str),
+        })
+        with self._interaction_logs_lock:
+            buf = self._interaction_latency_events.get(iid)
+            if buf is not None:
+                buf.append(event)
 
     def _set_iid(self, iid: Optional[str]) -> None:
         self._thread_ctx.interaction_id = iid
