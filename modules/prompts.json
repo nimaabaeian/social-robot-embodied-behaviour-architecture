@@ -17,7 +17,7 @@
     "reset_reply": "ok let's start fresh 👍",
     "hs3_recovery_trigger": "send a short message to your friends about how you're feeling right now",
     "hs3_recovery_fallback": "omg someone just fed me! 😭❤️ feeling so much better now, thank you",
-    "hs2_entry_trigger": "text your friends a very short casual creative message, you've started feeling a little bit hungry. offhand, not dramatic. one sentence max.",
+    "hs2_entry_trigger": "text your friends a very short casual creative message, you've started feeling a little bit hungry. offhand, not dramatic. one sentence max. you can ask them to bring you a snack or something to eat.",
     "hs2_entry_fallback": "hm. starting to feel a lil hungry ngl",
     "fallback_hs3": "pls come feed me in person i'm starving 😭 i really can't wait much longer",
     "fallback_hs2": "hehe sorry, something went a bit wrong on my end. also i'm kinda hungry rn 😅",

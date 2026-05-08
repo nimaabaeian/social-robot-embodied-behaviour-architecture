@@ -921,7 +921,10 @@ class ChatBotModule(yarp.RFModule):
         if not candidates:
             return
 
-        text = self._llm_hs3_proactive() or self._prompts.get("hs3_proactive_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
+        llm_text = self._llm_hs3_proactive()
+        if not llm_text:
+            self._log("WARN", "hs3_proactive: LLM returned empty — using fallback text")
+        text = llm_text or self._prompts.get("hs3_proactive_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
 
         sent_any = False
         for chat_id in candidates:
@@ -978,6 +981,8 @@ class ChatBotModule(yarp.RFModule):
             )},
         ]
         text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
+        if not text:
+            self._log("WARN", "hs2_entry: LLM returned empty — using fallback text")
         text = text or self._prompts.get("hs2_entry_fallback", "hm. starting to feel a lil hungry ngl")
         sent_any = False
         for chat_id in candidates:
@@ -1021,6 +1026,8 @@ class ChatBotModule(yarp.RFModule):
             )},
         ]
         text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
+        if not text:
+            self._log("WARN", "hs3_recovery: LLM returned empty — using fallback text")
         text = text or self._prompts.get(
             "hs3_recovery_fallback",
             "omg they just fed me!! 😭❤️ feeling SO much better now, thank you",
