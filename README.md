@@ -132,7 +132,7 @@ flowchart LR
 ### alwayson_executiveControl
 
 - **Social state machine**: ss1 (unknown → greet + extract name → ss3), ss2 (known, not greeted → say hello → ss3), ss3 (known, greeted → LLM conversation up to 3 turns → ss4), ss4 (no-op).
-- **Orexigenic drive model** (`HungerModel`): stomach level drains continuously over 5 hours. Thresholds: ≥60% = HS1 (full), 25–60% = HS2 (hungry), <25% = HS3 (starving). Level and timestamps persist atomically to `memory/hunger_state.json`.
+- **Orexigenic drive model** (`HungerModel`): stomach level drains continuously over 4 hours. Thresholds: ≥60% = HS1 (full), 25–60% = HS2 (hungry), <25% = HS3 (starving). Level and timestamps persist atomically to `memory/hunger_state.json`.
 - **Active energy costs**: each meaningful robot action (greeting, name question, conversation turn, feed acknowledgment) exerts a metabolic cost that accelerates stomach drain.
 - **QR-based feeding**: reads QR codes from vision (`/alwayson/executiveControl/qr:i`). Recognized payloads: `SMALL_MEAL` (+10%), `MEDIUM_MEAL` (+25%), `LARGE_MEAL` (+45%). Speaks a context-aware acknowledgment and logs a `qr_feed` reactive event.
 - **Reactive greeting path**: independently listens to STT for greeting utterances (hello, hi, ciao, etc.). When idle, responds reactively without requiring the proactive interaction flow to be triggered. At HS3, the reactive response skips the normal greeting and immediately delivers a combined greeting + hunger request ("Hello, I'm so hungry, would you feed me please?").
@@ -230,55 +230,6 @@ make install
 - **LLM config**: Copy `modules/llm.env.template` to `modules/llm.env` and fill in your Azure OpenAI credentials (used by ExecutiveControl and ChatBot).
 - **Face models**: Vision auto-downloads the YOLO face model on first run; ensure network access or place the model file locally. The MediaPipe `face_landmarker.task` model is bundled in the repository and installed automatically into the `alwaysOn` YARP context during `make install`.
 - **Python deps**: `requirements.txt` is installed during the build; use a virtualenv if running modules manually.
-
-## Data Collection
-
-Runtime SQLite databases are stored under `modules/data_collection/`.
-
-| Database | Contents |
-|---|---|
-| `executive_control.db` | Interaction outcomes, normalized interaction turns, latency events, reactive events (greetings, QR feeds), and continuous `hunger_level_events` timeline |
-| `salience_network.db` | Raw face observations, target selections, face IPS events with habituation data, interaction start/end events, social state changes, homeostatic learning deltas, and interaction attempts |
-| `chat_bot.db` | Complete Telegram message history, chat events, per-user memory snapshots, subscriber registry, and Orexigenic state at each message |
-
-**Analysis views**
-
-*executive_control.db*
-
-| View | Description |
-|---|---|
-| `v_interactions` | All interactions (proactive and reactive) with `trigger_mode`, `abort_category`, and computed fields. Base view for all metrics. |
-| `v_metric_ss3_daily` | Daily SS3→SS4 completion rate, grouped by day and hunger state |
-| `v_metric_response_rate_daily` | Daily proactive response rate broken down by outcome: `replied`, `ignored` (no_response), `target_lost`, `system_abort`, `errors` |
-| `v_metric_repeat_users_daily` | Daily repeat-visitor rate per recognised user |
-| `v_metric_depth_progression` | Interaction depth by initial social state: launched, reached SS4, avg turns, deep interactions (≥3 turns) |
-| `v_hunger_level_timeline` | Full Orexigenic drive timeline with per-event stomach deltas and state transitions |
-| `v_interaction_turns` | Normalized user/robot turns with STT, LLM, fallback, interruption, and TTS timing fields |
-| `v_latency_events` | Structured per-turn latency trace events |
-
-*salience_network.db*
-
-| View | Description |
-|---|---|
-| `v_interaction_attempts_clean` | Cleaned interaction attempts with `abort_category` (`no_response` / `target_lost` / `system_abort` / `error`) |
-| `v_interaction_attempts_daily` | Daily aggregates: launched, completed, SS4 rate, proactive count, abort breakdown by category |
-| `v_face_ips_timeline` | Per-frame IPS values with habituation and eligibility flags |
-| `v_face_observations` | Raw landmark-derived face observations while at least one face is visible, including bbox, gaze, pose, attention, and interaction-active flags |
-| `v_interaction_state_events` | Start/end timestamps for salience-triggered interactions |
-
-*chat_bot.db*: `v_chat_events_clean`, `v_chat_messages_clean`, `v_chat_daily_metrics`, `v_chat_user_daily`, `v_chat_session_metrics`
-
-Raw/event analysis tables include UTC, Rome-local, epoch, monotonic, and run-relative timestamp fields.
-
-**`abort_category` values** (available in all interaction views)
-
-| Value | Meaning |
-|---|---|
-| `no_response` | Person was present but did not reply (`no_response_greeting`, `no_response_conversation`, `no_response_name`) |
-| `target_lost` | Person walked away before or during the interaction (`target_lost`, `face_disappeared`, `target_monitor_abort`) |
-| `system_abort` | Internal system abort — TTS, LLM, or pipeline failure |
-| `error` | Unhandled exception |
-| `NULL` | Successful interaction |
 
 ## Running
 

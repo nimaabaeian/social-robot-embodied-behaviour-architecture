@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import fcntl
+import hashlib
 import json
 import os
 import queue
@@ -58,6 +59,77 @@ import httpx
 from openai import AzureOpenAI 
 import yarp                     
 
+
+class ExperimentMetadata:
+    ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
+    FALLBACK_SALT = "alwayson_local_participant_salt"
+
+    def __init__(self, *, default_condition: str = "unknown", log_cb=None):
+        self._log = log_cb or (lambda level, msg: None)
+        self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
+        self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
+        self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
+        self.scenario_id = (os.getenv("ALWAYSON_SCENARIO_ID") or "").strip() or "unspecified"
+        self._participant_source = (os.getenv("ALWAYSON_PARTICIPANT_ID") or "").strip()
+        self._salt = (os.getenv("ALWAYSON_PARTICIPANT_SALT") or "").strip()
+        self._warned_fallback_salt = False
+        self.participant_id = self._hash_participant(self._participant_source) if self._participant_source else None
+        self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
+        valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
+        self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
+
+    @classmethod
+    def _normalize_condition(cls, value: Optional[str]) -> Optional[str]:
+        condition = (value or "").strip().lower()
+        if not condition:
+            return None
+        return condition if condition in cls.ALLOWED_CONDITIONS else "unknown"
+
+    @staticmethod
+    def _parse_bool(value: Optional[str], *, default: bool) -> bool:
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def set_default_condition(self, condition: str) -> None:
+        if self._env_condition:
+            self.experiment_condition = self._env_condition
+            return
+        self.experiment_condition = self._normalize_condition(condition) or "unknown"
+
+    def _effective_salt(self) -> str:
+        if self._salt:
+            return self._salt
+        if not self._warned_fallback_salt:
+            self._log("WARNING", "ALWAYSON_PARTICIPANT_SALT not set; using deterministic local fallback salt")
+            self._warned_fallback_salt = True
+        return self.FALLBACK_SALT
+
+    def _hash_participant(self, value: Any) -> Optional[str]:
+        source = str(value).strip() if value is not None else ""
+        if not source or source.lower() in {"unknown", "none", "null"}:
+            return None
+        digest = hashlib.sha256(f"{self._effective_salt()}:{source}".encode("utf-8")).hexdigest()
+        return digest
+
+    def experiment_fields(self, extra_participant_source: Any = None) -> Dict[str, Any]:
+        participant = self.participant_id
+        if participant is None and extra_participant_source is not None:
+            participant = self._hash_participant(extra_participant_source)
+        return {
+            "run_id": self.run_id,
+            "experiment_condition": self.experiment_condition,
+            "scenario_id": self.scenario_id,
+            "participant_id": participant,
+            "is_test_run": int(self.is_test_run),
+            "valid_for_analysis": int(self.valid_for_analysis),
+        }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Orexigenic drive model
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,7 +147,7 @@ class HungerModel:
 
     def __init__(
         self,
-        drain_hours:        float = 5.0,
+        drain_hours:        float = 4.0,
         hungry_threshold:   float = 60.0,
         starving_threshold: float = 25.0,
         persist_file:       Optional[str] = None,
@@ -974,6 +1046,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self.module_name = "executiveControl"
         self.period      = 0.02
         self._running    = True
+        self.experiment  = ExperimentMetadata(default_condition="drive_enabled", log_cb=self._log)
 
         # YARP ports
         self.handle_port:   yarp.Port                   = yarp.Port()
@@ -1075,7 +1148,7 @@ class ExecutiveControlModule(yarp.RFModule):
             self.setName(self.module_name)
 
             self.hunger = HungerModel(
-                drain_hours        = rf.find("drain_hours").asFloat64()        if rf.check("drain_hours")        else 5.0,
+                drain_hours        = rf.find("drain_hours").asFloat64()        if rf.check("drain_hours")        else 4.0,
                 hungry_threshold   = rf.find("hungry_threshold").asFloat64()   if rf.check("hungry_threshold")   else 60.0,
                 starving_threshold = rf.find("starving_threshold").asFloat64() if rf.check("starving_threshold") else 25.0,
                 persist_file       = self.HUNGER_STATE_FILE,
@@ -1092,6 +1165,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     "1", "true", "yes", "on",
                 }
             self.hunger_enabled = self._rf_hunger_enabled(rf)
+            self.experiment.set_default_condition("drive_enabled" if self.hunger_enabled else "drive_disabled")
             if not self.hunger_enabled:
                 self.hunger.set_level(100.0)
 
@@ -1456,6 +1530,9 @@ class ExecutiveControlModule(yarp.RFModule):
             "hunger_enabled":  self.hunger_enabled,
             "hunger_state":    self._effective_hunger_state(snap),
             "hunger_level":    snap.level if snap else 100.0,
+            "run_id":          self.experiment.run_id,
+            "experiment_condition": self.experiment.experiment_condition,
+            "scenario_id":     self.experiment.scenario_id,
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:
@@ -1482,6 +1559,7 @@ class ExecutiveControlModule(yarp.RFModule):
         before = self.hunger.snapshot()
         state_before = self._effective_hunger_state(before)
         self.hunger_enabled = arg == "on"
+        self.experiment.set_default_condition("drive_enabled" if self.hunger_enabled else "drive_disabled")
         self.hunger.set_level(100.0)
         if not self.hunger_enabled:
             with self._feed_condition:
@@ -1519,6 +1597,7 @@ class ExecutiveControlModule(yarp.RFModule):
         state_before = self._effective_hunger_state(before)
         if arg == "hs0":
             self.hunger_enabled = False
+            self.experiment.set_default_condition("drive_disabled")
             self.hunger.set_level(100.0)
             with self._feed_condition:
                 self._feed_condition.notify_all()
@@ -1544,6 +1623,7 @@ class ExecutiveControlModule(yarp.RFModule):
         if arg not in level_map:
             return self._rpc_error(reply, "Usage: hunger <hs0|hs1|hs2|hs3>")
         self.hunger_enabled = True
+        self.experiment.set_default_condition("drive_enabled")
         new_level = level_map[arg]
         self.hunger.set_level(new_level)
         snap = self.hunger.snapshot()
@@ -3619,6 +3699,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 monotonic_sec REAL NOT NULL,
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
+                run_id TEXT,
+                experiment_condition TEXT,
+                scenario_id TEXT,
+                participant_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER NOT NULL,
                 face_id TEXT NOT NULL,
                 initial_state TEXT NOT NULL CHECK (initial_state IN ('ss1','ss2','ss3','ss4')),
@@ -3649,6 +3735,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 monotonic_sec REAL NOT NULL,
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
+                run_id TEXT,
+                experiment_condition TEXT,
+                scenario_id TEXT,
+                participant_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 turn_index INTEGER NOT NULL,
                 label TEXT,
                 social_state TEXT NOT NULL CHECK (social_state IN ('ss1','ss2','ss3','ss4')),
@@ -3685,6 +3777,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 monotonic_sec REAL NOT NULL,
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
+                run_id TEXT,
+                experiment_condition TEXT,
+                scenario_id TEXT,
+                participant_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 label TEXT NOT NULL,
                 turn_index INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
@@ -3705,6 +3803,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 monotonic_sec REAL NOT NULL,
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
+                run_id TEXT,
+                experiment_condition TEXT,
+                scenario_id TEXT,
+                participant_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 type TEXT NOT NULL CHECK (type IN ('greeting','unknown_intro','qr_feed')),
                 track_id INTEGER, name TEXT, payload TEXT,
                 hunger_state_before TEXT CHECK (hunger_state_before IS NULL OR hunger_state_before IN ('HS0','HS1','HS2','HS3')),
@@ -3721,6 +3825,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 monotonic_sec REAL NOT NULL,
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
+                run_id TEXT,
+                experiment_condition TEXT,
+                scenario_id TEXT,
+                participant_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 event_type TEXT NOT NULL,
                 stimulus_type TEXT,
                 stimulus_label TEXT,
@@ -3740,9 +3850,15 @@ class ExecutiveControlModule(yarp.RFModule):
                 exec_interaction_id TEXT
             )""")
             c.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','2') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','3') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
+            for key, value in self.experiment.experiment_fields().items():
+                c.execute(
+                    "INSERT INTO schema_info(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value) if value is not None else ""),
+                )
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
@@ -3751,15 +3867,31 @@ class ExecutiveControlModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_i_hs      ON interactions(hunger_state_start)",
                 "CREATE INDEX IF NOT EXISTS idx_i_day_rome ON interactions(day_rome)",
                 "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
+                "CREATE INDEX IF NOT EXISTS idx_i_run     ON interactions(run_id)",
+                "CREATE INDEX IF NOT EXISTS idx_i_cond    ON interactions(experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_i_scenario ON interactions(scenario_id)",
+                "CREATE INDEX IF NOT EXISTS idx_i_participant ON interactions(participant_id)",
+                "CREATE INDEX IF NOT EXISTS idx_i_valid   ON interactions(valid_for_analysis)",
+                "CREATE INDEX IF NOT EXISTS idx_i_run_cond ON interactions(run_id, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_i_valid_cond ON interactions(valid_for_analysis, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_i_scenario_cond ON interactions(scenario_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_iid  ON interaction_turns(interaction_id)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_time ON interaction_turns(timestamp_utc)",
+                "CREATE INDEX IF NOT EXISTS idx_turn_run_cond ON interaction_turns(run_id, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_turn_valid ON interaction_turns(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_lat_iid   ON latency_events(interaction_id)",
                 "CREATE INDEX IF NOT EXISTS idx_lat_event ON latency_events(event_type)",
+                "CREATE INDEX IF NOT EXISTS idx_lat_run_cond ON latency_events(run_id, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_lat_valid ON latency_events(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
+                "CREATE INDEX IF NOT EXISTS idx_r_run_cond ON reactive_interactions(run_id, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_r_valid   ON reactive_interactions(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_time  ON hunger_level_events(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_event ON hunger_level_events(event_type, stimulus_type)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_iid   ON hunger_level_events(exec_interaction_id)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_run_cond ON hunger_level_events(run_id, experiment_condition)",
+                "CREATE INDEX IF NOT EXISTS idx_hle_valid ON hunger_level_events(valid_for_analysis)",
             ]:
                 c.execute(idx_sql)
             self._create_analytics_views(conn)
@@ -3781,6 +3913,12 @@ class ExecutiveControlModule(yarp.RFModule):
                        monotonic_sec,
                        run_elapsed_sec,
                        day_rome,
+                       run_id,
+                       experiment_condition,
+                       scenario_id,
+                       participant_id,
+                       is_test_run,
+                       valid_for_analysis,
                        track_id, face_id,
                        COALESCE(NULLIF(extracted_name,''),face_id) AS user_key,
                        initial_state, final_state,
@@ -3806,15 +3944,17 @@ class ExecutiveControlModule(yarp.RFModule):
                        COALESCE(n_turns, 0) AS n_turns,
                        COALESCE(trigger_mode, 'proactive') AS trigger_mode
                 FROM interactions WHERE initial_state IN ('ss1','ss2','ss3')""",
+            "v_interactions_clean": """
+                SELECT * FROM v_interactions WHERE valid_for_analysis = 1""",
             "v_metric_ss3_daily": """
-                SELECT day_rome, hunger_state_start,
+                SELECT run_id, experiment_condition, scenario_id, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END) AS reached_ss4,
                        1.0*SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
-                FROM v_interactions WHERE initial_state='ss3'
-                GROUP BY day_rome, hunger_state_start""",
+                FROM v_interactions_clean WHERE initial_state='ss3'
+                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
             "v_metric_response_rate_daily": """
-                SELECT day_rome, hunger_state_start,
+                SELECT run_id, experiment_condition, scenario_id, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END) AS replied,
                        1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate,
@@ -3822,9 +3962,13 @@ class ExecutiveControlModule(yarp.RFModule):
                        SUM(CASE WHEN abort_category='target_lost'  THEN 1 ELSE 0 END) AS target_lost,
                        SUM(CASE WHEN abort_category='system_abort' THEN 1 ELSE 0 END) AS system_abort,
                        SUM(CASE WHEN abort_category='error'        THEN 1 ELSE 0 END) AS errors
-                FROM v_interactions GROUP BY day_rome, hunger_state_start""",
+                FROM v_interactions_clean
+                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
             "v_metric_repeat_users_daily": """
                 SELECT
+                    run_id,
+                    experiment_condition,
+                    scenario_id,
                     day_rome,
                     hunger_state_start,
                     COUNT(*)                                                          AS total_visits,
@@ -3834,20 +3978,30 @@ class ExecutiveControlModule(yarp.RFModule):
                           / MAX(COUNT(DISTINCT user_key), 1)                          AS repeat_user_rate
                 FROM (
                     SELECT
+                        run_id,
+                        experiment_condition,
+                        scenario_id,
                         day_rome,
                         hunger_state_start,
                         COALESCE(NULLIF(extracted_name, ''), face_id)                 AS user_key,
                         COUNT(*) OVER (
-                            PARTITION BY day_rome,
+                            PARTITION BY run_id,
+                                         experiment_condition,
+                                         scenario_id,
+                                         day_rome,
                                          COALESCE(NULLIF(extracted_name, ''), face_id)
                         )                                                             AS visit_count
                     FROM interactions
                     WHERE trigger_mode = 'proactive'
                       AND initial_state IN ('ss1', 'ss2', 'ss3')
+                      AND valid_for_analysis = 1
                 )
-                GROUP BY day_rome, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
             "v_metric_depth_progression": """
                 SELECT
+                    run_id,
+                    experiment_condition,
+                    scenario_id,
                     day_rome                                                                 AS day_rome,
                     initial_state,
                     hunger_state_start,
@@ -3861,7 +4015,8 @@ class ExecutiveControlModule(yarp.RFModule):
                     SUM(CASE WHEN replied_any = 1 AND final_state != 'ss4' THEN 1 ELSE 0 END) AS replied_but_no_ss4
                 FROM interactions
                 WHERE initial_state IN ('ss1', 'ss2', 'ss3')
-                GROUP BY day_rome, initial_state, hunger_state_start""",
+                  AND valid_for_analysis = 1
+                GROUP BY run_id, experiment_condition, scenario_id, day_rome, initial_state, hunger_state_start""",
             "v_hunger_level_timeline": """
                 SELECT timestamp_utc,
                        timestamp_local,
@@ -3870,6 +4025,12 @@ class ExecutiveControlModule(yarp.RFModule):
                        monotonic_sec,
                        run_elapsed_sec,
                        day_rome,
+                       run_id,
+                       experiment_condition,
+                       scenario_id,
+                       participant_id,
+                       is_test_run,
+                       valid_for_analysis,
                        event_type,
                        stimulus_type,
                        stimulus_label,
@@ -3897,6 +4058,12 @@ class ExecutiveControlModule(yarp.RFModule):
                        monotonic_sec,
                        run_elapsed_sec,
                        day_rome,
+                       run_id,
+                       experiment_condition,
+                       scenario_id,
+                       participant_id,
+                       is_test_run,
+                       valid_for_analysis,
                        turn_index,
                        label,
                        social_state,
@@ -3925,6 +4092,12 @@ class ExecutiveControlModule(yarp.RFModule):
                        monotonic_sec,
                        run_elapsed_sec,
                        day_rome,
+                       run_id,
+                       experiment_condition,
+                       scenario_id,
+                       participant_id,
+                       is_test_run,
+                       valid_for_analysis,
                        label,
                        turn_index,
                        event_type,
@@ -3934,8 +4107,24 @@ class ExecutiveControlModule(yarp.RFModule):
                        elapsed_sec,
                        fields_json
                 FROM latency_events""",
+            "v_quality_hunger_invalid_levels": """
+                SELECT *
+                FROM hunger_level_events
+                WHERE (stomach_level_before IS NOT NULL AND (stomach_level_before < 0 OR stomach_level_before > 100))
+                   OR (stomach_level_after IS NOT NULL AND (stomach_level_after < 0 OR stomach_level_after > 100))""",
+            "v_quality_interaction_missing_metadata": """
+                SELECT *
+                FROM interactions
+                WHERE run_id IS NULL OR experiment_condition IS NULL OR scenario_id IS NULL""",
+            "v_quality_condition_counts": """
+                SELECT run_id,
+                       experiment_condition,
+                       scenario_id,
+                       hunger_state_start,
+                       COUNT(*) AS interaction_count
+                FROM interactions
+                GROUP BY run_id, experiment_condition, scenario_id, hunger_state_start""",
         }
-        c.execute("DROP VIEW IF EXISTS v_proactive_interactions")  # legacy name — renamed to v_interactions
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
             c.execute(f"CREATE VIEW {name} AS {body}")
@@ -4001,17 +4190,19 @@ class ExecutiveControlModule(yarp.RFModule):
                 "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
                 "monotonic_sec", "run_elapsed_sec", "day_rome"
             ) if k in data}}
+            meta = self.experiment.experiment_fields(r.get("extracted_name") or data.get("face_id"))
             conn.cursor().execute(
                 """INSERT INTO interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 scenario_id,participant_id,is_test_run,valid_for_analysis,
                  track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
                  hunger_drive_enabled,stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
                  active_energy_cost,homeostatic_reward,n_turns,trigger_mode,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     ts["timestamp_utc"],
@@ -4021,6 +4212,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["monotonic_sec"],
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
+                    meta["run_id"],
+                    meta["experiment_condition"],
+                    meta["scenario_id"],
+                    meta["participant_id"],
+                    meta["is_test_run"],
+                    meta["valid_for_analysis"],
                     data["track_id"], data["face_id"], data["initial_state"],
                     r.get("final_state",""),
                     int(r.get("success", False)),      r.get("abort_reason"),
@@ -4041,9 +4238,9 @@ class ExecutiveControlModule(yarp.RFModule):
                 ),
             )
             for turn in turns:
-                self._db_save_interaction_turn(conn, data.get("interaction_id"), turn)
+                self._db_save_interaction_turn(conn, data.get("interaction_id"), turn, meta)
             for event in latency_events:
-                self._db_save_latency_event(conn, data.get("interaction_id"), event)
+                self._db_save_latency_event(conn, data.get("interaction_id"), event, meta)
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_interaction failed: {e}")
@@ -4053,19 +4250,23 @@ class ExecutiveControlModule(yarp.RFModule):
         conn: sqlite3.Connection,
         interaction_id: Optional[str],
         turn: Dict[str, Any],
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         ts = self._time_fields(monotonic_sec=turn.get("turn_started_mono"))
+        meta = meta or self.experiment.experiment_fields()
         conn.cursor().execute(
             """INSERT INTO interaction_turns
             (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-             monotonic_sec,run_elapsed_sec,day_rome,turn_index,label,social_state,
+             monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+             scenario_id,participant_id,is_test_run,valid_for_analysis,
+             turn_index,label,social_state,
              trigger_mode,hunger_state,user_utterance,assistant_utterance,user_chars,
              assistant_chars,llm_request_id,response_source,fallback_reason,interrupted,
              superseded,turn_started_mono,stt_final_mono,llm_first_token_mono,
              llm_last_token_mono,tts_dispatch_mono,tts_estimated_done_mono,
              tts_estimated_sec,time_to_first_response_sec,response_total_sec,
              stt_to_tts_dispatch_sec)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 interaction_id or turn.get("interaction_id"),
                 ts["timestamp_utc"],
@@ -4075,6 +4276,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 ts["monotonic_sec"],
                 ts["run_elapsed_sec"],
                 ts["day_rome"],
+                meta["run_id"],
+                meta["experiment_condition"],
+                meta["scenario_id"],
+                meta["participant_id"],
+                meta["is_test_run"],
+                meta["valid_for_analysis"],
                 int(turn.get("turn_index", 0)),
                 turn.get("label"),
                 turn.get("social_state") or "ss3",
@@ -4107,13 +4314,17 @@ class ExecutiveControlModule(yarp.RFModule):
         conn: sqlite3.Connection,
         interaction_id: Optional[str],
         event: Dict[str, Any],
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
+        meta = meta or self.experiment.experiment_fields()
         conn.cursor().execute(
             """INSERT INTO latency_events
             (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-             monotonic_sec,run_elapsed_sec,day_rome,label,turn_index,event_type,
+             monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+             scenario_id,participant_id,is_test_run,valid_for_analysis,
+             label,turn_index,event_type,
              request_id,at_mono,started_mono,elapsed_sec,fields_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 interaction_id or event.get("interaction_id"),
                 event.get("timestamp_utc"),
@@ -4123,6 +4334,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 event.get("monotonic_sec"),
                 event.get("run_elapsed_sec"),
                 event.get("day_rome"),
+                meta["run_id"],
+                meta["experiment_condition"],
+                meta["scenario_id"],
+                meta["participant_id"],
+                meta["is_test_run"],
+                meta["valid_for_analysis"],
                 event.get("label"),
                 int(event.get("turn_index", 0)),
                 event.get("event_type"),
@@ -4140,12 +4357,15 @@ class ExecutiveControlModule(yarp.RFModule):
                 "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
                 "monotonic_sec", "run_elapsed_sec", "day_rome"
             ) if k in data}}
+            meta = self.experiment.experiment_fields(data.get("name"))
             conn.cursor().execute(
                 """INSERT INTO reactive_interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,type,track_id,name,payload,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 scenario_id,participant_id,is_test_run,valid_for_analysis,
+                 type,track_id,name,payload,
                  hunger_state_before,stomach_level_before,hunger_state_after,stomach_level_after)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     ts["timestamp_utc"],
@@ -4155,6 +4375,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["monotonic_sec"],
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
+                    meta["run_id"],
+                    meta["experiment_condition"],
+                    meta["scenario_id"],
+                    meta["participant_id"],
+                    meta["is_test_run"],
+                    meta["valid_for_analysis"],
                     data.get("type"),
                     data.get("track_id"),
                     data.get("name"),
@@ -4175,16 +4401,18 @@ class ExecutiveControlModule(yarp.RFModule):
                 "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
                 "monotonic_sec", "run_elapsed_sec", "day_rome"
             ) if k in data}}
+            meta = self.experiment.experiment_fields()
             conn.cursor().execute(
                 """INSERT INTO hunger_level_events
                 (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 scenario_id,participant_id,is_test_run,valid_for_analysis,
                  event_type,stimulus_type,stimulus_label,reason,
                  hunger_drive_enabled,hunger_state_before,hunger_state_after,
                  stomach_level_before,stomach_level_after,level_delta,
                  active_energy_cost,meal_delta,meal_payload,trigger_mode,
                  social_state,interaction_tag,exec_interaction_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     ts["timestamp_utc"],
                     ts["timestamp_local"],
@@ -4193,6 +4421,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["monotonic_sec"],
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
+                    meta["run_id"],
+                    meta["experiment_condition"],
+                    meta["scenario_id"],
+                    meta["participant_id"],
+                    meta["is_test_run"],
+                    meta["valid_for_analysis"],
                     data.get("event_type"),
                     data.get("stimulus_type"),
                     data.get("stimulus_label"),
