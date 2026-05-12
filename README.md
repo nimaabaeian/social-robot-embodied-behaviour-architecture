@@ -1,6 +1,6 @@
 ![Always On Embodied Behaviour](media/embodiedbehaviour.png)
 
-This repository provides the **embodied behaviour module** for the iCub humanoid robot, functioning as a core subsystem of the [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git). It serves as the foundation for the robot's always-on social interaction stack.
+This repository provides the **embodied behaviour module** for the iCub humanoid robot, functioning as a core subsystem of the [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git).
 
 At its core, the module synthesizes a primary internal homeostatic motivation, the **Orexigenic Drive**. By embedding this drive directly into the continuous cognitive architecture, it enables the iCub to exhibit autonomous, lifelike, and drive-regulated social behaviors over extended periods.
 
@@ -81,7 +81,9 @@ flowchart LR
   S -->|run/sus RPC| FT
   STT[speech2text] -->|text:o| E
   E -->|speech:o| TTS[acapelaSpeak]
+  S -->|trigger interaction RPC| E
   E -->|interaction_result RPC| S
+  E -->|enroll name RPC| V
   E -->|emotions RPC| ICUB["/icub/face/emotions/in"]
   STM[alwayson/stm/context:o] --> S
   E -->|hunger:o| C[alwayson_chatBot]
@@ -91,86 +93,48 @@ flowchart LR
 ## Modules and Features
 
 ### alwayson_embodiedBehaviour_vision
-
-- Real-time face detection (YOLO v11) and tracking (ByteTrack) with a 10% bounding box expansion for better crop quality.
-- MediaPipe face landmark estimation: head pose via PnP (pitch, yaw, roll), gaze direction vector, and attention classification (`MUTUAL_GAZE` / `NEAR_GAZE` / `AWAY`).
-- Talking detection via lip motion history: standard deviation of normalized mouth opening over a rolling buffer.
-- Zone classification (`FAR_LEFT`, `LEFT`, `CENTER`, `RIGHT`, `FAR_RIGHT`) and distance classification (`SO_CLOSE`, `CLOSE`, `FAR`, `VERY_FAR`) per face.
-- Face identity matching with `face_recognition`: sticky identity across frames, per-track retry logic, runtime enrollment via RPC.
-- QR code detection (OpenCV, throttled to 1 in 10 frames) with hysteresis to suppress repeated emits.
-- Annotated face view output and lightweight `targetCmd` → `targetBox` relay for FaceTracker.
-- Optical flow motion detection and HSV-based light level estimation.
+- **Face & Gaze Tracking**: YOLO v11 face detection + ByteTrack + MediaPipe for pose, gaze, and attention (`MUTUAL_GAZE`/`NEAR_GAZE`/`AWAY`).
+- **Identity & Features**: Sticky face recognition, lip-motion talking detection, and spatial zone/distance classification.
+- **Environment**: QR code detection (for feeding), optical flow, and light level estimation.
 
 **RPC port**: `/alwayson/vision/rpc` (configurable with `rpc_name`)
-**Commands**:
-- `help` → list commands
-- `name <person_name> id <track_id>` → enroll or update a tracked face identity
-- `quit` → stop module
 
 ---
 
 ### alwayson_salienceNetwork
-
-- Computes **IPS (Interaction Priority Score)** per face as a weighted sum of four variables: proximity (bbox area), centrality (screen center distance), approach velocity (bbox area delta), and mutual gaze angle.
-- **Social state classification**: `ss1` = unknown, `ss2` = known not greeted, `ss3` = known greeted no talk, `ss4` = known talked. Each state has its own IPS threshold (ss1 strictest, ss2 most permissive).
-- **Hysteresis**: active target gets an IPS bonus (0.3) to prevent thrashing.
-- **Habituation**: per-person IPS is attenuated exponentially (λ=0.20) the longer a face is continuously targeted, driving the robot toward novel faces.
-- **Adaptive IPS weights**: per-person proximity/centrality/velocity/gaze weights shift based on homeostatic reward after each interaction (reward-weighted gradient, max shift 0.08 per interaction).
-- **Context-aware cooldown**: STM context label (1=lively → short cooldown; 0=calm → long cooldown; −1=default) adjusts interaction frequency.
-- **Unknown person dwell gate**: an unresolved (SS1) face must be continuously present for at least 7.5 seconds before an interaction can be triggered; resolving to a known identity clears the timer immediately.
-- Sends `run` to FaceTracker at startup and `sus` at shutdown.
-- Persists daily memory to JSON: `greeted_today.json`, `talked_today.json`, `last_greeted.json`, `homeostatic_learning.json`.
+- **Interaction Priority Score (IPS)**: Ranks faces dynamically by proximity, centrality, velocity, and mutual gaze. Uses hysteresis to prevent thrashing and habituation to drive novelty.
+- **Adaptive Learning**: Shifts IPS weights per-person based on homeostatic reward received after interactions.
+- **Social & Context Gates**: Manages social state transitions (`ss1` to `ss4`), dwell-time gates for strangers, and context-aware cooldowns to pace interactions.
+- **Persistence**: Saves daily social memory to JSON to track who was greeted or talked to.
 
 **RPC port**: `/<module_name>` (default: `/salienceNetwork`)
-**Commands** (received from executiveControl):
-- `set_track_id <int>` → override target selection
-- `reset_cooldown <face_id> <track_id>` → reset cooldown for a specific target
-- `interaction_result <json>` → deliver interaction outcome for homeostatic learning
 
 ---
 
 ### alwayson_executiveControl
-
-- **Social state machine**: ss1 (unknown → greet + extract name → ss3), ss2 (known, not greeted → say hello → ss3), ss3 (known, greeted → LLM conversation up to 3 turns → ss4), ss4 (no-op).
-- **Orexigenic drive model** (`HungerModel`): stomach level drains continuously over 4 hours. Thresholds: ≥60% = HS1 (full), 25–60% = HS2 (hungry), <25% = HS3 (starving). Level and timestamps persist atomically to `memory/hunger_state.json`.
-- **Active energy costs**: each meaningful robot action (greeting, name question, conversation turn, feed acknowledgment) exerts a metabolic cost that accelerates stomach drain.
-- **QR-based feeding**: reads QR codes from vision (`/alwayson/executiveControl/qr:i`). Recognized payloads: `SMALL_MEAL` (+10%), `MEDIUM_MEAL` (+25%), `LARGE_MEAL` (+45%). Speaks a context-aware acknowledgment and logs a `qr_feed` reactive event.
-- **Reactive greeting path**: independently listens to STT for greeting utterances (hello, hi, ciao, etc.). When idle, responds reactively without requiring the proactive interaction flow to be triggered. At HS3, the reactive response skips the normal greeting and immediately delivers a combined greeting + hunger request ("Hello, I'm so hungry, would you feed me please?").
-- **Face emotion**: sets iCub facial expression via `/icub/face/emotions/in` on HS transitions and at startup (HS1: all happy; HS2: mouth sad, eyebrows neutral; HS3: mouth + eyebrows fully sad).
-- **`LatestOnlyLlmWorker`**: bounded parallel LLM execution (up to 3 concurrent calls) with cancel-on-supersede semantics and streaming support.
-- **`SpeechCoordinator`**: non-blocking TTS timing tracker that allows the dialogue loop to continue without hard waits.
-- Publishes current Orexigenic state to `/alwayson/executiveControl/hunger:o`.
+- **Orexigenic Drive (Always-On)**: Simulates a continuous metabolism. Actions exert energy costs, pushing the robot through hunger states (HS1: full → HS2: hungry → HS3: starving). Drives both verbal requests and facial expressions.
+- **Feeding Mechanisms**: Recovers energy via QR code meals, generating homeostatic rewards that accelerate reinforcement learning in the Salience Network.
+- **Interaction Engine**: Orchestrates the social state machine (greeting, name extraction, LLM-driven conversation), combining proactive IPS-driven actions with reactive STT greetings.
+- **High-Performance Dialogue**: Uses parallel LLM execution with cancel-on-supersede semantics and non-blocking TTS coordination for real-time responsiveness.
 
 **RPC port**: `/<module_name>` (default: `/executiveControl`)
 **Commands**:
 - `status` or `ping` → module state (busy, mode, hunger level)
-- `help` → command list
-- `hunger_mode <on|off>` → enable/disable the Orexigenic drive (off publishes HS0, resets stomach to 100%)
-- `hunger <hs0|hs1|hs2|hs3>` → manually set drive: `hs0`=disable drive, `hs1`=full (100%), `hs2`=hungry (59%), `hs3`=starving (24%)
-- `run <track_id> <face_id> <ss1|ss2|ss3|ss4>` → trigger an interaction
-- `quit` → stop module
+- `hunger <hs1|hs2|hs3>` → manually override drive state: `hs1`=full, `hs2`=hungry, `hs3`=starving
+- `run <track_id> <face_id> <ss1|ss2|ss3|ss4>` → trigger an interaction manually
 
 ---
 
 ### alwayson_chatBot
+- **Drive-Grounded Telegram Bot**: Driven by the exact same Orexigenic drive as the physical robot. System prompts dynamically adapt to the robot's physical hunger state.
+- **Proactive Engagement**: Broadcasts to users when transitioning to hungry (HS2) or starving (HS3) states, requesting remote or in-person feeding.
+- **Deep Memory**: Maintains rolling conversation windows, auto-summarization, and persistent per-user psychological profiles (likes, topics, inside jokes, tone).
 
-- Telegram long-polling bot (dedicated background thread) with exponential backoff and rate-limit handling.
-- **Per-user memory**: name, age, likes, dislikes, favorite topics, inside jokes (with frequency tracking), and conversation style (tone, message length, emoji usage) — persisted to SQLite.
-- **Conversation history**: rolling 6-turn window with automatic summarization every 8 turns; summaries are injected into the system prompt to maintain long-term context.
-- **Orexigenic-drive-aware prompting**: HS-specific system prompt overlays. In HS3, a critical override forces the entire reply to be about starvation.
-- **HS2 hunger injection**: if 3 consecutive replies pass without a hunger mention, the next reply forces a casual hunger side-comment.
-- **Proactive messages**:
-  - HS1 → HS2 transition: sends a casual "peckish" message to all subscribers.
-  - HS3 entry: broadcasts immediately to all subscribers, then re-sends every 15 minutes (per-user cooldown) while starving.
-  - HS3 → HS1/HS2 recovery: sends a relief message to all subscribers on feeding.
-- **Telegram user commands**: `/start` (register as subscriber, clear history), `/reset` (clear conversation history and start fresh).
-- **RPC port**: `/chatBot/rpc`
-- **RPC commands**:
-  - `status` → module status (effective HS, subscriber count, thread health)
-  - `help` → command list
-  - `set_hs <HS0|HS1|HS2|HS3>` → force Orexigenic state via RPC
-  - `clear_hs` → clear RPC-forced state (revert to port-driven state)
-  - `reload_prompts` → hot-reload `prompts.json` without restart
+**RPC port**: `/chatBot/rpc`
+**Commands**:
+- `status` → module status (effective HS, subscriber count, thread health)
+- `set_hs <HS1|HS2|HS3>` → force Orexigenic state via RPC (for testing)
+- `clear_hs` → revert to physical port-driven state
 
 ---
 

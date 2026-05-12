@@ -50,23 +50,12 @@ _ALWAYSON_DIR = os.path.dirname(_MODULE_DIR)
 
 
 class ExperimentMetadata:
-    ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
-
-    def __init__(self, *, default_condition: str = "unknown", log_cb=None):
+    def __init__(self, *, log_cb=None):
         self._log = log_cb or (lambda level, msg: None)
         self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
-        self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
-        self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
-
-    @classmethod
-    def _normalize_condition(cls, value: Optional[str]) -> Optional[str]:
-        condition = (value or "").strip().lower()
-        if not condition:
-            return None
-        return condition if condition in cls.ALLOWED_CONDITIONS else "unknown"
 
     @staticmethod
     def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -79,16 +68,9 @@ class ExperimentMetadata:
             return False
         return default
 
-    def set_default_condition(self, condition: str) -> None:
-        if self._env_condition:
-            self.experiment_condition = self._env_condition
-            return
-        self.experiment_condition = self._normalize_condition(condition) or "unknown"
-
     def experiment_fields(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
-            "experiment_condition": self.experiment_condition,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
         }
@@ -293,7 +275,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._io_queue: queue.Queue = queue.Queue(maxsize=self.IO_QUEUE_MAXSIZE)
         self._io_thread: Optional[threading.Thread] = None
 
-        self.experiment = ExperimentMetadata(default_condition="unknown", log_cb=self._log)
+        self.experiment = ExperimentMetadata(log_cb=self._log)
         self.db_path = str(Path(_MODULE_DIR) / "data_collection" / "salience_network.db")
         self._db_queue: queue.Queue = queue.Queue()
         self._db_thread: Optional[threading.Thread] = None
@@ -1778,10 +1760,6 @@ class SalienceNetworkModule(yarp.RFModule):
             except json.JSONDecodeError:
                 return None
             if isinstance(data, dict):
-                if "hunger_enabled" in data:
-                    self.experiment.set_default_condition(
-                        "drive_enabled" if bool(data.get("hunger_enabled")) else "drive_disabled"
-                    )
                 return data
             return None
         except Exception as e:
@@ -2296,7 +2274,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER NOT NULL,
@@ -2320,7 +2297,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER,
@@ -2359,7 +2335,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 person_id TEXT NOT NULL,
@@ -2376,7 +2351,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 person_id TEXT NOT NULL,
@@ -2411,7 +2385,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 attempt_id TEXT NOT NULL UNIQUE,
@@ -2437,7 +2410,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 event_type TEXT NOT NULL CHECK (event_type IN ('start','end')),
@@ -2471,10 +2443,8 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_person ON target_selections(person_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_target_selections_run_cond ON target_selections(run_id, experiment_condition)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_target_selections_valid_cond ON target_selections(valid_for_analysis, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp_utc)"
@@ -2486,7 +2456,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_person ON face_ips_events(person_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_ips_events_run_cond ON face_ips_events(run_id, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_valid ON face_ips_events(valid_for_analysis)"
@@ -2507,22 +2476,18 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_ia_run ON interaction_attempts(run_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_condition ON interaction_attempts(experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ia_valid ON interaction_attempts(valid_for_analysis)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_run_cond ON interaction_attempts(run_id, experiment_condition)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_valid_cond ON interaction_attempts(valid_for_analysis, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_state_events_attempt ON interaction_state_events(attempt_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_interaction_state_events_run_cond ON interaction_state_events(run_id, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_time ON homeostatic_learning_changes(timestamp_utc)"
@@ -2531,7 +2496,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_person ON homeostatic_learning_changes(person_id)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_run_cond ON homeostatic_learning_changes(run_id, experiment_condition)"
             )
 
             self._create_analytics_views(conn)
@@ -2557,7 +2521,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2590,8 +2553,7 @@ class SalienceNetworkModule(yarp.RFModule):
             CREATE VIEW v_interaction_attempts_daily AS
             SELECT
                 day_rome,
-                run_id,
-                experiment_condition, hunger_state,
+                run_id, hunger_state,
                 start_ss,
                 COUNT(*)                                                          AS launched,
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END)                     AS completed,
@@ -2606,7 +2568,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 SUM(CASE WHEN abort_reason IS NOT NULL THEN 1 ELSE 0 END)        AS aborted_count,
                 AVG(duration_sec)                                                 AS avg_duration_sec
             FROM v_interaction_attempts_clean
-            GROUP BY run_id, experiment_condition, day_rome, hunger_state, start_ss
+            GROUP BY run_id, day_rome, hunger_state, start_ss
             """
         )
 
@@ -2623,7 +2585,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2666,7 +2627,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2696,7 +2656,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 person_id,
@@ -2737,7 +2696,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 event_type,
@@ -2758,24 +2716,23 @@ class SalienceNetworkModule(yarp.RFModule):
         c.execute(
             """
             CREATE VIEW v_quality_salience_missing_metadata AS
-            SELECT 'interaction_attempts' AS table_name, id, timestamp_utc, run_id, experiment_condition
+            SELECT 'interaction_attempts' AS table_name, id, timestamp_utc, run_id
             FROM interaction_attempts
-            WHERE run_id IS NULL OR experiment_condition IS NULL
+            WHERE run_id IS NULL
             UNION ALL
-            SELECT 'face_ips_events' AS table_name, id, timestamp_utc, run_id, experiment_condition
+            SELECT 'face_ips_events' AS table_name, id, timestamp_utc, run_id
             FROM face_ips_events
-            WHERE run_id IS NULL OR experiment_condition IS NULL
+            WHERE run_id IS NULL
             """
         )
         c.execute("DROP VIEW IF EXISTS v_quality_attempt_counts")
         c.execute(
             """
             CREATE VIEW v_quality_attempt_counts AS
-            SELECT run_id,
-                   experiment_condition, hunger_state,
+            SELECT run_id, hunger_state,
                    COUNT(*) AS attempt_count
             FROM interaction_attempts
-            GROUP BY run_id, experiment_condition, hunger_state
+            GROUP BY run_id, hunger_state
             """
         )
 
@@ -2850,7 +2807,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO target_selections
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,track_id,face_id,
                          person_id,bbox_area,ips,ss,eligible,context_label,reason,
                          last_greeted_ts)
@@ -2864,7 +2821,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["track_id"],
@@ -2881,7 +2837,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO face_ips_events
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          track_id,face_id,person_id,social_state,is_known,eligible,
                          is_active_target,bbox_area,ips,ips_before_habituation,
@@ -2899,7 +2855,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("track_id"),
@@ -2930,7 +2885,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO ss_changes
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          person_id,old_ss,new_ss)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -2943,7 +2898,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["person_id"],
@@ -2953,7 +2907,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO homeostatic_learning_changes
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          person_id,reward_delta,outcome,reason,trigger_mode,
                          hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
@@ -2970,7 +2924,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["person_id"],
@@ -2998,7 +2951,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO interaction_attempts
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          attempt_id,track_id,face_id,person_id,start_ss,
                          success,final_state,abort_reason,exec_interaction_id,duration_sec,
@@ -3013,7 +2966,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("attempt_id"),
@@ -3032,7 +2984,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     c.execute(
                         """INSERT INTO interaction_state_events
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                         monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          event_type,attempt_id,
                          exec_interaction_id,track_id,face_id,person_id,social_state,
@@ -3047,7 +2999,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["run_elapsed_sec"],
                             data["day_rome"],
                             data.get("run_id"),
-                            data.get("experiment_condition"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("event_type"),

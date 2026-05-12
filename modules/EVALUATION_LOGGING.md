@@ -5,7 +5,6 @@ The evaluation databases include shared experiment metadata on the main event ta
 ## Metadata Fields
 
 - `run_id`: stable identifier for one experimental run. Set `ALWAYSON_RUN_ID` for shared cross-module runs. If it is missing, each module generates one UUID at startup.
-- `experiment_condition`: experimental condition. Allowed values are `drive_enabled`, `drive_disabled`, `ablation`, `pilot`, and `unknown`.
 - `is_test_run`: `1` for pilot/debug/test runs, otherwise `0`.
 - `valid_for_analysis`: `1` for rows intended for analysis. If unset, it defaults to `0` for test runs and `1` otherwise.
 
@@ -25,7 +24,7 @@ RQ1 is evaluated as a homeostatic control question across four sub-functions:
 
 2. **Deficit detection.** Use `v_hs_transitions` to check HS1→HS2→HS3 threshold consistency and confirm that state boundaries align with the configured `hungry_threshold` and `starving_threshold`.
 
-3. **Deficit-to-action conversion.** Use `v_active_cost_breakdown` to verify action energy costs. Use feeding rows in `hunger_level_events` to verify QR meal recovery. Deficit-to-action conversion is evaluated from `v_interactions_clean` by conditioning `interaction_tag`, `hunger_state_start`, and recovery outcomes on `experiment_condition`.
+3. **Deficit-to-action conversion.** Use `v_active_cost_breakdown` to verify action energy costs. Use feeding rows in `hunger_level_events` to verify QR meal recovery. Deficit-to-action conversion is evaluated from `v_interactions_clean` by analysing `interaction_tag`, `hunger_state_start`, and recovery outcomes.
 
 4. **Behavioural prioritisation.** Evaluated at two levels. Verbal hunger expression is measured with `v_metric_hunger_mention_rate` and the chatbot `hunger_mentioned` fields. Adaptive prioritisation is measured with `v_homeostatic_learning_changes_clean` and `face_ips_events`, which expose reward-driven IPS weight changes and their downstream salience scores.
 
@@ -38,7 +37,7 @@ RQ2 is evaluated through caregiving and energy recovery. The core measures are:
 - **HS3 resolution rate:** `v_hs3_episodes.resolved_by_feeding` and `exit_cause`.
 - **Hunger-tree success:** `v_interactions_clean.abort_reason` conditioned on hunger state.
 
-The main comparison is `drive_enabled` versus `drive_disabled`. Chat `hs3_proactive` and `hs3_recovery` events from the chatbot database are channel-specific evidence of expressed deficit and recovery signalling, not proof of cross-channel feeding.
+Chat `hs3_proactive` and `hs3_recovery` events from the chatbot database are channel-specific evidence of expressed deficit and recovery signalling, not proof of cross-channel feeding.
 
 ## Run Data Collection
 
@@ -52,8 +51,7 @@ cd /usr/local/src/robot/cognitiveInteraction/alwaysOn-embodiedBehaviour
 
 2. Choose the run labels:
 
-- `run_id`: unique label for this run.
-- `experiment_condition`: `drive_enabled`, `drive_disabled`, `ablation`, `pilot`, or `unknown`.
+   - `run_id`: unique label for this run.
 
 3. Export the matching variables using one of the examples below.
 
@@ -61,7 +59,6 @@ cd /usr/local/src/robot/cognitiveInteraction/alwaysOn-embodiedBehaviour
 
 ```bash
 echo "$ALWAYSON_RUN_ID"
-echo "$ALWAYSON_EXPERIMENT_CONDITION"
 echo "$ALWAYSON_VALID_FOR_ANALYSIS"
 ```
 
@@ -89,20 +86,10 @@ modules/data_collection/chat_bot.db
 
 ## Environment
 
-Drive-enabled run:
+Experiment run:
 
 ```bash
-export ALWAYSON_RUN_ID="exp01_drive_on_2026_05_11"
-export ALWAYSON_EXPERIMENT_CONDITION="drive_enabled"
-export ALWAYSON_IS_TEST_RUN="0"
-export ALWAYSON_VALID_FOR_ANALYSIS="1"
-```
-
-Drive-disabled run:
-
-```bash
-export ALWAYSON_RUN_ID="exp01_drive_off_2026_05_11"
-export ALWAYSON_EXPERIMENT_CONDITION="drive_disabled"
+export ALWAYSON_RUN_ID="exp01_2026_05_11"
 export ALWAYSON_IS_TEST_RUN="0"
 export ALWAYSON_VALID_FOR_ANALYSIS="1"
 ```

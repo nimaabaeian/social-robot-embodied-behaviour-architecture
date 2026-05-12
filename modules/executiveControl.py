@@ -60,23 +60,12 @@ import yarp
 
 
 class ExperimentMetadata:
-    ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
-
-    def __init__(self, *, default_condition: str = "unknown", log_cb=None):
+    def __init__(self, *, log_cb=None):
         self._log = log_cb or (lambda level, msg: None)
         self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
-        self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
-        self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
-
-    @classmethod
-    def _normalize_condition(cls, value: Optional[str]) -> Optional[str]:
-        condition = (value or "").strip().lower()
-        if not condition:
-            return None
-        return condition if condition in cls.ALLOWED_CONDITIONS else "unknown"
 
     @staticmethod
     def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -89,16 +78,9 @@ class ExperimentMetadata:
             return False
         return default
 
-    def set_default_condition(self, condition: str) -> None:
-        if self._env_condition:
-            self.experiment_condition = self._env_condition
-            return
-        self.experiment_condition = self._normalize_condition(condition) or "unknown"
-
     def experiment_fields(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
-            "experiment_condition": self.experiment_condition,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
         }
@@ -984,7 +966,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self.module_name = "executiveControl"
         self.period      = 0.02
         self._running    = True
-        self.experiment  = ExperimentMetadata(default_condition="drive_enabled", log_cb=self._log)
+        self.experiment  = ExperimentMetadata(log_cb=self._log)
 
         # YARP ports
         self.handle_port:   yarp.Port                   = yarp.Port()
@@ -1100,7 +1082,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     "1", "true", "yes", "on",
                 }
             self.hunger_enabled = self._rf_hunger_enabled(rf)
-            self.experiment.set_default_condition("drive_enabled" if self.hunger_enabled else "drive_disabled")
             if not self.hunger_enabled:
                 self.hunger.set_level(100.0)
 
@@ -1458,7 +1439,6 @@ class ExecutiveControlModule(yarp.RFModule):
             "hunger_state":    self._effective_hunger_state(snap),
             "hunger_level":    snap.level if snap else 100.0,
             "run_id":          self.experiment.run_id,
-            "experiment_condition": self.experiment.experiment_condition,
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:
@@ -1485,7 +1465,6 @@ class ExecutiveControlModule(yarp.RFModule):
         before = self.hunger.snapshot()
         state_before = self._effective_hunger_state(before)
         self.hunger_enabled = arg == "on"
-        self.experiment.set_default_condition("drive_enabled" if self.hunger_enabled else "drive_disabled")
         self.hunger.set_level(100.0)
         if not self.hunger_enabled:
             with self._feed_condition:
@@ -1521,7 +1500,6 @@ class ExecutiveControlModule(yarp.RFModule):
         state_before = self._effective_hunger_state(before)
         if arg == "hs0":
             self.hunger_enabled = False
-            self.experiment.set_default_condition("drive_disabled")
             self.hunger.set_level(100.0)
             with self._feed_condition:
                 self._feed_condition.notify_all()
@@ -1546,7 +1524,6 @@ class ExecutiveControlModule(yarp.RFModule):
         if arg not in level_map:
             return self._rpc_error(reply, "Usage: hunger <hs0|hs1|hs2|hs3>")
         self.hunger_enabled = True
-        self.experiment.set_default_condition("drive_enabled")
         new_level = level_map[arg]
         self.hunger.set_level(new_level)
         snap = self.hunger.snapshot()
@@ -3573,7 +3550,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER NOT NULL,
@@ -3607,7 +3583,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 turn_index INTEGER NOT NULL,
@@ -3648,7 +3623,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 type TEXT NOT NULL CHECK (type IN ('greeting','unknown_intro','qr_feed')),
@@ -3668,7 +3642,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 run_elapsed_sec REAL NOT NULL,
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
-                experiment_condition TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 event_type TEXT NOT NULL,
@@ -3707,22 +3680,16 @@ class ExecutiveControlModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_i_day_rome ON interactions(day_rome)",
                 "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
                 "CREATE INDEX IF NOT EXISTS idx_i_run     ON interactions(run_id)",
-                "CREATE INDEX IF NOT EXISTS idx_i_cond    ON interactions(experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_i_valid   ON interactions(valid_for_analysis)",
-                "CREATE INDEX IF NOT EXISTS idx_i_run_cond ON interactions(run_id, experiment_condition)",
-                "CREATE INDEX IF NOT EXISTS idx_i_valid_cond ON interactions(valid_for_analysis, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_iid  ON interaction_turns(interaction_id)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_time ON interaction_turns(timestamp_utc)",
-                "CREATE INDEX IF NOT EXISTS idx_turn_run_cond ON interaction_turns(run_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_valid ON interaction_turns(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
-                "CREATE INDEX IF NOT EXISTS idx_r_run_cond ON reactive_interactions(run_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_r_valid   ON reactive_interactions(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_time  ON hunger_level_events(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_event ON hunger_level_events(event_type, stimulus_type)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_iid   ON hunger_level_events(exec_interaction_id)",
-                "CREATE INDEX IF NOT EXISTS idx_hle_run_cond ON hunger_level_events(run_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_hle_valid ON hunger_level_events(valid_for_analysis)",
             ]:
                 c.execute(idx_sql)
@@ -3746,7 +3713,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        run_elapsed_sec,
                        day_rome,
                        run_id,
-                       experiment_condition,
                        is_test_run,
                        valid_for_analysis,
                        track_id, face_id,
@@ -3777,14 +3743,14 @@ class ExecutiveControlModule(yarp.RFModule):
             "v_interactions_clean": """
                 SELECT * FROM v_interactions WHERE valid_for_analysis = 1""",
             "v_metric_ss3_daily": """
-                SELECT run_id, experiment_condition, day_rome, hunger_state_start,
+                SELECT run_id, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END) AS reached_ss4,
                        1.0*SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
                 FROM v_interactions_clean WHERE initial_state='ss3'
-                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
+                GROUP BY run_id, day_rome, hunger_state_start""",
             "v_metric_response_rate_daily": """
-                SELECT run_id, experiment_condition, day_rome, hunger_state_start,
+                SELECT run_id, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END) AS replied,
                        1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate,
@@ -3793,11 +3759,10 @@ class ExecutiveControlModule(yarp.RFModule):
                        SUM(CASE WHEN abort_category='system_abort' THEN 1 ELSE 0 END) AS system_abort,
                        SUM(CASE WHEN abort_category='error'        THEN 1 ELSE 0 END) AS errors
                 FROM v_interactions_clean
-                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
+                GROUP BY run_id, day_rome, hunger_state_start""",
             "v_metric_repeat_users_daily": """
                 SELECT
                     run_id,
-                    experiment_condition,
                     day_rome,
                     hunger_state_start,
                     COUNT(*)                                                          AS total_visits,
@@ -3808,13 +3773,11 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM (
                     SELECT
                         run_id,
-                        experiment_condition,
                         day_rome,
                         hunger_state_start,
                         COALESCE(NULLIF(extracted_name, ''), face_id)                 AS user_key,
                         COUNT(*) OVER (
                             PARTITION BY run_id,
-                                         experiment_condition,
                                          day_rome,
                                          COALESCE(NULLIF(extracted_name, ''), face_id)
                         )                                                             AS visit_count
@@ -3823,11 +3786,10 @@ class ExecutiveControlModule(yarp.RFModule):
                       AND initial_state IN ('ss1', 'ss2', 'ss3')
                       AND valid_for_analysis = 1
                 )
-                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
+                GROUP BY run_id, day_rome, hunger_state_start""",
             "v_metric_depth_progression": """
                 SELECT
                     run_id,
-                    experiment_condition,
                     day_rome                                                                 AS day_rome,
                     initial_state,
                     hunger_state_start,
@@ -3842,7 +3804,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM interactions
                 WHERE initial_state IN ('ss1', 'ss2', 'ss3')
                   AND valid_for_analysis = 1
-                GROUP BY run_id, experiment_condition, day_rome, initial_state, hunger_state_start""",
+                GROUP BY run_id, day_rome, initial_state, hunger_state_start""",
             "v_hunger_level_timeline": """
                 SELECT timestamp_utc,
                        timestamp_local,
@@ -3852,7 +3814,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        run_elapsed_sec,
                        day_rome,
                        run_id,
-                       experiment_condition,
                        is_test_run,
                        valid_for_analysis,
                        event_type,
@@ -3883,7 +3844,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        run_elapsed_sec,
                        day_rome,
                        run_id,
-                       experiment_condition,
                        is_test_run,
                        valid_for_analysis,
                        turn_index,
@@ -3908,7 +3868,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM interaction_turns""",
             "v_metric_hunger_mention_rate": """
                 SELECT run_id,
-                       experiment_condition,
                        day_rome,
                        hunger_state,
                        COUNT(*) AS turns,
@@ -3916,7 +3875,7 @@ class ExecutiveControlModule(yarp.RFModule):
                        1.0 * SUM(CASE WHEN hunger_mentioned = 1 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1) AS hunger_mention_rate
                 FROM interaction_turns
                 WHERE valid_for_analysis = 1
-                GROUP BY run_id, experiment_condition, day_rome, hunger_state""",
+                GROUP BY run_id, day_rome, hunger_state""",
             "v_hs_transitions": """
                 SELECT id,
                        timestamp_utc,
@@ -3925,7 +3884,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        run_elapsed_sec,
                        day_rome,
                        run_id,
-                       experiment_condition,
                        is_test_run,
                        valid_for_analysis,
                        hunger_state_before AS from_state,
@@ -3969,7 +3927,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     WHERE stimulus_type = 'passive_drain'
                 )
                 SELECT run_id,
-                       experiment_condition,
                        day_rome,
                        segment_id,
                        MIN(timestamp_utc) AS start_ts_utc,
@@ -4006,11 +3963,10 @@ class ExecutiveControlModule(yarp.RFModule):
                        END AS empirical_drain_rate,
                        COUNT(*) AS n_samples
                 FROM segmented s
-                GROUP BY run_id, experiment_condition, day_rome, segment_id
+                GROUP BY run_id, day_rome, segment_id
                 HAVING COUNT(*) >= 2""",
             "v_active_cost_breakdown": """
-                SELECT run_id,
-                       experiment_condition, stimulus_label,
+                SELECT run_id, stimulus_label,
                        COUNT(*) AS n_events,
                        AVG(level_delta) AS mean_level_delta,
                        AVG(active_energy_cost) AS mean_active_cost,
@@ -4019,12 +3975,11 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM hunger_level_events
                 WHERE event_type = 'active_cost'
                   AND valid_for_analysis = 1
-                GROUP BY run_id, experiment_condition, stimulus_label""",
+                GROUP BY run_id, stimulus_label""",
             "v_hs3_episodes": """
                 WITH entries AS (
                     SELECT id AS entry_id,
                            run_id,
-                           experiment_condition,
                            day_rome,
                            is_test_run,
                            valid_for_analysis,
@@ -4054,7 +4009,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 )
                 SELECT e.entry_id AS episode_id,
                        e.run_id,
-                       e.experiment_condition,
+                       e.
                        e.day_rome,
                        e.is_test_run,
                        e.valid_for_analysis,
@@ -4159,13 +4114,12 @@ class ExecutiveControlModule(yarp.RFModule):
             "v_quality_interaction_missing_metadata": """
                 SELECT *
                 FROM interactions
-                WHERE run_id IS NULL OR experiment_condition IS NULL""",
+                WHERE run_id IS NULL""",
             "v_quality_condition_counts": """
-                SELECT run_id,
-                       experiment_condition, hunger_state_start,
+                SELECT run_id, hunger_state_start,
                        COUNT(*) AS interaction_count
                 FROM interactions
-                GROUP BY run_id, experiment_condition, hunger_state_start""",
+                GROUP BY run_id, hunger_state_start""",
         }
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
@@ -4234,7 +4188,7 @@ class ExecutiveControlModule(yarp.RFModule):
             conn.cursor().execute(
                 """INSERT INTO interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,
                  is_test_run,valid_for_analysis,
                  track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
@@ -4253,7 +4207,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
                     meta["run_id"],
-                    meta["experiment_condition"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data["track_id"], data["face_id"], data["initial_state"],
@@ -4290,7 +4243,7 @@ class ExecutiveControlModule(yarp.RFModule):
         conn.cursor().execute(
             """INSERT INTO interaction_turns
             (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-             monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+             monotonic_sec,run_elapsed_sec,day_rome,run_id,
              is_test_run,valid_for_analysis,
              turn_index,label,social_state,
              trigger_mode,hunger_state,user_utterance,assistant_utterance,hunger_mentioned,user_chars,
@@ -4310,7 +4263,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 ts["run_elapsed_sec"],
                 ts["day_rome"],
                 meta["run_id"],
-                meta["experiment_condition"],
                 meta["is_test_run"],
                 meta["valid_for_analysis"],
                 int(turn.get("turn_index", 0)),
@@ -4349,7 +4301,7 @@ class ExecutiveControlModule(yarp.RFModule):
             conn.cursor().execute(
                 """INSERT INTO reactive_interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,
                  is_test_run,valid_for_analysis,
                  type,track_id,name,payload,
                  hunger_state_before,stomach_level_before,hunger_state_after,stomach_level_after)
@@ -4364,7 +4316,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
                     meta["run_id"],
-                    meta["experiment_condition"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data.get("type"),
@@ -4389,7 +4340,7 @@ class ExecutiveControlModule(yarp.RFModule):
             conn.cursor().execute(
                 """INSERT INTO hunger_level_events
                 (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                 monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
+                 monotonic_sec,run_elapsed_sec,day_rome,run_id,
                  is_test_run,valid_for_analysis,
                  event_type,stimulus_type,stimulus_label,reason,
                  hunger_drive_enabled,hunger_state_before,hunger_state_after,
@@ -4406,7 +4357,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["run_elapsed_sec"],
                     ts["day_rome"],
                     meta["run_id"],
-                    meta["experiment_condition"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data.get("event_type"),

@@ -58,23 +58,12 @@ import yarp
 
 
 class ExperimentMetadata:
-    ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
-
-    def __init__(self, *, default_condition: str = "unknown", log_cb=None):
+    def __init__(self, *, log_cb=None):
         self._log = log_cb or (lambda level, msg: None)
         self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
-        self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
-        self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
-
-    @classmethod
-    def _normalize_condition(cls, value: Optional[str]) -> Optional[str]:
-        condition = (value or "").strip().lower()
-        if not condition:
-            return None
-        return condition if condition in cls.ALLOWED_CONDITIONS else "unknown"
 
     @staticmethod
     def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -87,16 +76,9 @@ class ExperimentMetadata:
             return False
         return default
 
-    def set_default_condition(self, condition: str) -> None:
-        if self._env_condition:
-            self.experiment_condition = self._env_condition
-            return
-        self.experiment_condition = self._normalize_condition(condition) or "unknown"
-
     def experiment_fields(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
-            "experiment_condition": self.experiment_condition,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
         }
@@ -150,7 +132,7 @@ class ChatBotModule(yarp.RFModule):
         self.module_name = "chatBot"
         self._running = True
         self._closed = False
-        self.experiment = ExperimentMetadata(default_condition="unknown", log_cb=self._log)
+        self.experiment = ExperimentMetadata(log_cb=self._log)
 
         # YARP ports
         self._hunger_port: Optional[yarp.BufferedPortBottle] = None
@@ -263,7 +245,6 @@ class ChatBotModule(yarp.RFModule):
                     run_elapsed_sec REAL NOT NULL,
                     day_rome TEXT NOT NULL,
                     run_id TEXT,
-                    experiment_condition TEXT,
                     is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                     valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                     chat_id INTEGER,
@@ -291,7 +272,6 @@ class ChatBotModule(yarp.RFModule):
                     run_elapsed_sec REAL NOT NULL,
                     day_rome TEXT NOT NULL,
                     run_id TEXT,
-                    experiment_condition TEXT,
                     is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                     valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                     chat_id INTEGER NOT NULL,
@@ -314,15 +294,14 @@ class ChatBotModule(yarp.RFModule):
                 CREATE INDEX IF NOT EXISTS idx_chat_events_type ON chat_events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_session ON chat_events(session_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_run ON chat_events(run_id);
-                CREATE INDEX IF NOT EXISTS idx_chat_events_condition ON chat_events(experiment_condition);
                 CREATE INDEX IF NOT EXISTS idx_chat_events_valid ON chat_events(valid_for_analysis);
-                CREATE INDEX IF NOT EXISTS idx_chat_events_run_cond ON chat_events(run_id, experiment_condition);
-                CREATE INDEX IF NOT EXISTS idx_chat_events_valid_cond ON chat_events(valid_for_analysis, experiment_condition);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_run_cond ON chat_events(run_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_events_valid_cond ON chat_events(valid_for_analysis);
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_ts ON chat_messages(timestamp_utc);
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_role ON chat_messages(role);
-                CREATE INDEX IF NOT EXISTS idx_chat_messages_run_cond ON chat_messages(run_id, experiment_condition);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_run_cond ON chat_messages(run_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_valid ON chat_messages(valid_for_analysis);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_seen ON subscribers(last_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_subscribers_last_proactive ON subscribers(last_proactive_at);
@@ -596,10 +575,6 @@ class ChatBotModule(yarp.RFModule):
         self._raw_hs = hs
         self._hs_source = source
         self._last_hs_update = time.time() if source == "port" else 0.0
-        if hs == "HS0":
-            self.experiment.set_default_condition("drive_disabled")
-        elif hs in {"HS1", "HS2", "HS3"}:
-            self.experiment.set_default_condition("drive_enabled")
 
     @staticmethod
     def _rpc_help_text() -> str:
@@ -1883,7 +1858,6 @@ class ChatBotModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 chat_id,
@@ -1908,8 +1882,7 @@ class ChatBotModule(yarp.RFModule):
             CREATE VIEW v_chat_daily_metrics AS
             SELECT
                 day_rome,
-                run_id,
-                experiment_condition, hs,
+                run_id, hs,
                 SUM(CASE WHEN event_type = 'user_message' THEN 1 ELSE 0 END) AS user_messages,
                 SUM(CASE WHEN event_type = 'assistant_reply' THEN 1 ELSE 0 END) AS bot_replies,
                 SUM(CASE WHEN event_type = 'hs3_proactive' THEN 1 ELSE 0 END) AS hs3_proactives,
@@ -1926,7 +1899,7 @@ class ChatBotModule(yarp.RFModule):
                 END AS hunger_mention_rate,
                 AVG(CASE WHEN event_type = 'assistant_reply' THEN assistant_chars END) AS avg_reply_chars
             FROM v_chat_events_clean
-            GROUP BY run_id, experiment_condition, day_rome, hs
+            GROUP BY run_id, day_rome, hs
             """
         )
 
@@ -1937,7 +1910,6 @@ class ChatBotModule(yarp.RFModule):
             SELECT
                 day_rome,
                 run_id,
-                experiment_condition,
                 chat_id,
                 hs,
                 COUNT(CASE WHEN event_type = 'user_message'    THEN 1 END) AS user_messages,
@@ -1947,7 +1919,7 @@ class ChatBotModule(yarp.RFModule):
                 COUNT(DISTINCT session_id)                                  AS sessions_today
             FROM v_chat_events_clean
             WHERE event_type IN ('user_message', 'assistant_reply')
-            GROUP BY run_id, experiment_condition, day_rome, chat_id, hs
+            GROUP BY run_id, day_rome, chat_id, hs
             """
         )
 
@@ -1958,7 +1930,6 @@ class ChatBotModule(yarp.RFModule):
             SELECT
                 session_id,
                 run_id,
-                experiment_condition,
                 MIN(day_rome)                                               AS day_rome,
                 chat_id,
                 MAX(hs)                                                     AS hs_peak,
@@ -1974,7 +1945,7 @@ class ChatBotModule(yarp.RFModule):
             FROM v_chat_events_clean
             WHERE session_id IS NOT NULL
               AND event_type IN ('user_message', 'assistant_reply')
-            GROUP BY run_id, experiment_condition, session_id
+            GROUP BY run_id, session_id
             """
         )
         self._db.execute("DROP VIEW IF EXISTS v_chat_messages_clean")
@@ -1991,7 +1962,6 @@ class ChatBotModule(yarp.RFModule):
                 run_elapsed_sec,
                 day_rome,
                 run_id,
-                experiment_condition,
                 is_test_run,
                 valid_for_analysis,
                 chat_id,
@@ -2015,13 +1985,13 @@ class ChatBotModule(yarp.RFModule):
         self._db.execute(
             """
             CREATE VIEW v_quality_chat_missing_metadata AS
-            SELECT 'chat_events' AS table_name, id, timestamp_utc, run_id, experiment_condition
+            SELECT 'chat_events' AS table_name, id, timestamp_utc, run_id
             FROM chat_events
-            WHERE run_id IS NULL OR experiment_condition IS NULL
+            WHERE run_id IS NULL
             UNION ALL
-            SELECT 'chat_messages' AS table_name, id, timestamp_utc, run_id, experiment_condition
+            SELECT 'chat_messages' AS table_name, id, timestamp_utc, run_id
             FROM chat_messages
-            WHERE run_id IS NULL OR experiment_condition IS NULL
+            WHERE run_id IS NULL
             """
         )
         self._db.execute("DROP VIEW IF EXISTS v_quality_chat_condition_counts")
@@ -2029,15 +1999,14 @@ class ChatBotModule(yarp.RFModule):
             """
             CREATE VIEW v_quality_chat_condition_counts AS
             SELECT source,
-                   run_id,
-                   experiment_condition, hs,
+                   run_id, hs,
                    COUNT(*) AS row_count
             FROM (
-                SELECT 'events' AS source, run_id, experiment_condition, hs FROM chat_events
+                SELECT 'events' AS source, run_id, hs FROM chat_events
                 UNION ALL
-                SELECT 'messages' AS source, run_id, experiment_condition, hs FROM chat_messages
+                SELECT 'messages' AS source, run_id, hs FROM chat_messages
             )
-            GROUP BY source, run_id, experiment_condition, hs
+            GROUP BY source, run_id, hs
             """
         )
 
@@ -2085,7 +2054,7 @@ class ChatBotModule(yarp.RFModule):
             INSERT INTO chat_events
             (timestamp_utc, timestamp_local, timezone, timestamp_epoch,
              monotonic_sec, run_elapsed_sec, day_rome,
-             run_id, experiment_condition,
+             run_id,
              is_test_run, valid_for_analysis,
              chat_id, event_type, hs,
              user_chars, assistant_chars, hunger_mentioned, llm_fallback,
@@ -2101,7 +2070,6 @@ class ChatBotModule(yarp.RFModule):
                 ts["run_elapsed_sec"],
                 ts["day_rome"],
                 meta["run_id"],
-                meta["experiment_condition"],
                 meta["is_test_run"],
                 meta["valid_for_analysis"],
                 int(chat_id) if chat_id is not None else None,
@@ -2146,7 +2114,7 @@ class ChatBotModule(yarp.RFModule):
             INSERT INTO chat_messages
             (timestamp_utc, timestamp_local, timezone, timestamp_epoch,
              monotonic_sec, run_elapsed_sec, day_rome,
-             run_id, experiment_condition,
+             run_id,
              is_test_run, valid_for_analysis,
              chat_id, session_id, turn_index, role, hs, text, text_chars,
              telegram_message_ts_utc, telegram_message_epoch,
@@ -2162,7 +2130,6 @@ class ChatBotModule(yarp.RFModule):
                 ts["run_elapsed_sec"],
                 ts["day_rome"],
                 meta["run_id"],
-                meta["experiment_condition"],
                 meta["is_test_run"],
                 meta["valid_for_analysis"],
                 int(chat_id),
