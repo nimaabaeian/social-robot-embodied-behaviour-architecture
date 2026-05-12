@@ -22,7 +22,6 @@
 """salienceNetwork.py - real-time face selection and interaction gating."""
 
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -52,18 +51,12 @@ _ALWAYSON_DIR = os.path.dirname(_MODULE_DIR)
 
 class ExperimentMetadata:
     ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
-    FALLBACK_SALT = "alwayson_local_participant_salt"
 
     def __init__(self, *, default_condition: str = "unknown", log_cb=None):
         self._log = log_cb or (lambda level, msg: None)
         self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
         self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
         self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
-        self.scenario_id = (os.getenv("ALWAYSON_SCENARIO_ID") or "").strip() or "unspecified"
-        self._participant_source = (os.getenv("ALWAYSON_PARTICIPANT_ID") or "").strip()
-        self._salt = (os.getenv("ALWAYSON_PARTICIPANT_SALT") or "").strip()
-        self._warned_fallback_salt = False
-        self.participant_id = self._hash_participant(self._participant_source) if self._participant_source else None
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
@@ -92,30 +85,10 @@ class ExperimentMetadata:
             return
         self.experiment_condition = self._normalize_condition(condition) or "unknown"
 
-    def _effective_salt(self) -> str:
-        if self._salt:
-            return self._salt
-        if not self._warned_fallback_salt:
-            self._log("WARNING", "ALWAYSON_PARTICIPANT_SALT not set; using deterministic local fallback salt")
-            self._warned_fallback_salt = True
-        return self.FALLBACK_SALT
-
-    def _hash_participant(self, value: Any) -> Optional[str]:
-        source = str(value).strip() if value is not None else ""
-        if not source or source.lower() in {"unknown", "none", "null"}:
-            return None
-        digest = hashlib.sha256(f"{self._effective_salt()}:{source}".encode("utf-8")).hexdigest()
-        return digest
-
-    def experiment_fields(self, extra_participant_source: Any = None) -> Dict[str, Any]:
-        participant = self.participant_id
-        if participant is None and extra_participant_source is not None:
-            participant = self._hash_participant(extra_participant_source)
+    def experiment_fields(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "experiment_condition": self.experiment_condition,
-            "scenario_id": self.scenario_id,
-            "participant_id": participant,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
         }
@@ -191,10 +164,10 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # Minimum IPS by social state
     SS_THRESHOLDS = {
-        "ss1": 1.10,  # Stranger: stricter hurdle (less proactive)
-        "ss2": 0.90,  # Known, not greeted: more proactive
-        "ss3": 1.00,  # Known, greeted, no talk: still proactive, but less than ss2
-        "ss4": 99.0,  # Ultimate: never proactive
+        "ss1": 1.10, # Stranger: stricter hurdle (less proactive)
+        "ss2": 0.90, # Known, not greeted: more proactive
+        "ss3": 1.00, # Known, greeted, no talk: still proactive, but less than ss2
+        "ss4": 99.0, # Ultimate: never proactive
     }
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
@@ -416,15 +389,13 @@ class SalienceNetworkModule(yarp.RFModule):
             if not _open_port(
                 "landmarks_port",
                 yarp.BufferedPortBottle,
-                f"/alwayson/{self.module_name}/landmarks:i",
-            ):
+                f"/alwayson/{self.module_name}/landmarks:i"):
                 return False
 
             if not _open_port(
                 "vision_cmd_port",
                 yarp.BufferedPortBottle,
-                f"/alwayson/{self.module_name}/targetCmd:o",
-            ):
+                f"/alwayson/{self.module_name}/targetCmd:o"):
                 return False
 
             if not _open_port(
@@ -524,13 +495,11 @@ class SalienceNetworkModule(yarp.RFModule):
             (
                 f"/alwayson/vision/landmarks:o -> /alwayson/{self.module_name}/landmarks:i",
                 lambda: self.landmarks_port is not None
-                and self.landmarks_port.getInputCount() > 0,
-            ),
+                and self.landmarks_port.getInputCount() > 0),
             (
                 f"/alwayson/{self.module_name}/targetCmd:o -> /alwayson/vision/targetCmd:i",
                 lambda: self.vision_cmd_port is not None
-                and self.vision_cmd_port.getOutputCount() > 0,
-            ),
+                and self.vision_cmd_port.getOutputCount() > 0),
         ]
 
         pending = [name for name, ok in checks if not ok()]
@@ -540,8 +509,7 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             self._log(
                 "INFO",
-                f"Startup without blocking; pending required ports: {pending_labels}",
-            )
+                f"Startup without blocking; pending required ports: {pending_labels}")
         else:
             self._log("INFO", "Required ports already connected.")
 
@@ -681,8 +649,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 else:
                     self._log(
                         "WARNING",
-                        f"'/faceTracker' replied unexpectedly to '{command}': {reply.toString()}",
-                    )
+                        f"'/faceTracker' replied unexpectedly to '{command}': {reply.toString()}")
                     return
             else:
                 if attempt < retries - 1:
@@ -690,8 +657,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 else:
                     self._log(
                         "WARNING",
-                        f"Could not connect to /faceTracker to send '{command}'",
-                    )
+                        f"Could not connect to /faceTracker to send '{command}'")
 
     def getPeriod(self) -> float:
         return self.period
@@ -736,9 +702,6 @@ class SalienceNetworkModule(yarp.RFModule):
 
             with self.state_lock:
                 self.current_faces = self._compute_face_states(faces)
-                faces_for_logging = [dict(face) for face in self.current_faces]
-
-            self._log_face_observations(faces_for_logging)
 
             current_time = time.time()
             pending_exec_check = None
@@ -816,8 +779,7 @@ class SalienceNetworkModule(yarp.RFModule):
                                             "last_greeted_ts": candidate.get(
                                                 "last_greeted_ts"
                                             ),
-                                        },
-                                    )
+                                        })
 
                                 if eligible and ss != "ss4":
                                     can_try_exec = True
@@ -852,8 +814,7 @@ class SalienceNetworkModule(yarp.RFModule):
                         "try: start_check "
                         f"t{pending_exec_check['track_id']} "
                         f"{pending_exec_check['person_id']}"
-                    ),
-                )
+                    ))
                 im_status = self._executive_control_status()
                 if isinstance(im_status, dict):
                     hs_val = im_status.get("hunger_state")
@@ -875,8 +836,7 @@ class SalienceNetworkModule(yarp.RFModule):
                                         for f in self.current_faces
                                         if f.get("track_id") == track_id
                                     ),
-                                    None,
-                                )
+                                    None)
                                 if candidate is not None:
                                     now2 = time.time()
                                     last_int = self.last_interaction_time.get(cd_key, 0)
@@ -890,10 +850,8 @@ class SalienceNetworkModule(yarp.RFModule):
                                             str(
                                                 candidate.get(
                                                     "person_id",
-                                                    candidate.get("face_id", "unknown"),
-                                                )
-                                            ),
-                                        )
+                                                    candidate.get("face_id", "unknown"))
+                                            ))
                                         if not self._is_face_known(exec_face_id):
                                             candidate["social_state"] = "ss1"
                                         candidate["exec_face_id"] = exec_face_id
@@ -905,18 +863,15 @@ class SalienceNetworkModule(yarp.RFModule):
                                         ips_val = float(candidate.get("ips", 0.0))
                                         self._log(
                                             "INFO",
-                                            f"try: rpc t{track_id} {person_id} {ss} ips={ips_val:.2f}",
-                                        )
+                                            f"try: rpc t{track_id} {person_id} {ss} ips={ips_val:.2f}")
                                         self._log(
                                             "INFO",
-                                            f"pick: t{track_id} {person_id} {ss} ips={ips_val:.2f}",
-                                        )
+                                            f"pick: t{track_id} {person_id} {ss} ips={ips_val:.2f}")
 
                                         self.interaction_thread = threading.Thread(
                                             target=self._run_interaction_thread,
                                             args=(dict(candidate),),
-                                            daemon=True,
-                                        )
+                                            daemon=True)
                                         self.interaction_thread.start()
                                     else:
                                         self._log(
@@ -926,13 +881,11 @@ class SalienceNetworkModule(yarp.RFModule):
                                                 f"cooldown_ok={now2 - last_int >= self._effective_cooldown()} "
                                                 f"eligible={bool(candidate.get('eligible', False))} "
                                                 f"ss={candidate.get('social_state', 'ss1')}"
-                                            ),
-                                        )
+                                            ))
                                 else:
                                     self._log(
                                         "INFO",
-                                        f"try: blocked candidate_missing t{track_id}",
-                                    )
+                                        f"try: blocked candidate_missing t{track_id}")
                             else:
                                 self._log("INFO", "try: blocked salience_busy")
                 else:
@@ -941,8 +894,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     if busy_mode or busy_reason:
                         self._log(
                             "INFO",
-                            f"try: blocked executive_busy mode={busy_mode} reason={busy_reason}",
-                        )
+                            f"try: blocked executive_busy mode={busy_mode} reason={busy_reason}")
                     else:
                         self._log("INFO", "try: blocked executive_busy")
 
@@ -1031,6 +983,15 @@ class SalienceNetworkModule(yarp.RFModule):
             return True
         return False
 
+    @staticmethod
+    def _parse_boolish(value: Any, *, default: bool = False) -> bool:
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
     def _log_face_ips_events(self, faces: List[Dict[str, Any]]) -> None:
         now = time.time()
         active_track_id = self._active_attention_track_id()
@@ -1073,70 +1034,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     "weight_cent": weights["cent"],
                     "weight_vel": weights["vel"],
                     "weight_gaze": weights["gaze"],
-                },
-            )
-
-    def _log_face_observations(self, faces: List[Dict[str, Any]]) -> None:
-        """Persist raw landmark-derived observations whenever at least one face is visible."""
-        if not faces:
-            return
-        active_track_id = self._active_attention_track_id()
-        with self._interaction_lock:
-            active_attempt_id = self._active_interaction_attempt_id
-            interaction_busy = int(bool(self.interaction_busy))
-            active_interaction_track_id = self._active_interaction_track_id
-            active_interaction_person_id = self._active_interaction_person_id
-
-        for face in faces:
-            bbox = face.get("bbox", (0.0, 0.0, 0.0, 0.0))
-            gaze = face.get("gaze_direction", (0.0, 0.0, 1.0))
-            try:
-                x, y, w, h = [float(v) for v in bbox]
-            except Exception:
-                x = y = w = h = 0.0
-            try:
-                gaze_x, gaze_y, gaze_z = [float(v) for v in gaze]
-            except Exception:
-                gaze_x, gaze_y, gaze_z = 0.0, 0.0, 1.0
-            track_id = int(face.get("track_id", -1))
-            person_id = str(face.get("person_id", face.get("face_id", "unknown")))
-            self._db_log(
-                "face_observation",
-                {
-                    "track_id": track_id,
-                    "face_id": str(face.get("face_id", "unknown")),
-                    "person_id": person_id,
-                    "bbox_x": x,
-                    "bbox_y": y,
-                    "bbox_w": w,
-                    "bbox_h": h,
-                    "bbox_area": w * h,
-                    "distance": str(face.get("distance", "UNKNOWN")),
-                    "attention": str(face.get("attention", "AWAY")),
-                    "gaze_x": gaze_x,
-                    "gaze_y": gaze_y,
-                    "gaze_z": gaze_z,
-                    "pitch": float(face.get("pitch", 0.0)),
-                    "yaw": float(face.get("yaw", 0.0)),
-                    "roll": float(face.get("roll", 0.0)),
-                    "cos_angle": float(face.get("cos_angle", 0.0)),
-                    "is_talking": int(face.get("is_talking", 0)),
-                    "time_in_view": float(face.get("time_in_view", 0.0)),
-                    "social_state": str(face.get("social_state", "ss1")),
-                    "is_known": int(bool(face.get("is_known", False))),
-                    "eligible": int(bool(face.get("eligible", False))),
-                    "ips": float(face.get("ips", 0.0)),
-                    "context_label": self.current_context_label,
-                    "interaction_busy": interaction_busy,
-                    "active_attempt_id": active_attempt_id,
-                    "active_interaction_track_id": active_interaction_track_id,
-                    "active_interaction_person_id": active_interaction_person_id,
-                    "is_attention_target": int(track_id == active_track_id),
-                    "is_interaction_target": int(
-                        interaction_busy and track_id == active_interaction_track_id
-                    ),
-                },
-            )
+                })
 
     # ==================== Context-Aware Cooldown ====================
 
@@ -1239,14 +1137,12 @@ class SalienceNetworkModule(yarp.RFModule):
                                 nested.get(1).asFloat64(),
                                 nested.get(2).asFloat64(),
                                 nested.get(3).asFloat64(),
-                                nested.get(4).asFloat64(),
-                            )
+                                nested.get(4).asFloat64())
                         elif key == "gaze_direction" and nested.size() >= 4:
                             data["gaze_direction"] = (
                                 nested.get(1).asFloat64(),
                                 nested.get(2).asFloat64(),
-                                nested.get(3).asFloat64(),
-                            )
+                                nested.get(3).asFloat64())
                     i += 1
                 else:
                     i += 1
@@ -1304,8 +1200,7 @@ class SalienceNetworkModule(yarp.RFModule):
             current_track_id = self._active_attention_track_id()
             current_face = next(
                 (f for f in faces if int(f.get("track_id", -1)) == current_track_id),
-                None,
-            )
+                None)
             if current_face is not None:
                 person_id = str(
                     current_face.get(
@@ -1546,8 +1441,7 @@ class SalienceNetworkModule(yarp.RFModule):
             return None
         return next(
             (f for f in self.current_faces if int(f.get("track_id", -1)) == track_id),
-            None,
-        )
+            None)
 
     def _hydrate_tracking_target(
         self, target: Optional[Dict[str, Any]]
@@ -1707,8 +1601,7 @@ class SalienceNetworkModule(yarp.RFModule):
         face_id = str(
             target.get(
                 "exec_face_id",
-                target.get("person_id", target.get("face_id", "unknown")),
-            )
+                target.get("person_id", target.get("face_id", "unknown")))
         )
         ss = target.get("social_state", "ss1")
         with self._interaction_lock:
@@ -1729,8 +1622,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 "abort_reason": None,
                 "duration_sec": 0.0,
                 "hunger_state": self._last_hunger_state,
-            },
-        )
+            })
         try:
             self._log("INFO", f"talk: start t{track_id} {face_id} {ss}")
 
@@ -1763,8 +1655,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 exec_interaction_id=exec_interaction_id,
                 duration_sec=duration_sec,
                 hunger_state=self._last_hunger_state,
-                is_proactive=1,
-            )
+                is_proactive=1)
             self._db_log("interaction_attempt", asdict(attempt))
             self._db_log(
                 "interaction_state_event",
@@ -1780,8 +1671,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     "abort_reason": abort_reason,
                     "duration_sec": duration_sec,
                     "hunger_state": self._last_hunger_state,
-                },
-            )
+                })
             with self._interaction_lock:
                 with self.state_lock:
                     self.interaction_busy = False
@@ -1858,8 +1748,7 @@ class SalienceNetworkModule(yarp.RFModule):
                             ):
                                 self._log(
                                     "INFO",
-                                    "exec: busy, skip",
-                                )
+                                    "exec: busy, skip")
                                 return None
                             return parsed
                         except json.JSONDecodeError as e:
@@ -1949,8 +1838,7 @@ class SalienceNetworkModule(yarp.RFModule):
                         "person_id": person_id,
                         "old_ss": initial_ss,
                         "new_ss": final_ss,
-                    },
-                )
+                    })
 
         except Exception as e:
             self._log("ERROR", f"process_interaction_result failed: {e}")
@@ -2064,8 +1952,7 @@ class SalienceNetworkModule(yarp.RFModule):
         outcome: str,
         reason: str,
         old_weights: Optional[Dict[str, float]],
-        new_weights: Optional[Dict[str, float]],
-    ) -> None:
+        new_weights: Optional[Dict[str, float]]) -> None:
         delta = self.HomeostaticLearningDelta(
             person_id=person_id,
             reward_delta=reward,
@@ -2087,8 +1974,7 @@ class SalienceNetworkModule(yarp.RFModule):
             new_prox=new_weights.get("prox") if new_weights else None,
             new_cent=new_weights.get("cent") if new_weights else None,
             new_vel=new_weights.get("vel") if new_weights else None,
-            new_gaze=new_weights.get("gaze") if new_weights else None,
-        )
+            new_gaze=new_weights.get("gaze") if new_weights else None)
         self._db_log("homeostatic_learning_change", asdict(delta))
 
     def _apply_homeostatic_learning(self, result: Dict[str, Any], person_id: str) -> None:
@@ -2149,8 +2035,7 @@ class SalienceNetworkModule(yarp.RFModule):
                     self.MAX_WEIGHT_SHIFT_PER_INTERACTION,
                     self.HOMEOSTATIC_WEIGHT_SHIFT_RATE
                     * abs(reward)
-                    * self.HOMEOSTATIC_REWARD_SCALE,
-                )
+                    * self.HOMEOSTATIC_REWARD_SCALE)
                 if reward > epsilon:
                     outcome = "drive_reduced"
                     weights["prox"] = self._clamp01(weights["prox"] + shift)
@@ -2195,8 +2080,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self._log_homeostatic_delta(result, person_id, reward, outcome, reason, old_weights, weights)
         self._log(
             "INFO",
-            f"homeostatic learning: {person_id} reward={reward:.2f} outcome={outcome} shift={shift:.4f}",
-        )
+            f"homeostatic learning: {person_id} reward={reward:.2f} outcome={outcome} shift={shift:.4f}")
 
     # ==================== Last Greeted (fresh read) ====================
 
@@ -2285,16 +2169,14 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             learning_raw = self._load_json(
                 self.homeostatic_learning_path,
-                {"schema_version": 1, "people": {}},
-            )
+                {"schema_version": 1, "people": {}})
             people = learning_raw.get("people", {}) if isinstance(learning_raw, dict) else {}
             self.homeostatic_profiles = people if isinstance(people, dict) else {}
         self._log(
             "INFO",
             f"{log_prefix} – greeted:{len(self.greeted_today)} "
             f"talked:{len(self.talked_today)} "
-            f"homeostatic_profiles:{len(self.homeostatic_profiles)}",
-        )
+            f"homeostatic_profiles:{len(self.homeostatic_profiles)}")
 
     def _load_all_json_files(self):
         self._load_memory_from_disk("Loaded")
@@ -2415,8 +2297,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER NOT NULL,
@@ -2430,52 +2310,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 reason TEXT,
                 last_greeted_ts TEXT
             )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS face_observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_utc TEXT NOT NULL,
-                timestamp_local TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                timestamp_epoch REAL NOT NULL,
-                monotonic_sec REAL NOT NULL,
-                run_elapsed_sec REAL NOT NULL,
-                day_rome TEXT NOT NULL,
-                run_id TEXT,
-                experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
-                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
-                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
-                track_id INTEGER NOT NULL,
-                face_id TEXT NOT NULL,
-                person_id TEXT NOT NULL,
-                bbox_x REAL NOT NULL,
-                bbox_y REAL NOT NULL,
-                bbox_w REAL NOT NULL,
-                bbox_h REAL NOT NULL,
-                bbox_area REAL NOT NULL,
-                distance TEXT,
-                attention TEXT,
-                gaze_x REAL,
-                gaze_y REAL,
-                gaze_z REAL,
-                pitch REAL,
-                yaw REAL,
-                roll REAL,
-                cos_angle REAL,
-                is_talking INTEGER NOT NULL CHECK (is_talking IN (0,1)),
-                time_in_view REAL,
-                social_state TEXT NOT NULL CHECK (social_state IN ('ss1','ss2','ss3','ss4')),
-                is_known INTEGER NOT NULL CHECK (is_known IN (0,1)),
-                eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
-                ips REAL,
-                context_label INTEGER,
-                interaction_busy INTEGER NOT NULL CHECK (interaction_busy IN (0,1)),
-                active_attempt_id TEXT,
-                active_interaction_track_id INTEGER,
-                active_interaction_person_id TEXT,
-                is_attention_target INTEGER NOT NULL CHECK (is_attention_target IN (0,1)),
-                is_interaction_target INTEGER NOT NULL CHECK (is_interaction_target IN (0,1))
-            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS face_ips_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_utc TEXT NOT NULL,
@@ -2487,8 +2321,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER,
@@ -2528,8 +2360,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 person_id TEXT NOT NULL,
@@ -2547,8 +2377,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 person_id TEXT NOT NULL,
@@ -2584,8 +2412,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 attempt_id TEXT NOT NULL UNIQUE,
@@ -2612,8 +2438,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 event_type TEXT NOT NULL CHECK (event_type IN ('start','end')),
@@ -2629,15 +2453,14 @@ class SalienceNetworkModule(yarp.RFModule):
                 hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3'))
             )""")
             c.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','3') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','4') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             for key, value in self.experiment.experiment_fields().items():
                 c.execute(
                     "INSERT INTO schema_info(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, str(value) if value is not None else ""),
-                )
+                    (key, str(value) if value is not None else ""))
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_time ON target_selections(timestamp_utc)"
             )
@@ -2652,18 +2475,6 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_valid_cond ON target_selections(valid_for_analysis, experiment_condition)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_observations_time ON face_observations(timestamp_utc)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_observations_track ON face_observations(track_id)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_observations_attempt ON face_observations(active_attempt_id)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_face_observations_run_cond ON face_observations(run_id, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp_utc)"
@@ -2699,12 +2510,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_ia_condition ON interaction_attempts(experiment_condition)"
             )
             c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_scenario ON interaction_attempts(scenario_id)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_participant ON interaction_attempts(participant_id)"
-            )
-            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ia_valid ON interaction_attempts(valid_for_analysis)"
             )
             c.execute(
@@ -2712,9 +2517,6 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ia_valid_cond ON interaction_attempts(valid_for_analysis, experiment_condition)"
-            )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ia_scenario_cond ON interaction_attempts(scenario_id, experiment_condition)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_state_events_attempt ON interaction_state_events(attempt_id)"
@@ -2756,8 +2558,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome,
                 run_id,
                 experiment_condition,
-                scenario_id,
-                participant_id,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2791,9 +2591,7 @@ class SalienceNetworkModule(yarp.RFModule):
             SELECT
                 day_rome,
                 run_id,
-                experiment_condition,
-                scenario_id,
-                hunger_state,
+                experiment_condition, hunger_state,
                 start_ss,
                 COUNT(*)                                                          AS launched,
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END)                     AS completed,
@@ -2808,7 +2606,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 SUM(CASE WHEN abort_reason IS NOT NULL THEN 1 ELSE 0 END)        AS aborted_count,
                 AVG(duration_sec)                                                 AS avg_duration_sec
             FROM v_interaction_attempts_clean
-            GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state, start_ss
+            GROUP BY run_id, experiment_condition, day_rome, hunger_state, start_ss
             """
         )
 
@@ -2826,8 +2624,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome,
                 run_id,
                 experiment_condition,
-                scenario_id,
-                participant_id,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2857,57 +2653,6 @@ class SalienceNetworkModule(yarp.RFModule):
             FROM face_ips_events
             """
         )
-        c.execute("DROP VIEW IF EXISTS v_face_observations")
-        c.execute(
-            """
-            CREATE VIEW v_face_observations AS
-            SELECT
-                timestamp_utc,
-                timestamp_local,
-                timezone,
-                timestamp_epoch,
-                monotonic_sec,
-                run_elapsed_sec,
-                day_rome,
-                run_id,
-                experiment_condition,
-                scenario_id,
-                participant_id,
-                is_test_run,
-                valid_for_analysis,
-                track_id,
-                face_id,
-                person_id,
-                bbox_x,
-                bbox_y,
-                bbox_w,
-                bbox_h,
-                bbox_area,
-                distance,
-                attention,
-                gaze_x,
-                gaze_y,
-                gaze_z,
-                pitch,
-                yaw,
-                roll,
-                cos_angle,
-                is_talking,
-                time_in_view,
-                social_state,
-                is_known,
-                eligible,
-                ips,
-                context_label,
-                interaction_busy,
-                active_attempt_id,
-                active_interaction_track_id,
-                active_interaction_person_id,
-                is_attention_target,
-                is_interaction_target
-            FROM face_observations
-            """
-        )
         c.execute("DROP VIEW IF EXISTS v_target_selections_clean")
         c.execute(
             """
@@ -2922,8 +2667,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome,
                 run_id,
                 experiment_condition,
-                scenario_id,
-                participant_id,
                 is_test_run,
                 valid_for_analysis,
                 track_id,
@@ -2954,8 +2697,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome,
                 run_id,
                 experiment_condition,
-                scenario_id,
-                participant_id,
                 is_test_run,
                 valid_for_analysis,
                 person_id,
@@ -2997,8 +2738,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 day_rome,
                 run_id,
                 experiment_condition,
-                scenario_id,
-                participant_id,
                 is_test_run,
                 valid_for_analysis,
                 event_type,
@@ -3019,13 +2758,13 @@ class SalienceNetworkModule(yarp.RFModule):
         c.execute(
             """
             CREATE VIEW v_quality_salience_missing_metadata AS
-            SELECT 'interaction_attempts' AS table_name, id, timestamp_utc, run_id, experiment_condition, scenario_id
+            SELECT 'interaction_attempts' AS table_name, id, timestamp_utc, run_id, experiment_condition
             FROM interaction_attempts
-            WHERE run_id IS NULL OR experiment_condition IS NULL OR scenario_id IS NULL
+            WHERE run_id IS NULL OR experiment_condition IS NULL
             UNION ALL
-            SELECT 'face_ips_events' AS table_name, id, timestamp_utc, run_id, experiment_condition, scenario_id
+            SELECT 'face_ips_events' AS table_name, id, timestamp_utc, run_id, experiment_condition
             FROM face_ips_events
-            WHERE run_id IS NULL OR experiment_condition IS NULL OR scenario_id IS NULL
+            WHERE run_id IS NULL OR experiment_condition IS NULL
             """
         )
         c.execute("DROP VIEW IF EXISTS v_quality_attempt_counts")
@@ -3033,12 +2772,10 @@ class SalienceNetworkModule(yarp.RFModule):
             """
             CREATE VIEW v_quality_attempt_counts AS
             SELECT run_id,
-                   experiment_condition,
-                   scenario_id,
-                   hunger_state,
+                   experiment_condition, hunger_state,
                    COUNT(*) AS attempt_count
             FROM interaction_attempts
-            GROUP BY run_id, experiment_condition, scenario_id, hunger_state
+            GROUP BY run_id, experiment_condition, hunger_state
             """
         )
 
@@ -3046,8 +2783,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self,
         *,
         epoch: Optional[float] = None,
-        monotonic_sec: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        monotonic_sec: Optional[float] = None) -> Dict[str, Any]:
         now_epoch = time.time()
         now_mono = time.monotonic()
         mono = float(now_mono if monotonic_sec is None else monotonic_sec)
@@ -3067,8 +2803,7 @@ class SalienceNetworkModule(yarp.RFModule):
     def _db_log(self, table: str, data: Dict):
         for key, value in self._time_fields().items():
             data.setdefault(key, value)
-        participant_source = data.get("person_id") or data.get("face_id")
-        for key, value in self.experiment.experiment_fields(participant_source).items():
+        for key, value in self.experiment.experiment_fields().items():
             data.setdefault(key, value)
         self._db_queue.put((table, data))
 
@@ -3116,10 +2851,10 @@ class SalienceNetworkModule(yarp.RFModule):
                         """INSERT INTO target_selections
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,track_id,face_id,
+                         is_test_run,valid_for_analysis,track_id,face_id,
                          person_id,bbox_area,ips,ss,eligible,context_label,reason,
                          last_greeted_ts)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3130,8 +2865,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["track_id"],
@@ -3143,81 +2876,20 @@ class SalienceNetworkModule(yarp.RFModule):
                             int(data["eligible"]),
                             data.get("context_label"),
                             data.get("reason"),
-                            data.get("last_greeted_ts"),
-                        ),
-                    )
-                elif table == "face_observation":
-                    c.execute(
-                        """INSERT INTO face_observations
-                        (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-                         monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,track_id,face_id,
-                         person_id,bbox_x,bbox_y,bbox_w,bbox_h,bbox_area,distance,
-                         attention,gaze_x,gaze_y,gaze_z,pitch,yaw,roll,cos_angle,
-                         is_talking,time_in_view,social_state,is_known,eligible,ips,
-                         context_label,interaction_busy,active_attempt_id,
-                         active_interaction_track_id,active_interaction_person_id,
-                         is_attention_target,is_interaction_target)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            data["timestamp_utc"],
-                            data["timestamp_local"],
-                            data["timezone"],
-                            data["timestamp_epoch"],
-                            data["monotonic_sec"],
-                            data["run_elapsed_sec"],
-                            data["day_rome"],
-                            data.get("run_id"),
-                            data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
-                            int(data.get("is_test_run", 0)),
-                            int(data.get("valid_for_analysis", 1)),
-                            data.get("track_id"),
-                            data.get("face_id"),
-                            data.get("person_id"),
-                            data.get("bbox_x"),
-                            data.get("bbox_y"),
-                            data.get("bbox_w"),
-                            data.get("bbox_h"),
-                            data.get("bbox_area"),
-                            data.get("distance"),
-                            data.get("attention"),
-                            data.get("gaze_x"),
-                            data.get("gaze_y"),
-                            data.get("gaze_z"),
-                            data.get("pitch"),
-                            data.get("yaw"),
-                            data.get("roll"),
-                            data.get("cos_angle"),
-                            int(data.get("is_talking", 0)),
-                            data.get("time_in_view"),
-                            data.get("social_state"),
-                            int(data.get("is_known", 0)),
-                            int(data.get("eligible", 0)),
-                            data.get("ips"),
-                            data.get("context_label"),
-                            int(data.get("interaction_busy", 0)),
-                            data.get("active_attempt_id"),
-                            data.get("active_interaction_track_id"),
-                            data.get("active_interaction_person_id"),
-                            int(data.get("is_attention_target", 0)),
-                            int(data.get("is_interaction_target", 0)),
-                        ),
-                    )
+                            data.get("last_greeted_ts")))
                 elif table == "face_ips_event":
                     c.execute(
                         """INSERT INTO face_ips_events
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,
+                         is_test_run,valid_for_analysis,
                          track_id,face_id,person_id,social_state,is_known,eligible,
                          is_active_target,bbox_area,ips,ips_before_habituation,
                          habituation_applied,habituation_multiplier,habituation_elapsed_sec,
                          habituation_ips_delta,stimulus_type,context_label,
                          prox_score,cent_score,vel_score,gaze_score,
                          weight_prox,weight_cent,weight_vel,weight_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3228,8 +2900,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("track_id"),
@@ -3255,17 +2925,15 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("weight_prox"),
                             data.get("weight_cent"),
                             data.get("weight_vel"),
-                            data.get("weight_gaze"),
-                        ),
-                    )
+                            data.get("weight_gaze")))
                 elif table == "ss_change":
                     c.execute(
                         """INSERT INTO ss_changes
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,
+                         is_test_run,valid_for_analysis,
                          person_id,old_ss,new_ss)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3276,27 +2944,23 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["person_id"],
                             data["old_ss"],
-                            data["new_ss"],
-                        ),
-                    )
+                            data["new_ss"]))
                 elif table == "homeostatic_learning_change":
                     c.execute(
                         """INSERT INTO homeostatic_learning_changes
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,
+                         is_test_run,valid_for_analysis,
                          person_id,reward_delta,outcome,reason,trigger_mode,
                          hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
                          active_energy_cost,meals_eaten_count,n_turns,exec_interaction_id,
                          old_prox,old_cent,old_vel,old_gaze,
                          new_prox,new_cent,new_vel,new_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3307,8 +2971,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data["person_id"],
@@ -3331,19 +2993,17 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("new_prox"),
                             data.get("new_cent"),
                             data.get("new_vel"),
-                            data.get("new_gaze"),
-                        ),
-                    )
+                            data.get("new_gaze")))
                 elif table == "interaction_attempt":
                     c.execute(
                         """INSERT INTO interaction_attempts
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,
+                         is_test_run,valid_for_analysis,
                          attempt_id,track_id,face_id,person_id,start_ss,
                          success,final_state,abort_reason,exec_interaction_id,duration_sec,
                          hunger_state,is_proactive)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3354,8 +3014,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("attempt_id"),
@@ -3369,19 +3027,17 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("exec_interaction_id"),
                             data.get("duration_sec"),
                             data.get("hunger_state", "HS0"),
-                            int(data.get("is_proactive", 1)),
-                        ),
-                    )
+                            int(data.get("is_proactive", 1))))
                 elif table == "interaction_state_event":
                     c.execute(
                         """INSERT INTO interaction_state_events
                         (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                         scenario_id,participant_id,is_test_run,valid_for_analysis,
+                         is_test_run,valid_for_analysis,
                          event_type,attempt_id,
                          exec_interaction_id,track_id,face_id,person_id,social_state,
                          success,abort_reason,duration_sec,hunger_state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -3392,8 +3048,6 @@ class SalienceNetworkModule(yarp.RFModule):
                             data["day_rome"],
                             data.get("run_id"),
                             data.get("experiment_condition"),
-                            data.get("scenario_id"),
-                            data.get("participant_id"),
                             int(data.get("is_test_run", 0)),
                             int(data.get("valid_for_analysis", 1)),
                             data.get("event_type"),
@@ -3406,9 +3060,7 @@ class SalienceNetworkModule(yarp.RFModule):
                             int(data["success"]) if data.get("success") is not None else None,
                             data.get("abort_reason"),
                             data.get("duration_sec"),
-                            data.get("hunger_state"),
-                        ),
-                    )
+                            data.get("hunger_state")))
                 conn.commit()
             except Exception as e:
                 self._log("ERROR", f"DB write failed ({table}): {e}")
@@ -3491,8 +3143,7 @@ def _run_module_with_main_thread_signals(
                 2,
                 f"\n[INFO] SalienceNetworkModule received signal {signum}, shutting down.\n".encode(
                     "utf-8", errors="replace"
-                ),
-            )
+                ))
         except Exception:
             pass
 
@@ -3507,8 +3158,7 @@ def _run_module_with_main_thread_signals(
     run_thread = threading.Thread(
         target=_runner,
         name=f"{module.module_name}-runModule",
-        daemon=True,
-    )
+        daemon=True)
     run_thread.start()
 
     interrupted = False

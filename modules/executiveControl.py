@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import fcntl
-import hashlib
 import json
 import os
 import queue
@@ -62,18 +61,12 @@ import yarp
 
 class ExperimentMetadata:
     ALLOWED_CONDITIONS = {"drive_enabled", "drive_disabled", "ablation", "pilot", "unknown"}
-    FALLBACK_SALT = "alwayson_local_participant_salt"
 
     def __init__(self, *, default_condition: str = "unknown", log_cb=None):
         self._log = log_cb or (lambda level, msg: None)
         self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
         self._env_condition = self._normalize_condition(os.getenv("ALWAYSON_EXPERIMENT_CONDITION"))
         self.experiment_condition = self._env_condition or self._normalize_condition(default_condition) or "unknown"
-        self.scenario_id = (os.getenv("ALWAYSON_SCENARIO_ID") or "").strip() or "unspecified"
-        self._participant_source = (os.getenv("ALWAYSON_PARTICIPANT_ID") or "").strip()
-        self._salt = (os.getenv("ALWAYSON_PARTICIPANT_SALT") or "").strip()
-        self._warned_fallback_salt = False
-        self.participant_id = self._hash_participant(self._participant_source) if self._participant_source else None
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
@@ -102,30 +95,10 @@ class ExperimentMetadata:
             return
         self.experiment_condition = self._normalize_condition(condition) or "unknown"
 
-    def _effective_salt(self) -> str:
-        if self._salt:
-            return self._salt
-        if not self._warned_fallback_salt:
-            self._log("WARNING", "ALWAYSON_PARTICIPANT_SALT not set; using deterministic local fallback salt")
-            self._warned_fallback_salt = True
-        return self.FALLBACK_SALT
-
-    def _hash_participant(self, value: Any) -> Optional[str]:
-        source = str(value).strip() if value is not None else ""
-        if not source or source.lower() in {"unknown", "none", "null"}:
-            return None
-        digest = hashlib.sha256(f"{self._effective_salt()}:{source}".encode("utf-8")).hexdigest()
-        return digest
-
-    def experiment_fields(self, extra_participant_source: Any = None) -> Dict[str, Any]:
-        participant = self.participant_id
-        if participant is None and extra_participant_source is not None:
-            participant = self._hash_participant(extra_participant_source)
+    def experiment_fields(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "experiment_condition": self.experiment_condition,
-            "scenario_id": self.scenario_id,
-            "participant_id": participant,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
         }
@@ -151,8 +124,7 @@ class HungerModel:
         hungry_threshold:   float = 60.0,
         starving_threshold: float = 25.0,
         persist_file:       Optional[str] = None,
-        log_cb=None,
-    ):
+        log_cb=None):
         self.drain_hours        = drain_hours
         self.hungry_threshold   = hungry_threshold
         self.starving_threshold = starving_threshold
@@ -207,8 +179,7 @@ class HungerModel:
                             "last_feed_ts":      self.last_feed_ts,
                             "last_feed_payload": self.last_feed_payload,
                         },
-                        fh,
-                    )
+                        fh)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, self.persist_file)
@@ -293,8 +264,7 @@ class HungerModel:
                 level             = self.level,
                 state             = state,
                 last_feed_ts      = self.last_feed_ts,
-                last_feed_payload = self.last_feed_payload,
-            )
+                last_feed_payload = self.last_feed_payload)
 
     def state(self) -> str:
         return self.snapshot().state
@@ -392,8 +362,7 @@ class LatencyTrace:
         turn_index: int,
         utterance: str = "",
         request_id: Optional[int] = None,
-        started_mono: Optional[float] = None,
-    ):
+        started_mono: Optional[float] = None):
         self.module        = module
         self.label         = label
         self.turn_index    = turn_index
@@ -424,8 +393,7 @@ class LatencyTrace:
             at_mono=at_mono,
             started_mono=self.started_mono,
             request_id=self.request_id,
-            **fields,
-        )
+            **fields)
         return at_mono
 
     @staticmethod
@@ -438,8 +406,7 @@ class LatencyTrace:
         at_mono: float,
         started_mono: float,
         request_id: Optional[int] = None,
-        **fields: Any,
-    ) -> None:
+        **fields: Any) -> None:
         parts = [
             f"label={label}",
             f"turn={turn_index}",
@@ -455,15 +422,6 @@ class LatencyTrace:
                 parts.append(f"{key}={value:.3f}")
             else:
                 parts.append(f"{key}={value}")
-        module._record_latency_event(
-            label=label,
-            turn_index=turn_index,
-            event_type=event,
-            at_mono=at_mono,
-            started_mono=started_mono,
-            request_id=request_id,
-            fields=fields,
-        )
         module._log("INFO", "LATENCY " + " ".join(parts))
 
 
@@ -482,8 +440,7 @@ class SpeechCoordinator:
         *,
         label: str,
         trace: Optional[LatencyTrace] = None,
-        request_id: Optional[int] = None,
-    ) -> Optional[SpeechDispatch]:
+        request_id: Optional[int] = None) -> Optional[SpeechDispatch]:
         if not text:
             return None
         ok = self.module._speak(text)
@@ -505,8 +462,7 @@ class SpeechCoordinator:
                 trace_label=trace.label if trace is not None else "",
                 trace_turn_index=trace.turn_index if trace is not None else 0,
                 trace_started_mono=trace.started_mono if trace is not None else now,
-                trace_request_id=trace.request_id if trace is not None else request_id,
-            )
+                trace_request_id=trace.request_id if trace is not None else request_id)
             self._current = dispatch
 
         if trace is not None:
@@ -517,8 +473,7 @@ class SpeechCoordinator:
                 tts_label=label,
                 tts_est_sec=wait,
                 text_chars=len(text),
-                time_to_first_speech_sec=now - trace.started_mono,
-            )
+                time_to_first_speech_sec=now - trace.started_mono)
         return dispatch
 
     def current(self) -> Optional[SpeechDispatch]:
@@ -535,8 +490,7 @@ class SpeechCoordinator:
     def maybe_mark_done(
         self,
         trace: Optional[LatencyTrace] = None,
-        dispatch: Optional[SpeechDispatch] = None,
-    ) -> bool:
+        dispatch: Optional[SpeechDispatch] = None) -> bool:
         emit: Optional[SpeechDispatch] = None
         with self._lock:
             cur = dispatch or self._current
@@ -553,8 +507,7 @@ class SpeechCoordinator:
                     at_mono,
                     speech_id=emit.speech_id,
                     tts_label=emit.label,
-                    turn_total_sec=at_mono - trace.started_mono,
-                )
+                    turn_total_sec=at_mono - trace.started_mono)
             elif emit.trace_label:
                 LatencyTrace.log_detached(
                     self.module,
@@ -566,16 +519,14 @@ class SpeechCoordinator:
                     request_id=emit.trace_request_id,
                     speech_id=emit.speech_id,
                     tts_label=emit.label,
-                    turn_total_sec=at_mono - emit.trace_started_mono,
-                )
+                    turn_total_sec=at_mono - emit.trace_started_mono)
         return emit is not None
 
     def log_interruption(
         self,
         *,
         reason: str,
-        trace: Optional[LatencyTrace] = None,
-    ) -> bool:
+        trace: Optional[LatencyTrace] = None) -> bool:
         cur = self.current()
         if cur is None:
             return False
@@ -587,16 +538,14 @@ class SpeechCoordinator:
                 "interruption",
                 reason=reason,
                 speech_id=cur.speech_id,
-                tts_remaining_sec=remaining,
-            )
+                tts_remaining_sec=remaining)
         return True
 
     def wait_until_idle(
         self,
         *,
         trace: Optional[LatencyTrace] = None,
-        poll_sec: float = 0.05,
-    ) -> None:
+        poll_sec: float = 0.05) -> None:
         logged_wait = False
         while True:
             remaining = self.remaining_sec()
@@ -618,8 +567,7 @@ class LatestOnlyLlmWorker:
         self,
         module: "ExecutiveControlModule",
         *,
-        max_parallel: int = 3,
-    ):
+        max_parallel: int = 3):
         self.module        = module
         self._max_parallel = max(1, max_parallel)
         self._lock         = threading.Lock()
@@ -631,8 +579,7 @@ class LatestOnlyLlmWorker:
         self._stop_event = threading.Event()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self._max_parallel,
-            thread_name_prefix="llm-turn",
-        )
+            thread_name_prefix="llm-turn")
 
     def close(self) -> None:
         self._stop_event.set()
@@ -673,8 +620,7 @@ class LatestOnlyLlmWorker:
             self.module._log(
                 "INFO",
                 f"llm_worker: request {assigned.request_id} pending "
-                f"(active={active_count} replaced_pending={pending_replaced})",
-            )
+                f"(active={active_count} replaced_pending={pending_replaced})")
         return assigned.request_id
 
     def _start_request(self, request: LlmTurnRequest) -> None:
@@ -731,8 +677,7 @@ class LatestOnlyLlmWorker:
                     turn_index=request.turn_index,
                     interaction_id=request.interaction_id,
                     at_mono=time.monotonic(),
-                    error="client_not_initialized",
-                ))
+                    error="client_not_initialized"))
                 return
 
             messages: List[Dict[str, str]] = [{"role": "system", "content": request.system}]
@@ -762,8 +707,7 @@ class LatestOnlyLlmWorker:
             resp = self.module.llm_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
             self.module._log(
                 "INFO",
-                f"llm_worker[{request.request_id}]: sync create() returned in {time.monotonic()-started:.2f}s model={getattr(resp, 'model', '?')}",
-            )
+                f"llm_worker[{request.request_id}]: sync create() returned in {time.monotonic()-started:.2f}s model={getattr(resp, 'model', '?')}")
             choice = resp.choices[0]
             text = (choice.message.content or "").strip()
             if not self.is_latest(request.request_id):
@@ -772,8 +716,7 @@ class LatestOnlyLlmWorker:
                     request_id=request.request_id,
                     turn_index=request.turn_index,
                     interaction_id=request.interaction_id,
-                    at_mono=time.monotonic(),
-                ))
+                    at_mono=time.monotonic()))
                 return
             if text and len(text) < request.max_len:
                 now = time.monotonic()
@@ -784,8 +727,7 @@ class LatestOnlyLlmWorker:
             self.module._log(
                 "WARNING",
                 f"llm_worker[{request.request_id}]: rejected response"
-                f" finish_reason={finish_reason} text_len={len(text)} max_len={request.max_len}",
-            )
+                f" finish_reason={finish_reason} text_len={len(text)} max_len={request.max_len}")
             err = "empty_response_length" if finish_reason == "length" else "empty_response"
             self._emit(LlmTurnEvent(
                 kind="error",
@@ -793,8 +735,7 @@ class LatestOnlyLlmWorker:
                 turn_index=request.turn_index,
                 interaction_id=request.interaction_id,
                 at_mono=time.monotonic(),
-                error=err,
-            ))
+                error=err))
         except Exception as e:
             self._emit(LlmTurnEvent(
                 kind="error",
@@ -802,8 +743,7 @@ class LatestOnlyLlmWorker:
                 turn_index=request.turn_index,
                 interaction_id=request.interaction_id,
                 at_mono=time.monotonic(),
-                error=str(e),
-            ))
+                error=str(e)))
 
     def _run_streaming_request(self, request: LlmTurnRequest, kwargs: Dict[str, Any]) -> None:
         kwargs["stream"] = True
@@ -818,8 +758,7 @@ class LatestOnlyLlmWorker:
             stream = self.module.llm_client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
             self.module._log(
                 "INFO",
-                f"llm_worker[{request.request_id}]: stream opened in {time.monotonic()-started:.2f}s",
-            )
+                f"llm_worker[{request.request_id}]: stream opened in {time.monotonic()-started:.2f}s")
             for chunk in stream:
                 if self._stop_event.is_set():
                     self._emit(LlmTurnEvent(
@@ -827,8 +766,7 @@ class LatestOnlyLlmWorker:
                         request_id=request.request_id,
                         turn_index=request.turn_index,
                         interaction_id=request.interaction_id,
-                        at_mono=time.monotonic(),
-                    ))
+                        at_mono=time.monotonic()))
                     return
                 if not self.is_latest(request.request_id):
                     self._emit(LlmTurnEvent(
@@ -836,8 +774,7 @@ class LatestOnlyLlmWorker:
                         request_id=request.request_id,
                         turn_index=request.turn_index,
                         interaction_id=request.interaction_id,
-                        at_mono=time.monotonic(),
-                    ))
+                        at_mono=time.monotonic()))
                     return
 
                 if not getattr(chunk, "choices", None):
@@ -854,8 +791,7 @@ class LatestOnlyLlmWorker:
                             request_id=request.request_id,
                             turn_index=request.turn_index,
                             interaction_id=request.interaction_id,
-                            at_mono=first_token_mono,
-                        ))
+                            at_mono=first_token_mono))
                 if getattr(choice, "finish_reason", None):
                     finish_reason = str(choice.finish_reason)
 
@@ -866,8 +802,7 @@ class LatestOnlyLlmWorker:
                     request_id=request.request_id,
                     turn_index=request.turn_index,
                     interaction_id=request.interaction_id,
-                    at_mono=time.monotonic(),
-                ))
+                    at_mono=time.monotonic()))
                 return
 
             if text and len(text) < request.max_len:
@@ -878,16 +813,14 @@ class LatestOnlyLlmWorker:
                         request_id=request.request_id,
                         turn_index=request.turn_index,
                         interaction_id=request.interaction_id,
-                        at_mono=end_mono,
-                    ))
+                        at_mono=end_mono))
                 self._emit(LlmTurnEvent(
                     kind="final",
                     request_id=request.request_id,
                     turn_index=request.turn_index,
                     interaction_id=request.interaction_id,
                     at_mono=end_mono,
-                    text=text,
-                ))
+                    text=text))
                 return
 
             err = "empty_response_length" if finish_reason == "length" else "empty_response"
@@ -897,8 +830,7 @@ class LatestOnlyLlmWorker:
                 turn_index=request.turn_index,
                 interaction_id=request.interaction_id,
                 at_mono=time.monotonic(),
-                error=err,
-            ))
+                error=err))
         except Exception as e:
             self._emit(LlmTurnEvent(
                 kind="error",
@@ -906,8 +838,7 @@ class LatestOnlyLlmWorker:
                 turn_index=request.turn_index,
                 interaction_id=request.interaction_id,
                 at_mono=time.monotonic(),
-                error=str(e),
-            ))
+                error=str(e)))
         finally:
             if stream is not None:
                 try:
@@ -954,7 +885,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
     # Paths
     _PROMPTS_CANDIDATES = [
-        os.path.join(_MODULE_DIR,   "prompts.json"),
+        os.path.join(_MODULE_DIR,  "prompts.json"),
         os.path.join(_ALWAYSON_DIR, "prompts.json"),
     ]
     DB_FILE             = os.path.join(_MODULE_DIR, "data_collection", "executive_control.db")
@@ -1005,6 +936,9 @@ class ExecutiveControlModule(yarp.RFModule):
     REACTIVE_GREET_REGEX    = re.compile(r"\b(hello|hi|hey|ciao|buongiorno|good\s+morning)\b")
     REACTIVE_GREET_COOLDOWN = 10.0
     _REACTIVE_GAZE_STATES   = frozenset({"MUTUAL_GAZE", "NEAR_GAZE"})
+    _HUNGER_MENTION_RE      = re.compile(
+        r"\b(?:hungry|hunger|starv|tummy|stomach|eat|food|snack|feed|fed)",
+        re.IGNORECASE)
 
     VALID_STATES    = {"ss1", "ss2", "ss3", "ss4"}
     HUNGER_OFF_STATE = "HS0"
@@ -1027,7 +961,7 @@ class ExecutiveControlModule(yarp.RFModule):
                         data = json.load(fh)
                     cls._P = data.get("executiveControl", {})
                     cls.LLM_SYS_DEFAULT = cls._P.get("system_default", "")
-                    cls.LLM_SYS_JSON    = cls._P.get("system_json",    "")
+                    cls.LLM_SYS_JSON    = cls._P.get("system_json",   "")
                     cls.LLM_SYS_FAST    = cls._P.get(
                         "system_fast",
                         "You are iCub speaking face to face. Output only one short natural spoken sentence. No markdown, no emojis, no explanations."
@@ -1038,6 +972,10 @@ class ExecutiveControlModule(yarp.RFModule):
                 except Exception as e:
                     print(f"[ERROR] Failed to load prompts.json ({path}): {e}")
         print("[ERROR] prompts.json not found. Tried: " + ", ".join(cls._PROMPTS_CANDIDATES))
+
+    @classmethod
+    def _mentions_hunger(cls, text: Optional[str]) -> int:
+        return 1 if text and cls._HUNGER_MENTION_RE.search(text) else 0
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -1106,7 +1044,6 @@ class ExecutiveControlModule(yarp.RFModule):
         self.log_buffer:        List[Dict]           = []
         self._log_lock          = threading.Lock()
         self._interaction_logs: Dict[str, List[Dict]] = {}
-        self._interaction_latency_events: Dict[str, List[Dict]] = {}
         self._interaction_logs_lock = threading.Lock()
         self._thread_ctx        = threading.local()
         self._log_throttle_lock = threading.Lock()
@@ -1134,8 +1071,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self._speech = SpeechCoordinator(self)
         self._llm_turn_worker = LatestOnlyLlmWorker(
             self,
-            max_parallel=self.SS3_LLM_WORKER_PARALLELISM,
-        )
+            max_parallel=self.SS3_LLM_WORKER_PARALLELISM)
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1152,8 +1088,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 hungry_threshold   = rf.find("hungry_threshold").asFloat64()   if rf.check("hungry_threshold")   else 60.0,
                 starving_threshold = rf.find("starving_threshold").asFloat64() if rf.check("starving_threshold") else 25.0,
                 persist_file       = self.HUNGER_STATE_FILE,
-                log_cb             = self._log,
-            )
+                log_cb             = self._log)
             if rf.check("qr_cooldown_sec"):
                 self._qr_cooldown_sec = rf.find("qr_cooldown_sec").asFloat64()
             if rf.check("feed_wait_timeout_sec"):
@@ -1173,16 +1108,14 @@ class ExecutiveControlModule(yarp.RFModule):
             self._log(
                 "INFO",
                 f"Hunger drive {'enabled' if self.hunger_enabled else 'disabled'}; "
-                f"stored stomach={snap.level:.1f}% ({snap.state}), effective={self._effective_hunger_state()}",
-            )
+                f"stored stomach={snap.level:.1f}% ({snap.state}), effective={self._effective_hunger_state()}")
             self._log_hunger_level_event(
                 "configure",
                 stimulus_type="mode",
                 stimulus_label="enabled" if self.hunger_enabled else "disabled",
                 level_after=snap.level,
                 state_after=self._effective_hunger_state(snap),
-                force=True,
-            )
+                force=True)
             self._set_face_emotion(self._effective_hunger_state(snap))
 
             # Ports
@@ -1192,13 +1125,13 @@ class ExecutiveControlModule(yarp.RFModule):
             self.landmarks_port = self._open_port(yarp.BufferedPortBottle(), f"{base}/landmarks:i")
             self.stt_port       = self._open_port(yarp.BufferedPortBottle(), f"{base}/stt:i")
             self.speech_port    = self._open_port(yarp.BufferedPortBottle(), f"{base}/speech:o")
-            self.qr_port        = self._open_port(yarp.BufferedPortBottle(), f"{base}/qr:i",     optional=True)
+            self.qr_port        = self._open_port(yarp.BufferedPortBottle(), f"{base}/qr:i",    optional=True)
             self.hunger_port    = self._open_port(yarp.BufferedPortBottle(), f"{base}/hunger:o", optional=True)
 
             if self.landmarks_port is None or self.stt_port is None or self.speech_port is None:
                 return False
 
-            self._ensure_json_file(self.LAST_GREETED_FILE,  {})
+            self._ensure_json_file(self.LAST_GREETED_FILE, {})
             self._ensure_json_file(self.GREETED_TODAY_FILE, {})
             self._init_db()
             self._setup_llm()
@@ -1212,9 +1145,9 @@ class ExecutiveControlModule(yarp.RFModule):
             # Background threads
             for attr, target, stop_ev in [
                 ("_landmarks_thread", self._landmarks_reader_loop, self._landmarks_stop),
-                ("_db_thread",        self._db_worker,             None),
-                ("_qr_thread",        self._qr_reader_loop,        self._qr_stop),
-                ("_reactive_thread",  self._reactive_loop,         self._reactive_stop),
+                ("_db_thread",       self._db_worker,            None),
+                ("_qr_thread",       self._qr_reader_loop,       self._qr_stop),
+                ("_reactive_thread", self._reactive_loop,        self._reactive_stop),
             ]:
                 if stop_ev is not None:
                     stop_ev.clear()
@@ -1231,8 +1164,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     model=self._llm_deployment,
                     messages=[{"role": "user", "content": "ok"}],
                     max_completion_tokens=16,
-                    timeout=20.0,
-                )
+                    timeout=20.0)
                 self._log("INFO", f"LLM warm-up (post-threads) ok in {time.monotonic()-t0:.2f}s")
             except Exception as e:
                 self._log("WARNING", f"LLM warm-up (post-threads) failed: {type(e).__name__}: {e}")
@@ -1248,8 +1180,7 @@ class ExecutiveControlModule(yarp.RFModule):
                         messages=[{"role": "system", "content": sys_msg},
                                   {"role": "user", "content": user_msg}],
                         max_completion_tokens=self.SS3_STARTER_MAX_TOKENS,
-                        timeout=20.0,
-                    )
+                        timeout=20.0)
                     self._log("INFO", f"LLM diag (full-prompt, main thread) ok in {time.monotonic()-t0:.2f}s")
                 except Exception as e:
                     self._log("WARNING", f"LLM diag (full-prompt, main thread) failed: {type(e).__name__}: {e}")
@@ -1336,8 +1267,7 @@ class ExecutiveControlModule(yarp.RFModule):
         meal_payload: Optional[str] = None,
         result: Optional[InteractionResult] = None,
         reason: Optional[str] = None,
-        force: bool = False,
-    ) -> None:
+        force: bool = False) -> None:
         try:
             snap = self.hunger.snapshot()
             after = float(level_after if level_after is not None else snap.level)
@@ -1384,15 +1314,13 @@ class ExecutiveControlModule(yarp.RFModule):
             level_after=snap.level,
             state_before=self._effective_hunger_state(snap),
             state_after=self._effective_hunger_state(snap),
-            delta=snap.level - before,
-        )
+            delta=snap.level - before)
 
     def _charge_energy(
         self,
         cost: float,
         result: Optional[InteractionResult],
-        reason: str,
-    ) -> None:
+        reason: str) -> None:
         """
         Charge active metabolic energy for a meaningful robot action.
         Does nothing when Orexigenic drive is disabled.
@@ -1423,8 +1351,7 @@ class ExecutiveControlModule(yarp.RFModule):
             active_energy_cost=cost_f,
             result=result,
             reason=reason,
-            force=True,
-        )
+            force=True)
         self._log("DEBUG", f"energy: -{cost_f:.2f} reason={reason}")
 
     def interruptModule(self) -> bool:
@@ -1532,7 +1459,6 @@ class ExecutiveControlModule(yarp.RFModule):
             "hunger_level":    snap.level if snap else 100.0,
             "run_id":          self.experiment.run_id,
             "experiment_condition": self.experiment.experiment_condition,
-            "scenario_id":     self.experiment.scenario_id,
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:
@@ -1574,13 +1500,11 @@ class ExecutiveControlModule(yarp.RFModule):
             state_before=state_before,
             state_after=self._effective_hunger_state(snap),
             delta=snap.level - before.level,
-            force=True,
-        )
+            force=True)
         self._log(
             "INFO",
             f"Hunger drive {'ON' if self.hunger_enabled else 'OFF'}; reset to 100%; "
-            f"effective={self._effective_hunger_state(snap)}",
-        )
+            f"effective={self._effective_hunger_state(snap)}")
         return self._rpc_ok(reply, {
             "success":        True,
             "hunger_enabled": self.hunger_enabled,
@@ -1611,8 +1535,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 state_before=state_before,
                 state_after=self.HUNGER_OFF_STATE,
                 delta=snap.level - before.level,
-                force=True,
-            )
+                force=True)
             self._log("INFO", "Hunger drive manually disabled (HS0)")
             return self._rpc_ok(reply, {
                 "success": True,
@@ -1636,8 +1559,7 @@ class ExecutiveControlModule(yarp.RFModule):
             state_before=state_before,
             state_after=snap.state,
             delta=snap.level - before.level,
-            force=True,
-        )
+            force=True)
         self._log("INFO", f"Hunger drive enabled; manually set to {new_level}% ({snap.state})")
         return self._rpc_ok(reply, {
             "success": True,
@@ -1695,15 +1617,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 track_id=track_id,
                 face_id=resolved,
                 social_state=social_state,
-                result=result,
-            )
+                result=result)
 
             compact = self._build_compact_result(interaction_id, track_id, face_id, social_state, result)
             return self._rpc_ok(reply, compact)
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
-            self._pop_latency_events(interaction_id)
             self._end_interaction("proactive")
 
     def _enqueue_interaction_result(
@@ -1713,19 +1633,16 @@ class ExecutiveControlModule(yarp.RFModule):
         track_id: int,
         face_id: str,
         social_state: str,
-        result: InteractionResult,
-    ) -> None:
+        result: InteractionResult) -> None:
         d = result.to_dict()
         d["interaction_id"] = interaction_id
         d["logs"] = self._pop_ilog(interaction_id)
-        d["latency_events"] = self._pop_latency_events(interaction_id)
         self._db_enqueue(("interaction", asdict(self.InteractionAttempt(
             interaction_id=interaction_id,
             track_id=track_id,
             face_id=face_id,
             initial_state=social_state,
-            result=d,
-        ))))
+            result=d))))
 
     def _build_compact_result(
         self, iid: str, track_id: int, face_id: str, social_state: str, r: InteractionResult
@@ -1761,8 +1678,7 @@ class ExecutiveControlModule(yarp.RFModule):
             "meals_eaten_count",
             "last_meal_payload",
             "n_turns",
-            "trigger_mode",
-        ):
+            "trigger_mode"):
             val = getattr(r, key, None)
             if val is not None:
                 c[key] = val
@@ -1775,8 +1691,7 @@ class ExecutiveControlModule(yarp.RFModule):
         track_id:      int,
         face_id:       str,
         social_state:  str,
-        interaction_id: Optional[str] = None,
-    ) -> InteractionResult:
+        interaction_id: Optional[str] = None) -> InteractionResult:
         self._interaction_abort_event.clear()
         result = InteractionResult(initial_state=social_state, final_state=social_state)
         result.resolved_face_id = face_id
@@ -1916,8 +1831,7 @@ class ExecutiveControlModule(yarp.RFModule):
         self,
         timeout: float,
         *,
-        trace: Optional[LatencyTrace] = None,
-    ) -> Tuple[Optional[str], Optional[float]]:
+        trace: Optional[LatencyTrace] = None) -> Tuple[Optional[str], Optional[float]]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._abort_requested():
@@ -1954,8 +1868,7 @@ class ExecutiveControlModule(yarp.RFModule):
         starter_trace.mark_at(
             "first_token_received",
             starter_ready_mono,
-            time_to_first_response_sec=starter_ready_mono - starter_trace.started_mono,
-        )
+            time_to_first_response_sec=starter_ready_mono - starter_trace.started_mono)
         starter_trace.mark_at("last_token_received", starter_ready_mono, text_chars=len(starter))
         if not starter:
             result.abort_reason = result.abort_reason or "llm_starter_failed"
@@ -1987,8 +1900,7 @@ class ExecutiveControlModule(yarp.RFModule):
             face_id=face_id,
             first_utterance_mono=utterance_mono,
             result=result,
-            prior_assistant=starter,
-        )
+            prior_assistant=starter)
         result.n_turns = turns
         if turns > 0:
             result.success     = True
@@ -2007,8 +1919,7 @@ class ExecutiveControlModule(yarp.RFModule):
         face_id: str = "",
         first_utterance_mono: Optional[float] = None,
         result: Optional[InteractionResult] = None,
-        prior_assistant: Optional[str] = None,
-    ) -> int:
+        prior_assistant: Optional[str] = None) -> int:
         """Run up to SS3_MAX_TURNS follow-up turns with latest-utterance-wins semantics."""
         turns          = 0
         utterance      = first_utterance
@@ -2031,8 +1942,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 label=tag,
                 turn_index=next_turn,
                 utterance=utterance,
-                started_mono=utterance_mono,
-            )
+                started_mono=utterance_mono)
             trace.mark_at("stt_final_received", utterance_mono, utterance_chars=len(utterance))
             trace.mark_at("end_of_turn_detected", utterance_mono)
             self._log("INFO", f"{tag} turn {next_turn}/{self.SS3_MAX_TURNS}: '{utterance}'")
@@ -2052,8 +1962,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     "first_token_received",
                     now,
                     time_to_first_response_sec=now - trace.started_mono,
-                    source="local",
-                )
+                    source="local")
                 trace.mark_at("last_token_received", now, text_chars=len(reply), source="local")
                 trace.mark("local_reply_selected", reason="greeting_detected", text_chars=len(reply))
             else:
@@ -2064,15 +1973,13 @@ class ExecutiveControlModule(yarp.RFModule):
                     hs=hs,
                     turn_index=next_turn,
                     interaction_id=interaction_id,
-                    history=tuple(history),
-                )
+                    history=tuple(history))
                 request_id = self._llm_turn_worker.submit(req)
                 trace.request_id = request_id
                 trace.mark(
                     "llm_request_submitted",
                     max_tokens=req.max_tokens,
-                    stream=int(req.stream),
-                )
+                    stream=int(req.stream))
 
                 superseding_utterance: Optional[str] = None
                 superseding_mono: Optional[float] = None
@@ -2093,16 +2000,14 @@ class ExecutiveControlModule(yarp.RFModule):
                             trace.mark_at(
                                 "first_token_received",
                                 event.at_mono,
-                                time_to_first_response_sec=event.at_mono - trace.started_mono,
-                            )
+                                time_to_first_response_sec=event.at_mono - trace.started_mono)
                             continue
                         if event.kind == "final":
                             if not trace.has("first_token_received"):
                                 trace.mark_at(
                                     "first_token_received",
                                     event.at_mono,
-                                    time_to_first_response_sec=event.at_mono - trace.started_mono,
-                                )
+                                    time_to_first_response_sec=event.at_mono - trace.started_mono)
                             trace.mark_at("last_token_received", event.at_mono, text_chars=len(event.text))
                             reply = event.text.strip()
                             response_source = "llm"
@@ -2118,14 +2023,12 @@ class ExecutiveControlModule(yarp.RFModule):
                                     "first_token_received",
                                     fallback_mono,
                                     time_to_first_response_sec=fallback_mono - trace.started_mono,
-                                    source="local_fallback",
-                                )
+                                    source="local_fallback")
                             trace.mark_at(
                                 "last_token_received",
                                 fallback_mono,
                                 text_chars=len(reply),
-                                source="local_fallback",
-                            )
+                                source="local_fallback")
                             trace.mark("local_fallback", reason=event.error or "llm_error", text_chars=len(reply))
                             break
                         if event.kind == "cancelled":
@@ -2158,8 +2061,7 @@ class ExecutiveControlModule(yarp.RFModule):
                             interrupted=interrupted,
                             superseded=superseded,
                             trace=trace,
-                            dispatch=None,
-                        ))
+                            dispatch=None))
                     utterance = superseding_utterance
                     utterance_mono = superseding_mono or time.monotonic()
                     continue
@@ -2180,8 +2082,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 reply,
                 label="ss3_reply",
                 trace=trace,
-                request_id=trace.request_id,
-            )
+                request_id=trace.request_id)
             if dispatch is None:
                 if result is not None and not result.abort_reason:
                     result.abort_reason = "tts_dispatch_failed"
@@ -2191,8 +2092,7 @@ class ExecutiveControlModule(yarp.RFModule):
             self._charge_energy(
                 self.CONVERSATION_TURN_ENERGY_COST,
                 result,
-                "ss3_conversation_turn",
-            )
+                "ss3_conversation_turn")
             if result is not None:
                 result.turns.append(self._build_turn_record(
                     interaction_id=interaction_id,
@@ -2207,8 +2107,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     interrupted=interrupted,
                     superseded=superseded,
                     trace=trace,
-                    dispatch=dispatch,
-                ))
+                    dispatch=dispatch))
             history.append(("user", utterance))
             history.append(("assistant", reply))
 
@@ -2240,8 +2139,7 @@ class ExecutiveControlModule(yarp.RFModule):
         interrupted: int,
         superseded: int,
         trace: LatencyTrace,
-        dispatch: Optional[SpeechDispatch],
-    ) -> Dict[str, Any]:
+        dispatch: Optional[SpeechDispatch]) -> Dict[str, Any]:
         first_token = trace.get("first_token_received")
         last_token = trace.get("last_token_received")
         stt_final = trace.get("stt_final_received")
@@ -2255,6 +2153,7 @@ class ExecutiveControlModule(yarp.RFModule):
             "hunger_state": self._current_hs(),
             "user_utterance": user_utterance,
             "assistant_utterance": assistant_utterance,
+            "hunger_mentioned": self._mentions_hunger(assistant_utterance),
             "user_chars": len(user_utterance or ""),
             "assistant_chars": len(assistant_utterance or "") if assistant_utterance is not None else None,
             "llm_request_id": request_id,
@@ -2428,8 +2327,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     meal_delta=delta,
                     meal_payload=val,
                     reason="qr_feed",
-                    force=True,
-                )
+                    force=True)
                 self._log("INFO", f"QR: {val} (+{delta}) → stomach {snap.level:.1f} ({snap.state})")
                 if snap.state != hs_before:
                     self._set_face_emotion(snap.state)
@@ -2534,8 +2432,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     timeout=self.SS3_STT_TIMEOUT,
                     attempts=1,
                     tag=tag,
-                    result=dummy,
-                )
+                    result=dummy)
                 if not dummy.aborted:
                     dummy.success = True
                     dummy.final_state = "ss3"
@@ -2547,8 +2444,7 @@ class ExecutiveControlModule(yarp.RFModule):
                         utterance,
                         face_id=name,
                         prior_assistant=greeting,
-                        result=dummy,
-                    )
+                        result=dummy)
                     dummy.n_turns = turns
                     if turns > 0:
                         dummy.success = True
@@ -2575,8 +2471,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     face_id=name,
                     social_state="ss3",
                     person_id=name,
-                    interaction_id=interaction_id,
-                )
+                    interaction_id=interaction_id)
                 self._selector_reset_cooldown(name, track_id)
                 self._selector_set_track(-1)
                 self._enqueue_interaction_result(
@@ -2584,12 +2479,10 @@ class ExecutiveControlModule(yarp.RFModule):
                     track_id=track_id,
                     face_id=name,
                     social_state="ss3",
-                    result=dummy,
-                )
+                    result=dummy)
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
-            self._pop_latency_events(interaction_id)
             self._end_interaction("reactive")
 
     def _run_reactive_unknown_intro(self, track_id: int, face_id: str) -> None:
@@ -2669,8 +2562,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     face_id=face_id,
                     social_state="ss1",
                     person_id=person_id,
-                    interaction_id=interaction_id,
-                )
+                    interaction_id=interaction_id)
                 self._selector_reset_cooldown(face_id, track_id)
                 self._selector_set_track(-1)
                 self._enqueue_interaction_result(
@@ -2678,12 +2570,10 @@ class ExecutiveControlModule(yarp.RFModule):
                     track_id=track_id,
                     face_id=dummy.resolved_face_id or face_id,
                     social_state="ss1",
-                    result=dummy,
-                )
+                    result=dummy)
         finally:
             self._set_iid(prev_iid)
             self._pop_ilog(interaction_id)
-            self._pop_latency_events(interaction_id)
             self._end_interaction("reactive")
 
     # ── shared interaction helpers ─────────────────────────────────────────────
@@ -2694,8 +2584,7 @@ class ExecutiveControlModule(yarp.RFModule):
         timeout:  float,
         attempts: int = 1,
         tag:      str = "[greet]",
-        result:   Optional[InteractionResult] = None,
-    ) -> Optional[str]:
+        result:   Optional[InteractionResult] = None) -> Optional[str]:
         tpl = self._P.get("ss2_greeting", "Hello {name}")
         for attempt in range(max(1, attempts)):
             self._log("INFO", f"{tag} greeting attempt {attempt+1}/{attempts}")
@@ -2803,14 +2692,12 @@ class ExecutiveControlModule(yarp.RFModule):
         track_id:      int,
         face_id:       str,
         result:        InteractionResult,
-        interaction_id: Optional[str] = None,
-    ) -> None:
+        interaction_id: Optional[str] = None) -> None:
         self._current_track_id = track_id
         self._monitor_thread   = threading.Thread(
             target = self._monitor_loop,
             args   = (track_id, face_id, result, interaction_id),
-            daemon = True,
-        )
+            daemon = True)
         self._monitor_thread.start()
 
     def _stop_monitor(self) -> None:
@@ -2822,8 +2709,7 @@ class ExecutiveControlModule(yarp.RFModule):
         track_id:       int,
         expected_face:  str,
         result:         InteractionResult,
-        interaction_id: Optional[str] = None,
-    ) -> None:
+        interaction_id: Optional[str] = None) -> None:
         prev_iid = self._get_iid()
         if interaction_id:
             self._set_iid(interaction_id)
@@ -3112,8 +2998,7 @@ class ExecutiveControlModule(yarp.RFModule):
         # Fast regex
         m = re.search(
             r"(?i)(?:my name is|my name's|i am|i'm|im|call me)\s+([a-z][a-z'\-]+)",
-            utterance,
-        )
+            utterance)
         if m:
             return m.group(1).title()
         # LLM fallback
@@ -3184,8 +3069,7 @@ class ExecutiveControlModule(yarp.RFModule):
         face_id: str,
         social_state: str,
         person_id: Optional[str] = None,
-        interaction_id: Optional[str] = None,
-    ) -> None:
+        interaction_id: Optional[str] = None) -> None:
         """
         Send completed reactive interaction results to salienceNetwork
         so homeostatic learning is applied consistently.
@@ -3273,7 +3157,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
     def _setup_llm(self) -> None:
         endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().strip('"').strip("'")
-        api_key    = os.getenv("AZURE_OPENAI_API_KEY",  "").strip().strip('"').strip("'")
+        api_key    = os.getenv("AZURE_OPENAI_API_KEY", "").strip().strip('"').strip("'")
         api_ver    = (os.getenv("OPENAI_API_VERSION", "") or os.getenv("AZURE_OPENAI_API_VERSION", "")).strip().strip('"').strip("'")
         deployment = os.getenv("AZURE_DEPLOYMENT_GPT41_MINI", "contact-Yogaexperiment_gpt41mini")
 
@@ -3297,9 +3181,7 @@ class ExecutiveControlModule(yarp.RFModule):
             limits=httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=0,
-                keepalive_expiry=0.0,
-            ),
-        )
+                keepalive_expiry=0.0))
         self.llm_client       = AzureOpenAI(azure_endpoint=endpoint, api_key=api_key,
                                              api_version=api_ver, timeout=self.LLM_TIMEOUT,
                                              max_retries=0, http_client=http_client)
@@ -3314,8 +3196,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 model=deployment,
                 messages=[{"role": "user", "content": "ok"}],
                 max_completion_tokens=16,
-                timeout=20.0,
-            )
+                timeout=20.0)
             self._log("INFO", f"LLM warm-up ok in {time.monotonic()-t0:.2f}s")
         except Exception as e:
             self._log("WARNING", f"LLM warm-up failed: {type(e).__name__}: {e}")
@@ -3327,8 +3208,7 @@ class ExecutiveControlModule(yarp.RFModule):
         max_tokens:      int,
         timeout:         Optional[float] = None,
         response_format: Optional[Any]   = None,
-        deployment:      Optional[str]   = None,
-    ) -> LlmResult:
+        deployment:      Optional[str]   = None) -> LlmResult:
         if self.llm_client is None:
             return self.LlmResult(ok=False, error="client_not_initialized")
 
@@ -3399,8 +3279,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 "WARNING",
                 f"llm_watchdog: hard_timeout started={worker_started[0]} "
                 f"entered_create={worker_entered_create[0]} "
-                f"thread_alive={t.is_alive()} timeout_sec={timeout_sec:.1f}s",
-            )
+                f"thread_alive={t.is_alive()} timeout_sec={timeout_sec:.1f}s")
             raise TimeoutError(f"LLM hard timeout after {timeout_sec:.1f}s") from e
 
         if status == "err":
@@ -3462,22 +3341,19 @@ class ExecutiveControlModule(yarp.RFModule):
         hs: str,
         turn_index: int,
         interaction_id: Optional[str],
-        history: Tuple[Tuple[str, str], ...] = (),
-    ) -> LlmTurnRequest:
+        history: Tuple[Tuple[str, str], ...] = ()) -> LlmTurnRequest:
         if is_last:
             tmpl = self._prompt_for_hs(
                 "closing_ack_prompt",
                 hs,
-                "Person said: '{last_utterance}'\nWarm acknowledgment, 4 to 8 words. No question mark. Output only.",
-            )
+                "Person said: '{last_utterance}'\nWarm acknowledgment, 4 to 8 words. No question mark. Output only.")
             max_tokens = self.SS3_CLOSING_MAX_TOKENS
             max_len    = self.SS3_CLOSING_MAX_LEN
         else:
             tmpl = self._prompt_for_hs(
                 "followup_prompt",
                 hs,
-                "User said: '{last_utterance}'\nRespond in 1 sentence, 22 words or fewer. At most one short follow-up question. Output only.",
-            )
+                "User said: '{last_utterance}'\nRespond in 1 sentence, 22 words or fewer. At most one short follow-up question. Output only.")
             max_tokens = self.SS3_FOLLOWUP_MAX_TOKENS
             max_len    = self.SS3_TURN_MAX_LEN
 
@@ -3490,8 +3366,7 @@ class ExecutiveControlModule(yarp.RFModule):
             turn_index=turn_index,
             interaction_id=interaction_id,
             stream=self.SS3_LLM_STREAMING_ENABLED,
-            history=history,
-        )
+            history=history)
 
     @staticmethod
     def _strip_json(text: str) -> str:
@@ -3555,8 +3430,7 @@ class ExecutiveControlModule(yarp.RFModule):
         prompt = self._prompt_for_hs(
             "convo_starter_prompt",
             hs,
-            "Ask ONE short friendly question about the person's day (6–12 words). No greeting. Output only the sentence.",
-        )
+            "Ask ONE short friendly question about the person's day (6–12 words). No greeting. Output only the sentence.")
         system = self._system_for_hs(hs)
 
         req = LlmTurnRequest(
@@ -3567,8 +3441,7 @@ class ExecutiveControlModule(yarp.RFModule):
             max_len=96,
             turn_index=0,
             interaction_id=self._get_iid(),
-            stream=self.SS3_LLM_STREAMING_ENABLED,
-        )
+            stream=self.SS3_LLM_STREAMING_ENABLED)
         request_id = self._llm_turn_worker.submit(req)
         deadline = time.monotonic() + min(self.LLM_TIMEOUT, 2.0)
         text: Optional[str] = None
@@ -3701,8 +3574,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 track_id INTEGER NOT NULL,
@@ -3737,8 +3608,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 turn_index INTEGER NOT NULL,
@@ -3748,6 +3617,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3')),
                 user_utterance TEXT NOT NULL,
                 assistant_utterance TEXT,
+                hunger_mentioned INTEGER NOT NULL DEFAULT 0 CHECK (hunger_mentioned IN (0,1)),
                 user_chars INTEGER NOT NULL,
                 assistant_chars INTEGER,
                 llm_request_id INTEGER,
@@ -3767,32 +3637,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 stt_to_tts_dispatch_sec REAL,
                 FOREIGN KEY(interaction_id) REFERENCES interactions(interaction_id) ON DELETE CASCADE
             )""")
-            c.execute("""CREATE TABLE IF NOT EXISTS latency_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                interaction_id TEXT NOT NULL,
-                timestamp_utc TEXT NOT NULL,
-                timestamp_local TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                timestamp_epoch REAL NOT NULL,
-                monotonic_sec REAL NOT NULL,
-                run_elapsed_sec REAL NOT NULL,
-                day_rome TEXT NOT NULL,
-                run_id TEXT,
-                experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
-                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
-                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
-                label TEXT NOT NULL,
-                turn_index INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                request_id INTEGER,
-                at_mono REAL NOT NULL,
-                started_mono REAL NOT NULL,
-                elapsed_sec REAL NOT NULL,
-                fields_json TEXT NOT NULL DEFAULT '{}',
-                FOREIGN KEY(interaction_id) REFERENCES interactions(interaction_id) ON DELETE CASCADE
-            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS reactive_interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 interaction_id TEXT,
@@ -3805,8 +3649,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 type TEXT NOT NULL CHECK (type IN ('greeting','unknown_intro','qr_feed')),
@@ -3827,8 +3669,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 day_rome TEXT NOT NULL,
                 run_id TEXT,
                 experiment_condition TEXT,
-                scenario_id TEXT,
-                participant_id TEXT,
                 is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
                 valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
                 event_type TEXT NOT NULL,
@@ -3850,15 +3690,14 @@ class ExecutiveControlModule(yarp.RFModule):
                 exec_interaction_id TEXT
             )""")
             c.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','3') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','5') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             for key, value in self.experiment.experiment_fields().items():
                 c.execute(
                     "INSERT INTO schema_info(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, str(value) if value is not None else ""),
-                )
+                    (key, str(value) if value is not None else ""))
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_i_time    ON interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_i_track   ON interactions(track_id)",
@@ -3869,20 +3708,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_i_trigger  ON interactions(trigger_mode, initial_state)",
                 "CREATE INDEX IF NOT EXISTS idx_i_run     ON interactions(run_id)",
                 "CREATE INDEX IF NOT EXISTS idx_i_cond    ON interactions(experiment_condition)",
-                "CREATE INDEX IF NOT EXISTS idx_i_scenario ON interactions(scenario_id)",
-                "CREATE INDEX IF NOT EXISTS idx_i_participant ON interactions(participant_id)",
                 "CREATE INDEX IF NOT EXISTS idx_i_valid   ON interactions(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_i_run_cond ON interactions(run_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_i_valid_cond ON interactions(valid_for_analysis, experiment_condition)",
-                "CREATE INDEX IF NOT EXISTS idx_i_scenario_cond ON interactions(scenario_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_iid  ON interaction_turns(interaction_id)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_time ON interaction_turns(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_run_cond ON interaction_turns(run_id, experiment_condition)",
                 "CREATE INDEX IF NOT EXISTS idx_turn_valid ON interaction_turns(valid_for_analysis)",
-                "CREATE INDEX IF NOT EXISTS idx_lat_iid   ON latency_events(interaction_id)",
-                "CREATE INDEX IF NOT EXISTS idx_lat_event ON latency_events(event_type)",
-                "CREATE INDEX IF NOT EXISTS idx_lat_run_cond ON latency_events(run_id, experiment_condition)",
-                "CREATE INDEX IF NOT EXISTS idx_lat_valid ON latency_events(valid_for_analysis)",
                 "CREATE INDEX IF NOT EXISTS idx_r_time    ON reactive_interactions(timestamp_utc)",
                 "CREATE INDEX IF NOT EXISTS idx_r_type    ON reactive_interactions(type)",
                 "CREATE INDEX IF NOT EXISTS idx_r_run_cond ON reactive_interactions(run_id, experiment_condition)",
@@ -3915,8 +3747,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        day_rome,
                        run_id,
                        experiment_condition,
-                       scenario_id,
-                       participant_id,
                        is_test_run,
                        valid_for_analysis,
                        track_id, face_id,
@@ -3947,14 +3777,14 @@ class ExecutiveControlModule(yarp.RFModule):
             "v_interactions_clean": """
                 SELECT * FROM v_interactions WHERE valid_for_analysis = 1""",
             "v_metric_ss3_daily": """
-                SELECT run_id, experiment_condition, scenario_id, day_rome, hunger_state_start,
+                SELECT run_id, experiment_condition, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END) AS reached_ss4,
                        1.0*SUM(CASE WHEN success=1 AND final_state='ss4' THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate
                 FROM v_interactions_clean WHERE initial_state='ss3'
-                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
             "v_metric_response_rate_daily": """
-                SELECT run_id, experiment_condition, scenario_id, day_rome, hunger_state_start,
+                SELECT run_id, experiment_condition, day_rome, hunger_state_start,
                        COUNT(*) AS launched,
                        SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END) AS replied,
                        1.0*SUM(CASE WHEN replied_any=1 THEN 1 ELSE 0 END)/MAX(COUNT(*),1) AS rate,
@@ -3963,12 +3793,11 @@ class ExecutiveControlModule(yarp.RFModule):
                        SUM(CASE WHEN abort_category='system_abort' THEN 1 ELSE 0 END) AS system_abort,
                        SUM(CASE WHEN abort_category='error'        THEN 1 ELSE 0 END) AS errors
                 FROM v_interactions_clean
-                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
             "v_metric_repeat_users_daily": """
                 SELECT
                     run_id,
                     experiment_condition,
-                    scenario_id,
                     day_rome,
                     hunger_state_start,
                     COUNT(*)                                                          AS total_visits,
@@ -3980,14 +3809,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     SELECT
                         run_id,
                         experiment_condition,
-                        scenario_id,
                         day_rome,
                         hunger_state_start,
                         COALESCE(NULLIF(extracted_name, ''), face_id)                 AS user_key,
                         COUNT(*) OVER (
                             PARTITION BY run_id,
                                          experiment_condition,
-                                         scenario_id,
                                          day_rome,
                                          COALESCE(NULLIF(extracted_name, ''), face_id)
                         )                                                             AS visit_count
@@ -3996,12 +3823,11 @@ class ExecutiveControlModule(yarp.RFModule):
                       AND initial_state IN ('ss1', 'ss2', 'ss3')
                       AND valid_for_analysis = 1
                 )
-                GROUP BY run_id, experiment_condition, scenario_id, day_rome, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, day_rome, hunger_state_start""",
             "v_metric_depth_progression": """
                 SELECT
                     run_id,
                     experiment_condition,
-                    scenario_id,
                     day_rome                                                                 AS day_rome,
                     initial_state,
                     hunger_state_start,
@@ -4016,7 +3842,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 FROM interactions
                 WHERE initial_state IN ('ss1', 'ss2', 'ss3')
                   AND valid_for_analysis = 1
-                GROUP BY run_id, experiment_condition, scenario_id, day_rome, initial_state, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, day_rome, initial_state, hunger_state_start""",
             "v_hunger_level_timeline": """
                 SELECT timestamp_utc,
                        timestamp_local,
@@ -4027,8 +3853,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        day_rome,
                        run_id,
                        experiment_condition,
-                       scenario_id,
-                       participant_id,
                        is_test_run,
                        valid_for_analysis,
                        event_type,
@@ -4060,8 +3884,6 @@ class ExecutiveControlModule(yarp.RFModule):
                        day_rome,
                        run_id,
                        experiment_condition,
-                       scenario_id,
-                       participant_id,
                        is_test_run,
                        valid_for_analysis,
                        turn_index,
@@ -4071,6 +3893,7 @@ class ExecutiveControlModule(yarp.RFModule):
                        hunger_state,
                        user_utterance,
                        assistant_utterance,
+                       CAST(COALESCE(hunger_mentioned, 0) AS INTEGER) AS hunger_mentioned,
                        user_chars,
                        assistant_chars,
                        llm_request_id,
@@ -4083,30 +3906,251 @@ class ExecutiveControlModule(yarp.RFModule):
                        stt_to_tts_dispatch_sec,
                        tts_estimated_sec
                 FROM interaction_turns""",
-            "v_latency_events": """
-                SELECT interaction_id,
+            "v_metric_hunger_mention_rate": """
+                SELECT run_id,
+                       experiment_condition,
+                       day_rome,
+                       hunger_state,
+                       COUNT(*) AS turns,
+                       SUM(CASE WHEN hunger_mentioned = 1 THEN 1 ELSE 0 END) AS hunger_turns,
+                       1.0 * SUM(CASE WHEN hunger_mentioned = 1 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1) AS hunger_mention_rate
+                FROM interaction_turns
+                WHERE valid_for_analysis = 1
+                GROUP BY run_id, experiment_condition, day_rome, hunger_state""",
+            "v_hs_transitions": """
+                SELECT id,
                        timestamp_utc,
-                       timestamp_local,
-                       timezone,
                        timestamp_epoch,
                        monotonic_sec,
                        run_elapsed_sec,
                        day_rome,
                        run_id,
                        experiment_condition,
-                       scenario_id,
-                       participant_id,
                        is_test_run,
                        valid_for_analysis,
-                       label,
-                       turn_index,
-                       event_type,
-                       request_id,
-                       at_mono,
-                       started_mono,
-                       elapsed_sec,
-                       fields_json
-                FROM latency_events""",
+                       hunger_state_before AS from_state,
+                       hunger_state_after AS to_state,
+                       stimulus_type AS cause,
+                       CASE
+                           WHEN hunger_state_after = 'HS3' AND hunger_state_before != 'HS3' THEN 'hs3_entry'
+                           WHEN hunger_state_before = 'HS3' AND hunger_state_after != 'HS3' THEN 'hs3_exit'
+                           WHEN hunger_state_before != hunger_state_after THEN 'state_change'
+                           ELSE NULL
+                       END AS transition_type,
+                       stomach_level_before,
+                       stomach_level_after,
+                       level_delta,
+                       exec_interaction_id
+                FROM hunger_level_events
+                WHERE hunger_state_before IS NOT NULL
+                  AND hunger_state_after IS NOT NULL
+                  AND hunger_state_before != hunger_state_after""",
+            "v_drain_segments": """
+                WITH ordered AS (
+                    SELECT *,
+                           CASE
+                               WHEN stimulus_type = 'passive_drain'
+                                AND COALESCE(LAG(stimulus_type) OVER (
+                                       PARTITION BY run_id ORDER BY monotonic_sec, id
+                                    ), '') = 'passive_drain'
+                               THEN 0
+                               ELSE 1
+                           END AS segment_start
+                    FROM hunger_level_events
+                    WHERE valid_for_analysis = 1
+                ),
+                segmented AS (
+                    SELECT *,
+                           SUM(segment_start) OVER (
+                               PARTITION BY run_id ORDER BY monotonic_sec, id
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ) AS segment_id
+                    FROM ordered
+                    WHERE stimulus_type = 'passive_drain'
+                )
+                SELECT run_id,
+                       experiment_condition,
+                       day_rome,
+                       segment_id,
+                       MIN(timestamp_utc) AS start_ts_utc,
+                       MAX(timestamp_utc) AS end_ts_utc,
+                       MIN(monotonic_sec) AS start_mono,
+                       MAX(monotonic_sec) AS end_mono,
+                       (SELECT s2.stomach_level_after
+                        FROM segmented s2
+                        WHERE s2.run_id = s.run_id AND s2.segment_id = s.segment_id
+                        ORDER BY s2.monotonic_sec, s2.id
+                        LIMIT 1) AS start_level,
+                       (SELECT s3.stomach_level_after
+                        FROM segmented s3
+                        WHERE s3.run_id = s.run_id AND s3.segment_id = s.segment_id
+                        ORDER BY s3.monotonic_sec DESC, s3.id DESC
+                        LIMIT 1) AS end_level,
+                       MAX(monotonic_sec) - MIN(monotonic_sec) AS duration_sec,
+                       CASE
+                           WHEN MAX(monotonic_sec) > MIN(monotonic_sec)
+                           THEN (
+                               (SELECT s3.stomach_level_after
+                                FROM segmented s3
+                                WHERE s3.run_id = s.run_id AND s3.segment_id = s.segment_id
+                                ORDER BY s3.monotonic_sec DESC, s3.id DESC
+                                LIMIT 1)
+                               -
+                               (SELECT s2.stomach_level_after
+                                FROM segmented s2
+                                WHERE s2.run_id = s.run_id AND s2.segment_id = s.segment_id
+                                ORDER BY s2.monotonic_sec, s2.id
+                                LIMIT 1)
+                           ) / (MAX(monotonic_sec) - MIN(monotonic_sec))
+                           ELSE NULL
+                       END AS empirical_drain_rate,
+                       COUNT(*) AS n_samples
+                FROM segmented s
+                GROUP BY run_id, experiment_condition, day_rome, segment_id
+                HAVING COUNT(*) >= 2""",
+            "v_active_cost_breakdown": """
+                SELECT run_id,
+                       experiment_condition, stimulus_label,
+                       COUNT(*) AS n_events,
+                       AVG(level_delta) AS mean_level_delta,
+                       AVG(active_energy_cost) AS mean_active_cost,
+                       MIN(level_delta) AS min_level_delta,
+                       MAX(level_delta) AS max_level_delta
+                FROM hunger_level_events
+                WHERE event_type = 'active_cost'
+                  AND valid_for_analysis = 1
+                GROUP BY run_id, experiment_condition, stimulus_label""",
+            "v_hs3_episodes": """
+                WITH entries AS (
+                    SELECT id AS entry_id,
+                           run_id,
+                           experiment_condition,
+                           day_rome,
+                           is_test_run,
+                           valid_for_analysis,
+                           timestamp_utc AS entry_ts_utc,
+                           timestamp_epoch AS entry_ts_epoch,
+                           monotonic_sec AS entry_mono,
+                           stimulus_type AS entry_cause,
+                           stomach_level_after AS entry_level
+                    FROM hunger_level_events
+                    WHERE hunger_state_after = 'HS3'
+                      AND (hunger_state_before IS NULL OR hunger_state_before != 'HS3')
+                ),
+                episode_bounds AS (
+                    SELECT e.*,
+                           COALESCE(
+                               (SELECT MIN(h.monotonic_sec)
+                                FROM hunger_level_events h
+                                WHERE h.run_id = e.run_id
+                                  AND h.monotonic_sec > e.entry_mono
+                                  AND h.hunger_state_before = 'HS3'
+                                  AND h.hunger_state_after != 'HS3'),
+                               (SELECT MAX(h.monotonic_sec)
+                                FROM hunger_level_events h
+                                WHERE h.run_id = e.run_id)
+                           ) AS episode_end_mono
+                    FROM entries e
+                )
+                SELECT e.entry_id AS episode_id,
+                       e.run_id,
+                       e.experiment_condition,
+                       e.day_rome,
+                       e.is_test_run,
+                       e.valid_for_analysis,
+                       e.entry_ts_utc,
+                       e.entry_ts_epoch,
+                       e.entry_mono,
+                       e.entry_cause,
+                       e.entry_level,
+                       (SELECT h.timestamp_utc
+                        FROM hunger_level_events h
+                        WHERE h.run_id = e.run_id
+                          AND h.monotonic_sec > e.entry_mono
+                          AND h.monotonic_sec <= e.episode_end_mono
+                          AND h.event_type = 'feeding'
+                        ORDER BY h.monotonic_sec, h.id
+                        LIMIT 1) AS first_feeding_ts_utc,
+                       (SELECT h.monotonic_sec
+                        FROM hunger_level_events h
+                        WHERE h.run_id = e.run_id
+                          AND h.monotonic_sec > e.entry_mono
+                          AND h.monotonic_sec <= e.episode_end_mono
+                          AND h.event_type = 'feeding'
+                        ORDER BY h.monotonic_sec, h.id
+                        LIMIT 1) AS first_feed_mono,
+                       CASE
+                           WHEN (SELECT h.monotonic_sec
+                                 FROM hunger_level_events h
+                                 WHERE h.run_id = e.run_id
+                                   AND h.monotonic_sec > e.entry_mono
+                                   AND h.monotonic_sec <= e.episode_end_mono
+                                   AND h.event_type = 'feeding'
+                                 ORDER BY h.monotonic_sec, h.id
+                                 LIMIT 1) IS NULL
+                           THEN NULL
+                           ELSE (SELECT h.monotonic_sec
+                                 FROM hunger_level_events h
+                                 WHERE h.run_id = e.run_id
+                                   AND h.monotonic_sec > e.entry_mono
+                                   AND h.monotonic_sec <= e.episode_end_mono
+                                   AND h.event_type = 'feeding'
+                                 ORDER BY h.monotonic_sec, h.id
+                                 LIMIT 1) - e.entry_mono
+                       END AS time_to_first_feed_sec,
+                       (SELECT h.timestamp_utc
+                        FROM hunger_level_events h
+                        WHERE h.run_id = e.run_id
+                          AND h.monotonic_sec = e.episode_end_mono
+                        ORDER BY h.id DESC
+                        LIMIT 1) AS exit_ts_utc,
+                       e.episode_end_mono AS exit_mono,
+                       e.episode_end_mono - e.entry_mono AS episode_duration_sec,
+                       CASE
+                           WHEN EXISTS (
+                               SELECT 1
+                               FROM hunger_level_events h
+                               WHERE h.run_id = e.run_id
+                                 AND h.monotonic_sec > e.entry_mono
+                                 AND h.monotonic_sec <= e.episode_end_mono
+                                 AND h.event_type = 'feeding'
+                           )
+                           THEN 1 ELSE 0
+                       END AS resolved_by_feeding,
+                       (SELECT COUNT(*)
+                        FROM hunger_level_events h
+                        WHERE h.run_id = e.run_id
+                          AND h.monotonic_sec > e.entry_mono
+                          AND h.monotonic_sec <= e.episode_end_mono
+                          AND h.event_type = 'feeding') AS meals_received,
+                       COALESCE((SELECT SUM(active_energy_cost)
+                                 FROM hunger_level_events h
+                                 WHERE h.run_id = e.run_id
+                                   AND h.monotonic_sec > e.entry_mono
+                                   AND h.monotonic_sec <= e.episode_end_mono
+                                   AND h.event_type = 'active_cost'), 0.0) AS total_active_energy_during_episode,
+                       CASE
+                           WHEN EXISTS (
+                               SELECT 1
+                               FROM hunger_level_events h
+                               WHERE h.run_id = e.run_id
+                                 AND h.monotonic_sec > e.entry_mono
+                                 AND h.monotonic_sec <= e.episode_end_mono
+                                 AND h.event_type = 'feeding'
+                           )
+                           THEN 'fed'
+                           WHEN EXISTS (
+                               SELECT 1
+                               FROM hunger_level_events h
+                               WHERE h.run_id = e.run_id
+                                 AND h.monotonic_sec = e.episode_end_mono
+                                 AND h.hunger_state_before = 'HS3'
+                                 AND h.hunger_state_after != 'HS3'
+                           )
+                           THEN 'state_exit'
+                           ELSE 'end_of_run'
+                       END AS exit_cause
+                FROM episode_bounds e""",
             "v_quality_hunger_invalid_levels": """
                 SELECT *
                 FROM hunger_level_events
@@ -4115,15 +4159,13 @@ class ExecutiveControlModule(yarp.RFModule):
             "v_quality_interaction_missing_metadata": """
                 SELECT *
                 FROM interactions
-                WHERE run_id IS NULL OR experiment_condition IS NULL OR scenario_id IS NULL""",
+                WHERE run_id IS NULL OR experiment_condition IS NULL""",
             "v_quality_condition_counts": """
                 SELECT run_id,
-                       experiment_condition,
-                       scenario_id,
-                       hunger_state_start,
+                       experiment_condition, hunger_state_start,
                        COUNT(*) AS interaction_count
                 FROM interactions
-                GROUP BY run_id, experiment_condition, scenario_id, hunger_state_start""",
+                GROUP BY run_id, experiment_condition, hunger_state_start""",
         }
         for name, body in views.items():
             c.execute(f"DROP VIEW IF EXISTS {name}")
@@ -4179,30 +4221,28 @@ class ExecutiveControlModule(yarp.RFModule):
             r    = data["result"]
             logs = r.get("logs", [])
             turns = r.get("turns", []) if isinstance(r.get("turns", []), list) else []
-            latency_events = r.get("latency_events", []) if isinstance(r.get("latency_events", []), list) else []
             transcript = json.dumps(
                 [l["message"] for l in logs
                  if any(kw in l.get("message", "") for kw in ("User:", "Robot:", "Asking", "Response"))],
-                ensure_ascii=False,
-            )
-            r_compact = {k: v for k, v in r.items() if k not in {"logs", "turns", "latency_events"}}
+                ensure_ascii=False)
+            r_compact = {k: v for k, v in r.items() if k not in {"logs", "turns"}}
             ts = {**self._time_fields(), **{k: data[k] for k in (
                 "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
                 "monotonic_sec", "run_elapsed_sec", "day_rome"
             ) if k in data}}
-            meta = self.experiment.experiment_fields(r.get("extracted_name") or data.get("face_id"))
+            meta = self.experiment.experiment_fields()
             conn.cursor().execute(
                 """INSERT INTO interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                  monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                 scenario_id,participant_id,is_test_run,valid_for_analysis,
+                 is_test_run,valid_for_analysis,
                  track_id,face_id,initial_state,final_state,
                  success,abort_reason,greeted,talked,replied_any,extracted_name,
                  target_stayed_biggest,interaction_tag,hunger_state_start,hunger_state_end,
                  hunger_drive_enabled,stomach_level_start,stomach_level_end,meals_eaten_count,last_meal_payload,
                  active_energy_cost,homeostatic_reward,n_turns,trigger_mode,
                  transcript,full_result)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     ts["timestamp_utc"],
@@ -4214,33 +4254,27 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["day_rome"],
                     meta["run_id"],
                     meta["experiment_condition"],
-                    meta["scenario_id"],
-                    meta["participant_id"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data["track_id"], data["face_id"], data["initial_state"],
                     r.get("final_state",""),
-                    int(r.get("success", False)),      r.get("abort_reason"),
-                    int(r.get("greeted", False)),       int(r.get("talked", False)),
-                    int(r.get("replied_any", False)),   r.get("extracted_name"),
+                    int(r.get("success", False)),     r.get("abort_reason"),
+                    int(r.get("greeted", False)),      int(r.get("talked", False)),
+                    int(r.get("replied_any", False)),  r.get("extracted_name"),
                     int(r.get("target_stayed_biggest", True)),
                     r.get("interaction_tag"),
-                    r.get("hunger_state_start"),        r.get("hunger_state_end"),
+                    r.get("hunger_state_start"),       r.get("hunger_state_end"),
                     int(bool(r.get("hunger_drive_enabled", r.get("hunger_state_start") != self.HUNGER_OFF_STATE))),
-                    r.get("stomach_level_start"),       r.get("stomach_level_end"),
-                    r.get("meals_eaten_count"),         r.get("last_meal_payload"),
+                    r.get("stomach_level_start"),      r.get("stomach_level_end"),
+                    r.get("meals_eaten_count"),        r.get("last_meal_payload"),
                     r.get("active_energy_cost", 0.0),
                     r.get("homeostatic_reward", 0.0),
                     r.get("n_turns", 0),
                     r.get("trigger_mode", "proactive"),
                     transcript,
-                    json.dumps(r_compact, ensure_ascii=False),
-                ),
-            )
+                    json.dumps(r_compact, ensure_ascii=False)))
             for turn in turns:
                 self._db_save_interaction_turn(conn, data.get("interaction_id"), turn, meta)
-            for event in latency_events:
-                self._db_save_latency_event(conn, data.get("interaction_id"), event, meta)
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_interaction failed: {e}")
@@ -4250,23 +4284,22 @@ class ExecutiveControlModule(yarp.RFModule):
         conn: sqlite3.Connection,
         interaction_id: Optional[str],
         turn: Dict[str, Any],
-        meta: Optional[Dict[str, Any]] = None,
-    ) -> None:
+        meta: Optional[Dict[str, Any]] = None) -> None:
         ts = self._time_fields(monotonic_sec=turn.get("turn_started_mono"))
         meta = meta or self.experiment.experiment_fields()
         conn.cursor().execute(
             """INSERT INTO interaction_turns
             (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
              monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-             scenario_id,participant_id,is_test_run,valid_for_analysis,
+             is_test_run,valid_for_analysis,
              turn_index,label,social_state,
-             trigger_mode,hunger_state,user_utterance,assistant_utterance,user_chars,
+             trigger_mode,hunger_state,user_utterance,assistant_utterance,hunger_mentioned,user_chars,
              assistant_chars,llm_request_id,response_source,fallback_reason,interrupted,
              superseded,turn_started_mono,stt_final_mono,llm_first_token_mono,
              llm_last_token_mono,tts_dispatch_mono,tts_estimated_done_mono,
              tts_estimated_sec,time_to_first_response_sec,response_total_sec,
              stt_to_tts_dispatch_sec)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 interaction_id or turn.get("interaction_id"),
                 ts["timestamp_utc"],
@@ -4278,8 +4311,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 ts["day_rome"],
                 meta["run_id"],
                 meta["experiment_condition"],
-                meta["scenario_id"],
-                meta["participant_id"],
                 meta["is_test_run"],
                 meta["valid_for_analysis"],
                 int(turn.get("turn_index", 0)),
@@ -4289,6 +4320,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 turn.get("hunger_state"),
                 turn.get("user_utterance") or "",
                 turn.get("assistant_utterance"),
+                int(turn.get("hunger_mentioned", self._mentions_hunger(turn.get("assistant_utterance")))),
                 int(turn.get("user_chars", len(turn.get("user_utterance") or ""))),
                 turn.get("assistant_chars"),
                 turn.get("llm_request_id"),
@@ -4305,51 +4337,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 turn.get("tts_estimated_sec"),
                 turn.get("time_to_first_response_sec"),
                 turn.get("response_total_sec"),
-                turn.get("stt_to_tts_dispatch_sec"),
-            ),
-        )
-
-    def _db_save_latency_event(
-        self,
-        conn: sqlite3.Connection,
-        interaction_id: Optional[str],
-        event: Dict[str, Any],
-        meta: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        meta = meta or self.experiment.experiment_fields()
-        conn.cursor().execute(
-            """INSERT INTO latency_events
-            (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
-             monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-             scenario_id,participant_id,is_test_run,valid_for_analysis,
-             label,turn_index,event_type,
-             request_id,at_mono,started_mono,elapsed_sec,fields_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                interaction_id or event.get("interaction_id"),
-                event.get("timestamp_utc"),
-                event.get("timestamp_local"),
-                event.get("timezone"),
-                event.get("timestamp_epoch"),
-                event.get("monotonic_sec"),
-                event.get("run_elapsed_sec"),
-                event.get("day_rome"),
-                meta["run_id"],
-                meta["experiment_condition"],
-                meta["scenario_id"],
-                meta["participant_id"],
-                meta["is_test_run"],
-                meta["valid_for_analysis"],
-                event.get("label"),
-                int(event.get("turn_index", 0)),
-                event.get("event_type"),
-                event.get("request_id"),
-                event.get("at_mono"),
-                event.get("started_mono"),
-                event.get("elapsed_sec"),
-                event.get("fields_json") or "{}",
-            ),
-        )
+                turn.get("stt_to_tts_dispatch_sec")))
 
     def _db_save_reactive(self, conn: sqlite3.Connection, data: Dict) -> None:
         try:
@@ -4357,15 +4345,15 @@ class ExecutiveControlModule(yarp.RFModule):
                 "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
                 "monotonic_sec", "run_elapsed_sec", "day_rome"
             ) if k in data}}
-            meta = self.experiment.experiment_fields(data.get("name"))
+            meta = self.experiment.experiment_fields()
             conn.cursor().execute(
                 """INSERT INTO reactive_interactions
                 (interaction_id,timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                  monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                 scenario_id,participant_id,is_test_run,valid_for_analysis,
+                 is_test_run,valid_for_analysis,
                  type,track_id,name,payload,
                  hunger_state_before,stomach_level_before,hunger_state_after,stomach_level_after)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     data.get("interaction_id"),
                     ts["timestamp_utc"],
@@ -4377,8 +4365,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["day_rome"],
                     meta["run_id"],
                     meta["experiment_condition"],
-                    meta["scenario_id"],
-                    meta["participant_id"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data.get("type"),
@@ -4388,9 +4374,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     data.get("hunger_state_before"),
                     data.get("stomach_level_before"),
                     data.get("hunger_state_after"),
-                    data.get("stomach_level_after"),
-                ),
-            )
+                    data.get("stomach_level_after")))
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_reactive failed: {e}")
@@ -4406,13 +4390,13 @@ class ExecutiveControlModule(yarp.RFModule):
                 """INSERT INTO hunger_level_events
                 (timestamp_utc,timestamp_local,timezone,timestamp_epoch,
                  monotonic_sec,run_elapsed_sec,day_rome,run_id,experiment_condition,
-                 scenario_id,participant_id,is_test_run,valid_for_analysis,
+                 is_test_run,valid_for_analysis,
                  event_type,stimulus_type,stimulus_label,reason,
                  hunger_drive_enabled,hunger_state_before,hunger_state_after,
                  stomach_level_before,stomach_level_after,level_delta,
                  active_energy_cost,meal_delta,meal_payload,trigger_mode,
                  social_state,interaction_tag,exec_interaction_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     ts["timestamp_utc"],
                     ts["timestamp_local"],
@@ -4423,8 +4407,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     ts["day_rome"],
                     meta["run_id"],
                     meta["experiment_condition"],
-                    meta["scenario_id"],
-                    meta["participant_id"],
                     meta["is_test_run"],
                     meta["valid_for_analysis"],
                     data.get("event_type"),
@@ -4443,9 +4425,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     data.get("trigger_mode"),
                     data.get("social_state"),
                     data.get("interaction_tag"),
-                    data.get("exec_interaction_id"),
-                ),
-            )
+                    data.get("exec_interaction_id")))
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_hunger_level_event failed: {e}")
@@ -4455,22 +4435,16 @@ class ExecutiveControlModule(yarp.RFModule):
     def _init_ilog(self, iid: str) -> None:
         with self._interaction_logs_lock:
             self._interaction_logs[iid] = []
-            self._interaction_latency_events[iid] = []
 
     def _pop_ilog(self, iid: str) -> List[Dict]:
         with self._interaction_logs_lock:
             return self._interaction_logs.pop(iid, [])
 
-    def _pop_latency_events(self, iid: str) -> List[Dict]:
-        with self._interaction_logs_lock:
-            return self._interaction_latency_events.pop(iid, [])
-
     def _time_fields(
         self,
         *,
         epoch: Optional[float] = None,
-        monotonic_sec: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        monotonic_sec: Optional[float] = None) -> Dict[str, Any]:
         now_epoch = time.time()
         now_mono = time.monotonic()
         mono = float(now_mono if monotonic_sec is None else monotonic_sec)
@@ -4486,37 +4460,6 @@ class ExecutiveControlModule(yarp.RFModule):
             "run_elapsed_sec": mono - self._run_started_mono,
             "day_rome": local_dt.date().isoformat(),
         }
-
-    def _record_latency_event(
-        self,
-        *,
-        label: str,
-        turn_index: int,
-        event_type: str,
-        at_mono: float,
-        started_mono: float,
-        request_id: Optional[int],
-        fields: Dict[str, Any],
-    ) -> None:
-        iid = self._get_iid()
-        if not iid:
-            return
-        event = self._time_fields(monotonic_sec=at_mono)
-        event.update({
-            "interaction_id": iid,
-            "label": label,
-            "turn_index": int(turn_index),
-            "event_type": event_type,
-            "request_id": request_id,
-            "at_mono": float(at_mono),
-            "started_mono": float(started_mono),
-            "elapsed_sec": float(at_mono - started_mono),
-            "fields_json": json.dumps(fields, ensure_ascii=False, default=str),
-        })
-        with self._interaction_logs_lock:
-            buf = self._interaction_latency_events.get(iid)
-            if buf is not None:
-                buf.append(event)
 
     def _set_iid(self, iid: Optional[str]) -> None:
         self._thread_ctx.interaction_id = iid
