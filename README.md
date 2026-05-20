@@ -180,6 +180,35 @@ flowchart LR
 
 ---
 
+## Experimental Logging
+
+### Metadata Fields
+
+| Field | Description |
+|---|---|
+| `run_id` | Stable identifier for one experimental run. Set `ALWAYSON_RUN_ID` for shared cross-module runs. If unset, each module generates one UUID at startup. |
+| `is_test_run` | `1` for pilot/debug/test runs, otherwise `0`. |
+| `valid_for_analysis` | `1` for rows intended for analysis. Defaults to `0` for test runs and `1` otherwise if unset. |
+
+### Environment Variables
+
+**Experiment run:**
+```bash
+export ALWAYSON_RUN_ID="exp01_2026_05_11"
+export ALWAYSON_IS_TEST_RUN="0"
+export ALWAYSON_VALID_FOR_ANALYSIS="1"
+```
+
+**Pilot/debug run:**
+```bash
+export ALWAYSON_RUN_ID="pilot_debug_001"
+export ALWAYSON_EXPERIMENT_CONDITION="pilot"
+export ALWAYSON_IS_TEST_RUN="1"
+export ALWAYSON_VALID_FOR_ANALYSIS="0"
+```
+
+---
+
 ## Installation
 
 ```bash
