@@ -2059,7 +2059,7 @@ class ChatBotModule(yarp.RFModule):
              chat_id, event_type, hs,
              user_chars, assistant_chars, hunger_mentioned, llm_fallback,
              proactive_mode, note, turn_count_at_event, session_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 ts["timestamp_utc"],
@@ -2119,7 +2119,7 @@ class ChatBotModule(yarp.RFModule):
              chat_id, session_id, turn_index, role, hs, text, text_chars,
              telegram_message_ts_utc, telegram_message_epoch,
              llm_fallback, hunger_mentioned, proactive_mode, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 ts["timestamp_utc"],

@@ -2443,10 +2443,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_target_selections_person ON target_selections(person_id)"
             )
             c.execute(
-            )
-            c.execute(
-            )
-            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_time ON face_ips_events(timestamp_utc)"
             )
             c.execute(
@@ -2454,8 +2450,6 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_person ON face_ips_events(person_id)"
-            )
-            c.execute(
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_face_ips_events_valid ON face_ips_events(valid_for_analysis)"
@@ -2476,26 +2470,16 @@ class SalienceNetworkModule(yarp.RFModule):
                 "CREATE INDEX IF NOT EXISTS idx_ia_run ON interaction_attempts(run_id)"
             )
             c.execute(
-            )
-            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ia_valid ON interaction_attempts(valid_for_analysis)"
             )
             c.execute(
-            )
-            c.execute(
-            )
-            c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_interaction_state_events_attempt ON interaction_state_events(attempt_id)"
-            )
-            c.execute(
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_time ON homeostatic_learning_changes(timestamp_utc)"
             )
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_homeostatic_learning_changes_person ON homeostatic_learning_changes(person_id)"
-            )
-            c.execute(
             )
 
             self._create_analytics_views(conn)
@@ -2811,7 +2795,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          is_test_run,valid_for_analysis,track_id,face_id,
                          person_id,bbox_area,ips,ss,eligible,context_label,reason,
                          last_greeted_ts)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2845,7 +2829,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          habituation_ips_delta,stimulus_type,context_label,
                          prox_score,cent_score,vel_score,gaze_score,
                          weight_prox,weight_cent,weight_vel,weight_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2888,7 +2872,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,
                          person_id,old_ss,new_ss)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2914,7 +2898,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          active_energy_cost,meals_eaten_count,n_turns,exec_interaction_id,
                          old_prox,old_cent,old_vel,old_gaze,
                          new_prox,new_cent,new_vel,new_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2956,7 +2940,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          attempt_id,track_id,face_id,person_id,start_ss,
                          success,final_state,abort_reason,exec_interaction_id,duration_sec,
                          hunger_state,is_proactive)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2989,7 +2973,7 @@ class SalienceNetworkModule(yarp.RFModule):
                          event_type,attempt_id,
                          exec_interaction_id,track_id,face_id,person_id,social_state,
                          success,abort_reason,duration_sec,hunger_state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
