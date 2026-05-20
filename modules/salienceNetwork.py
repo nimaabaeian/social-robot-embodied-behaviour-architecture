@@ -237,7 +237,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self.track_switch_hysteresis: float = 0.05
         self.track_stop_debounce_sec: float = 2.0
         self.exec_rpc_retry_sec: float = 1.0
-        self.unknown_ss1_wait_sec: float = 7.5
+        self.unknown_ss1_wait_sec: float = 5.0
 
         self.current_context_label: int = -1
 
@@ -1512,10 +1512,13 @@ class SalienceNetworkModule(yarp.RFModule):
 
     @staticmethod
     def _is_face_id_resolved(face_id: str) -> bool:
-        """A face_id is resolved when it's no longer recognizing/unmatched/empty."""
+        """A face_id is resolved when it's no longer recognizing/unmatched/unknown/empty."""
         if not face_id:
             return False
-        return face_id.lower() not in ("recognizing", "unmatched", "")
+        norm = face_id.lower()
+        if norm.startswith("unknown:"):
+            return False
+        return norm not in ("recognizing", "unmatched", "unknown", "")
 
     @staticmethod
     def _bbox_area(face: Dict[str, Any]) -> float:

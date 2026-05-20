@@ -727,35 +727,41 @@ class VisionAnalyzer(yarp.RFModule):
         has_view_subscriber = self.face_detection_img_port.getOutputCount() > 0
         has_qr_subscriber = self.qr_port.getOutputCount() > 0
 
-        if has_features_subscriber or has_landmarks_subscriber or has_target_subscriber or has_view_subscriber or has_qr_subscriber:
-            self.img_in_btl = self.img_in_port.read(shouldWait=True)
-            # Drain backlog and keep only the freshest frame to reduce display lag/stutter.
-            while True:
-                newest = self.img_in_port.read(shouldWait=False)
-                if newest is None:
-                    break
-                self.img_in_btl = newest
-            if self.img_in_btl:
-                self.image = self.__img_yarp_to_cv(self.img_in_btl)
-                if has_qr_subscriber:
-                    self.detect_qr_codes()
-                self.detect_people_obj()        # Run YOLO/ByteTrack directly on self.image
-                self.detect_mutual_gaze()       # Count # people looking at the camera and publish per-face details
-                self.detect_light()             # Extract from a HSV space, the V component of the image
-                self.detect_motion()            # Only presence (no magnitude or orientation)
-                if has_view_subscriber:
-                    self.draw_and_publish_faces_view()
-            self.timestamp = datetime.now().timestamp()
+        try:
+            if has_features_subscriber or has_landmarks_subscriber or has_target_subscriber or has_view_subscriber or has_qr_subscriber:
+                self.img_in_btl = self.img_in_port.read(shouldWait=True)
+                # Drain backlog and keep only the freshest frame to reduce display lag/stutter.
+                while True:
+                    newest = self.img_in_port.read(shouldWait=False)
+                    if newest is None:
+                        break
+                    self.img_in_btl = newest
+                if self.img_in_btl:
+                    self.image = self.__img_yarp_to_cv(self.img_in_btl)
+                    if has_qr_subscriber:
+                        self.detect_qr_codes()
+                    self.detect_people_obj()        # Run YOLO/ByteTrack directly on self.image
+                    self.detect_mutual_gaze()       # Count # people looking at the camera and publish per-face details
+                    self.detect_light()             # Extract from a HSV space, the V component of the image
+                    self.detect_motion()            # Only presence (no magnitude or orientation)
+                    if has_view_subscriber:
+                        self.draw_and_publish_faces_view()
+                self.timestamp = datetime.now().timestamp()
 
-            if has_features_subscriber:
-                self.fill_bottle()
-                self.vision_features_port.write(self.vision_features_btl)
+                if has_features_subscriber:
+                    self.fill_bottle()
+                    self.vision_features_port.write(self.vision_features_btl)
 
-            if has_landmarks_subscriber:
-                self.landmarks_port.write(self.landmarks_btl)
+                if has_landmarks_subscriber:
+                    self.landmarks_port.write(self.landmarks_btl)
+        except Exception as err:
+            self.logger.warning(f"updateModule perception stage failed: {err}")
 
         # --- Target delegation: read command from salienceNetwork, stream bbox to FaceTracker ---
-        self._handle_target_command()
+        try:
+            self._handle_target_command()
+        except Exception as err:
+            self.logger.warning(f"updateModule target delegation failed: {err}")
 
         return True
 
