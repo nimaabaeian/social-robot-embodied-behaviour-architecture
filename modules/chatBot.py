@@ -112,6 +112,19 @@ class ChatBotModule(yarp.RFModule):
     HS2_HUNGER_EVERY_N: int = 3  # force Orexigenic drive mention after N messages without one
     SESSION_GAP_SEC: float = 1800.0  # 30 min inactivity = new session
 
+    # ---- Priority-based proactive messaging (reads salienceNetwork's learning file) ----
+    LEARNING_FILENAME: str = "homeostatic_learning.json"
+    LEARNING_CACHE_TTL_SEC: float = 30.0   # min seconds between disk stat() checks
+    HS2_PRIORITY_TOPK: int = 5             # max selective recipients for HS2 entry
+    HS2_PRIORITY_FLOOR: int = 2            # min recipients; fill from unknown if below
+    HS3_PRIORITY_FLOOR: int = 3            # if filtered count < this, fall back to broadcast
+    MIN_INTERACTIONS_FOR_TRUST: int = 3    # below this, treat reward_ema as too noisy
+    PRIORITY_EMA_WEIGHT: float = 0.7       # blend: 70% reward_ema, 30% approach-from-weights
+    PRIORITY_THRESHOLD_HS2: float = 0.05   # priority score needed to be selectively pinged on HS2
+    REWARD_EMA_CLAMP: float = 30.0         # matches salienceNetwork.py reward clamp
+    FAIRNESS_ROTATION_DAYS: int = 7        # subscriber not pinged in this long gets boosted
+    DEFAULT_PROACTIVE_MODE: str = "priority"  # set to "broadcast" to disable everything below
+
     # Compiled emoji regex (proper Unicode ranges — avoids false-positives from CJK/Arabic etc.)
     _EMOJI_RE = re.compile(
         "[\U0001F300-\U0001F9FF"  # misc symbols, pictographs, emoticons, transport
@@ -174,6 +187,13 @@ class ChatBotModule(yarp.RFModule):
         self._hs2_hunger_counters: Dict[str, int] = {}  # per-user Orexigenic drive mention counter
         self._session_tracker: Dict[int, Dict[str, Any]] = {}  # chat_id -> {session_id, last_message_ts}
 
+        # Priority-based proactive messaging (read-only consumer of salienceNetwork's file)
+        self._learning_path: str = ""             # resolved in configure()
+        self._learning_cache: Dict[str, Any] = {"people": {}}
+        self._learning_mtime: float = 0.0
+        self._learning_last_check: float = 0.0    # monotonic
+        self._proactive_mode: str = self.DEFAULT_PROACTIVE_MODE
+
     # ------------------------- RFModule API -------------------------
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         try:
@@ -187,6 +207,19 @@ class ChatBotModule(yarp.RFModule):
             if rf.check("prompts"):
                 self._prompts_path = rf.find("prompts").asString()
             self._load_prompts()
+
+            # Priority-based proactive messaging config (safe defaults)
+            default_learning = os.path.join(self._alwayson_dir, "memory", self.LEARNING_FILENAME)
+            if rf.check("homeostatic_learning_path"):
+                self._learning_path = rf.find("homeostatic_learning_path").asString()
+            else:
+                self._learning_path = default_learning
+
+            if rf.check("proactive_mode"):
+                mode = rf.find("proactive_mode").asString().strip().lower()
+                if mode in ("broadcast", "priority"):
+                    self._proactive_mode = mode
+            self._log("INFO", f"Proactive mode: {self._proactive_mode} (learning: {self._learning_path})")
 
             # YARP ports
             self._hunger_port = yarp.BufferedPortBottle()
@@ -250,7 +283,9 @@ class ChatBotModule(yarp.RFModule):
                     chat_id INTEGER,
                     event_type TEXT NOT NULL CHECK (event_type IN (
                         'start','reset','user_message','assistant_reply',
-                        'hs3_proactive','hs2_entry','hs3_recovery'
+                        'hs3_proactive','hs2_entry','hs3_recovery',
+                        'link_prompt','link_confirmed','link_rejected','link_skipped',
+                        'proactive_selection'
                     )),
                     hs TEXT CHECK (hs IS NULL OR hs IN ('HS0','HS1','HS2','HS3')),
                     user_chars INTEGER,
@@ -310,7 +345,7 @@ class ChatBotModule(yarp.RFModule):
                 """
             )
             self._db.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','4') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','5') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             for key, value in self.experiment.experiment_fields().items():
@@ -458,6 +493,52 @@ class ChatBotModule(yarp.RFModule):
                 reply.addString("prompts reloaded")
                 return True
 
+            if action == "proactive_mode":
+                if cmd.size() < 2:
+                    reply.addString("ok")
+                    reply.addString(self._proactive_mode)
+                    return True
+                mode = cmd.get(1).asString().strip().lower()
+                if mode not in ("broadcast", "priority"):
+                    reply.addString("error")
+                    reply.addString("usage: proactive_mode [broadcast|priority]")
+                    return True
+                self._proactive_mode = mode
+                reply.addString("ok")
+                reply.addString(f"proactive_mode set to {mode}")
+                return True
+
+            if action == "link_status":
+                if cmd.size() >= 2:
+                    chat_id = cmd.get(1).asInt64() if cmd.get(1).isInt64() or cmd.get(1).isInt32() \
+                        else int(cmd.get(1).asString() or "0")
+                    rec = self._get_user_record(chat_id)
+                    reply.addString("ok")
+                    reply.addString(json.dumps({
+                        "chat_id": chat_id,
+                        "name": rec.get("name", ""),
+                        "person_id": rec.get("person_id", ""),
+                        "link_status": rec.get("link_status", "none"),
+                        "person_id_candidate": rec.get("person_id_candidate", ""),
+                        "link_attempts": rec.get("link_attempts", 0),
+                    }))
+                    return True
+                counts: Dict[str, int] = {}
+                for rec in self._user_memory.values():
+                    st = rec.get("link_status", "none") if isinstance(rec, dict) else "none"
+                    counts[st] = counts.get(st, 0) + 1
+                reply.addString("ok")
+                reply.addString(json.dumps(counts))
+                return True
+
+            if action == "learning_reload":
+                self._learning_mtime = 0.0
+                self._learning_last_check = 0.0
+                data = self._load_learning()
+                reply.addString("ok")
+                reply.addString(f"learning reloaded ({len(data.get('people', {}))} people)")
+                return True
+
             reply.addString("error")
             reply.addString(f"unknown command: {action}")
             return True
@@ -580,6 +661,7 @@ class ChatBotModule(yarp.RFModule):
     def _rpc_help_text() -> str:
         return (
             "commands: status | help | set_hs HS0|HS1|HS2|HS3 | clear_hs | reload_prompts"
+            " | proactive_mode [broadcast|priority] | link_status [chat_id] | learning_reload"
         )
 
     # ------------------------- Telegram Polling -------------------------
@@ -796,6 +878,14 @@ class ChatBotModule(yarp.RFModule):
         self._db_upsert_subscriber(chat_id, commit=False)
         self._db_touch_subscriber(chat_id, commit=False)
 
+        # chat_id <-> person_id link flow (runs before any LLM work / message logging).
+        # A consumed yes/no answer short-circuits; otherwise we may start a link prompt.
+        if self._handle_link_reply(chat_id, user_text):
+            self._save_user_memory()
+            self._db_commit()
+            return
+        self._maybe_start_link_flow(chat_id)
+
         hs = self._effective_hs()
         summary, history, turn_count = self._db_load_memory(chat_id)
         user_record = self._get_user_record(chat_id)
@@ -941,6 +1031,259 @@ class ChatBotModule(yarp.RFModule):
         self._db_save_memory(chat_id, summary, history, turn_count, commit=False)
         self._db_commit()
 
+    # ------------------------- chat_id <-> person_id linking -------------------------
+    def _maybe_start_link_flow(self, chat_id: int) -> None:
+        """If the user's name unambiguously matches a learned person_id, ask them to confirm.
+
+        Only ever moves the record into the ``pending`` state and sends a yes/no question;
+        the actual link is established by :meth:`_handle_link_reply` on a ``yes``. Terminal
+        states (confirmed/rejected/skipped) and an already-pending prompt are left untouched.
+        """
+        record = self._get_user_record(chat_id)
+        status = record.get("link_status", "none")
+        if status in ("confirmed", "rejected", "skipped", "pending"):
+            return
+
+        name = (record.get("name") or "").strip()
+        if not name:
+            return
+
+        matched = self._match_person_id_by_name(name)
+        if not matched:
+            return
+
+        record["person_id_candidate"] = matched
+        record["link_status"] = "pending"
+        record["link_asked_at"] = int(time.time())
+        record["link_attempts"] = int(record.get("link_attempts", 0)) + 1
+
+        question = self._prompts.get(
+            "link_confirmation",
+            "hey — quick one: are you the person I usually see in the lab? (yes / no)")
+        self._tg_send(chat_id, question)
+        self._db_log_aux_event(
+            "link_prompt",
+            chat_id=chat_id,
+            note=json.dumps({
+                "person_id_candidate": matched,
+                "link_attempts": record["link_attempts"],
+            }, ensure_ascii=False),
+            commit=False)
+        self._save_user_memory()
+        self._log("INFO", f"link flow: prompting {chat_id} (attempt {record['link_attempts']})")
+
+    def _handle_link_reply(self, chat_id: int, text: str) -> bool:
+        """Interpret an incoming message as a yes/no answer to a pending link prompt.
+
+        Returns ``True`` if the message was consumed by the link flow (caller should stop
+        and not pass it to the LLM); ``False`` if the message should flow on normally.
+        """
+        record = self._get_user_record(chat_id)
+        if record.get("link_status") != "pending":
+            return False
+
+        norm = self._normalize_for_matching(text or "").lower()
+
+        yes_re = r"\b(yes|yeah|yep|yup|y|s[iì]|sure|that'?s me|it'?s me|correct|true|affirm(ative)?|confirm)\b"
+        no_re = r"\b(no|nope|n|nah|not me|wrong|false|negative)\b"
+
+        if re.search(yes_re, norm, re.IGNORECASE):
+            record["person_id"] = record.get("person_id_candidate", "")
+            record["link_status"] = "confirmed"
+            record["person_id_candidate"] = ""
+            self._tg_send(chat_id, self._prompts.get("link_confirmed", "cool, got it 🙌"))
+            self._db_log_aux_event("link_confirmed", chat_id=chat_id, commit=False)
+            self._save_user_memory()
+            self._log("INFO", f"link flow: {chat_id} confirmed")
+            return True
+
+        if re.search(no_re, norm, re.IGNORECASE):
+            record["link_status"] = "rejected"
+            record["person_id_candidate"] = ""
+            self._tg_send(chat_id, self._prompts.get("link_rejected", "ok no worries, my bad"))
+            self._db_log_aux_event("link_rejected", chat_id=chat_id, commit=False)
+            self._save_user_memory()
+            self._log("INFO", f"link flow: {chat_id} rejected")
+            return True
+
+        # Neither yes nor no.
+        if int(record.get("link_attempts", 0)) >= 2:
+            record["link_status"] = "skipped"
+            record["person_id_candidate"] = ""
+            self._db_log_aux_event("link_skipped", chat_id=chat_id, commit=False)
+            self._save_user_memory()
+            self._log("INFO", f"link flow: {chat_id} skipped (no clear yes/no)")
+            return False  # let this message flow to the LLM normally
+
+        record["link_attempts"] = int(record.get("link_attempts", 0)) + 1
+        self._tg_send(chat_id, self._prompts.get(
+            "link_confirmation_retry", "sorry — was that a yes or a no?"))
+        self._save_user_memory()
+        return True
+
+    # ------------------------- Learning file (read-only) -------------------------
+    def _load_learning(self) -> Dict[str, Any]:
+        """Return the cached homeostatic-learning data, re-reading from disk when stale.
+
+        Always returns ``{"people": {...}}`` — never raises. On a missing file (cold start)
+        returns an empty mapping silently; on any read/parse/schema error keeps and returns
+        the previously cached data so a transient/torn read never wipes priority info.
+        """
+        now_mono = time.monotonic()
+        if (now_mono - self._learning_last_check) < self.LEARNING_CACHE_TTL_SEC:
+            return self._learning_cache
+        self._learning_last_check = now_mono
+
+        path = self._learning_path
+        if not path:
+            return self._learning_cache
+
+        try:
+            try:
+                mtime = os.path.getmtime(path)
+            except FileNotFoundError:
+                # Cold start — file appears gradually as the salience network learns.
+                self._learning_cache = {"people": {}}
+                self._learning_mtime = 0.0
+                return self._learning_cache
+
+            if mtime == self._learning_mtime:
+                return self._learning_cache
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict) or data.get("schema_version") != 1 \
+                    or not isinstance(data.get("people"), dict):
+                self._log("WARN", f"learning file schema mismatch ({path}); keeping previous cache")
+                return self._learning_cache
+
+            self._learning_cache = {"people": data["people"]}
+            self._learning_mtime = mtime
+            return self._learning_cache
+
+        except Exception as exc:  # noqa: BLE001
+            self._log("WARN", f"learning file read failed ({path}): {exc}; keeping previous cache")
+            return self._learning_cache
+
+    def _match_person_id_by_name(self, name: str) -> Optional[str]:
+        """Return the single person_id whose tokens are a superset of the name's tokens.
+
+        Tokenizes on whitespace/underscore/hyphen. Returns ``None`` for empty input, no
+        match, or an ambiguous (multiple) match — we never guess a colliding name.
+        """
+        name = (name or "").strip().lower()
+        if not name:
+            return None
+        name_tokens = {t for t in re.split(r"[\s_\-]+", name) if t}
+        if not name_tokens:
+            return None
+
+        people = self._load_learning().get("people", {})
+        matches: List[str] = []
+        for pid in people:
+            if not isinstance(pid, str):
+                continue
+            pid_tokens = {t for t in re.split(r"[\s_\-]+", pid.lower()) if t}
+            if name_tokens.issubset(pid_tokens):
+                matches.append(pid)
+
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _person_priority(self, person_id: str) -> Optional[float]:
+        """Compute a roughly [-1, +1] priority score for a confirmed person_id.
+
+        Blends the homeostatic reward EMA with an approach signal derived from learned IPS
+        weights. Returns ``None`` when the person is unknown or has too few interactions to
+        trust (``< MIN_INTERACTIONS_FOR_TRUST``). Never raises on a malformed entry.
+        """
+        if not person_id:
+            return None
+        try:
+            profile = self._load_learning().get("people", {}).get(person_id)
+            if not isinstance(profile, dict):
+                return None
+
+            homeostasis = profile.get("homeostasis")
+            if not isinstance(homeostasis, dict):
+                return None
+            interactions = int(homeostasis.get("interactions", 0) or 0)
+            if interactions < self.MIN_INTERACTIONS_FOR_TRUST:
+                return None
+
+            ema = float(homeostasis.get("reward_ema", 0.0) or 0.0)
+            ema_clamped = max(-self.REWARD_EMA_CLAMP, min(self.REWARD_EMA_CLAMP, ema))
+
+            w = profile.get("weights")
+            if not isinstance(w, dict):
+                w = {}
+            base = self._sn_baseline_weights()
+            prox = float(w.get("prox", base["prox"]) or base["prox"])
+            vel = float(w.get("vel", base["vel"]) or base["vel"])
+            cent = float(w.get("cent", base["cent"]) or base["cent"])
+            gaze = float(w.get("gaze", base["gaze"]) or base["gaze"])
+
+            approach = prox + vel + 0.5 * cent - gaze
+            approach_baseline = base["prox"] + base["vel"] + 0.5 * base["cent"] - base["gaze"]
+            approach_centered = approach - approach_baseline
+
+            score = (self.PRIORITY_EMA_WEIGHT * (ema_clamped / self.REWARD_EMA_CLAMP)
+                     + (1.0 - self.PRIORITY_EMA_WEIGHT) * approach_centered)
+            return float(score)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _sn_baseline_weights() -> Dict[str, float]:
+        # Mirrors salienceNetwork.py BASELINE_WEIGHTS (read-only reference).
+        return {"prox": 0.5, "cent": 0.15, "vel": 0.3, "gaze": 0.5}
+
+    def _rank_proactive_targets(self, all_subs: List[int], mode: str) -> List[int]:
+        """Order/filter subscribers for a proactive event according to learned priority.
+
+        ``mode`` is one of ``hs3_enter``, ``hs3_cooldown``, ``hs2_entry``, ``hs3_recovery``.
+        In ``broadcast`` proactive mode (or for unknown modes) this is a no-op that returns
+        every subscriber. Unknown users (no confirmed link / no trustworthy data) are never
+        excluded from HS3 messaging and backfill the HS2 selection when the priority pool
+        is short.
+        """
+        if self._proactive_mode == "broadcast":
+            return list(all_subs)
+
+        scored: List[Tuple[float, int]] = []
+        unknown: List[int] = []
+        now = int(time.time())
+        rotation_cutoff = now - self.FAIRNESS_ROTATION_DAYS * 86400
+
+        for chat_id in all_subs:
+            rec = self._get_user_record(chat_id)
+            pid = (rec.get("person_id") or "").strip() if rec.get("link_status") == "confirmed" else ""
+            prio = self._person_priority(pid) if pid else None
+            if prio is None:
+                unknown.append(chat_id)
+            else:
+                last_prox = self._db_last_proactive_at(chat_id)
+                if last_prox and last_prox < rotation_cutoff:
+                    prio += 1.0  # fairness boost: re-enter the loop, refresh learning signal
+                scored.append((prio, chat_id))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if mode in ("hs3_enter", "hs3_cooldown", "hs3_recovery"):
+            return [cid for _, cid in scored] + unknown
+
+        if mode == "hs2_entry":
+            positive = [cid for s, cid in scored if s > self.PRIORITY_THRESHOLD_HS2]
+            target = positive[: self.HS2_PRIORITY_TOPK]
+            if len(target) < self.HS2_PRIORITY_FLOOR:
+                need = self.HS2_PRIORITY_FLOOR - len(target)
+                target.extend([cid for cid in unknown if cid not in target][:need])
+            return target
+
+        return list(all_subs)  # defensive fall-through
+
     # ------------------------- HS3 Broadcast -------------------------
     def _maybe_hs3_proactive(self) -> None:
         eff = self._effective_hs()
@@ -952,12 +1295,31 @@ class ChatBotModule(yarp.RFModule):
 
         # on entry send to all; otherwise apply per-user cooldown
         if entering:
-            candidates = self._db_list_subscribers()
+            all_subs = self._db_list_subscribers()
+            candidates = self._rank_proactive_targets(all_subs, "hs3_enter")
+            if len(candidates) < self.HS3_PRIORITY_FLOOR and len(all_subs) > len(candidates):
+                candidates = list(all_subs)  # safety: never under-message HS3
         else:
-            candidates = self._db_proactive_candidates(now - self.HS3_PROACTIVE_COOLDOWN_SEC)
+            all_subs = self._db_proactive_candidates(now - self.HS3_PROACTIVE_COOLDOWN_SEC)
+            candidates = self._rank_proactive_targets(all_subs, "hs3_cooldown")
+            if len(candidates) < self.HS3_PRIORITY_FLOOR and len(all_subs) > len(candidates):
+                candidates = list(all_subs)
 
         if not candidates:
             return
+
+        self._db_log_aux_event(
+            "proactive_selection",
+            hs="HS3",
+            proactive_mode=self._proactive_mode,
+            note=json.dumps({
+                "mode": ("hs3_enter" if entering else "hs3_cooldown"),
+                "proactive_mode": self._proactive_mode,
+                "selected_count": len(candidates),
+                "total_subs": len(all_subs),
+                "filtered_count": len(all_subs) - len(candidates),
+            }, ensure_ascii=False),
+            commit=False)
 
         llm_text = self._llm_hs3_proactive()
         if not llm_text:
@@ -1006,9 +1368,23 @@ class ChatBotModule(yarp.RFModule):
             self._proactive_hs2_entry()
 
     def _proactive_hs2_entry(self) -> None:
-        candidates = self._db_list_subscribers()
+        all_subs = self._db_list_subscribers()
+        candidates = self._rank_proactive_targets(all_subs, "hs2_entry")
         if not candidates:
             return
+        self._log("INFO", f"HS2 entry: mode={self._proactive_mode} selected {len(candidates)}/{len(all_subs)}")
+        self._db_log_aux_event(
+            "proactive_selection",
+            hs="HS2",
+            proactive_mode=self._proactive_mode,
+            note=json.dumps({
+                "mode": "hs2_entry",
+                "proactive_mode": self._proactive_mode,
+                "selected_count": len(candidates),
+                "total_subs": len(all_subs),
+                "filtered_count": len(all_subs) - len(candidates),
+            }, ensure_ascii=False),
+            commit=False)
         msgs = [
             {"role": "system", "content": self._system_prompt("HS2")},
             {"role": "user", "content": self._prompts.get(
@@ -1048,9 +1424,22 @@ class ChatBotModule(yarp.RFModule):
             self._db_commit()
 
     def _proactive_hs3_recovery(self, new_hs: str) -> None:
-        candidates = self._db_list_subscribers()
+        all_subs = self._db_list_subscribers()
+        candidates = self._rank_proactive_targets(all_subs, "hs3_recovery")
         if not candidates:
             return
+        self._db_log_aux_event(
+            "proactive_selection",
+            hs=new_hs,
+            proactive_mode=self._proactive_mode,
+            note=json.dumps({
+                "mode": "hs3_recovery",
+                "proactive_mode": self._proactive_mode,
+                "selected_count": len(candidates),
+                "total_subs": len(all_subs),
+                "filtered_count": len(all_subs) - len(candidates),
+            }, ensure_ascii=False),
+            commit=False)
         msgs = [
             {"role": "system", "content": self._system_prompt(new_hs)},
             {"role": "user", "content": self._prompts.get(
@@ -1355,6 +1744,13 @@ class ChatBotModule(yarp.RFModule):
             "message_length": "",
             "tone": "",
         })
+
+        # chat_id <-> person_id linking (for priority-based proactive messaging)
+        record.setdefault("person_id", "")             # confirmed link (empty until confirmed)
+        record.setdefault("person_id_candidate", "")   # tentative match, pending user confirmation
+        record.setdefault("link_status", "none")       # none|pending|confirmed|rejected|skipped
+        record.setdefault("link_asked_at", 0)          # unix epoch of last confirmation prompt
+        record.setdefault("link_attempts", 0)          # times prompted (capped at 2)
 
         # Normalize jokes memory: inside_jokes: phrase -> {"count": int, "last_seen": int}
         jokes_raw = record.get("inside_jokes")
@@ -2010,6 +2406,58 @@ class ChatBotModule(yarp.RFModule):
             """
         )
 
+        # Link-flow events (chat_id <-> person_id confirmation lifecycle).
+        # Detail (person_id_candidate / link_attempts) is JSON-encoded into note.
+        self._db.execute("DROP VIEW IF EXISTS v_chat_link_events")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_link_events AS
+            SELECT
+                id,
+                timestamp_utc,
+                timestamp_local,
+                timestamp_epoch,
+                day_rome,
+                run_id,
+                is_test_run,
+                valid_for_analysis,
+                chat_id,
+                event_type,
+                CASE WHEN json_valid(note) THEN json_extract(note, '$.person_id_candidate') END AS person_id_candidate,
+                CASE WHEN json_valid(note) THEN json_extract(note, '$.link_attempts')        END AS link_attempts,
+                note
+            FROM chat_events
+            WHERE event_type IN ('link_prompt','link_confirmed','link_rejected','link_skipped')
+              AND valid_for_analysis = 1
+            """
+        )
+
+        # Priority-based proactive selection decisions (one row per proactive event).
+        self._db.execute("DROP VIEW IF EXISTS v_chat_proactive_selection")
+        self._db.execute(
+            """
+            CREATE VIEW v_chat_proactive_selection AS
+            SELECT
+                id,
+                timestamp_utc,
+                timestamp_local,
+                timestamp_epoch,
+                day_rome,
+                run_id,
+                is_test_run,
+                valid_for_analysis,
+                hs,
+                proactive_mode,
+                json_extract(note, '$.mode')           AS selection_mode,
+                CAST(json_extract(note, '$.selected_count') AS INTEGER) AS selected_count,
+                CAST(json_extract(note, '$.total_subs')     AS INTEGER) AS total_subs,
+                CAST(json_extract(note, '$.filtered_count') AS INTEGER) AS filtered_count
+            FROM chat_events
+            WHERE event_type = 'proactive_selection'
+              AND valid_for_analysis = 1
+            """
+        )
+
     # ------------------------- DB helpers -------------------------
     def _time_fields(self, epoch: Optional[float] = None) -> Dict[str, Any]:
         ts_epoch = float(time.time() if epoch is None else epoch)
@@ -2212,6 +2660,39 @@ class ChatBotModule(yarp.RFModule):
             (int(time.time()), int(chat_id)))
         if commit:
             self._db_commit()
+
+    def _db_last_proactive_at(self, chat_id: int) -> int:
+        if not self._db:
+            return 0
+        row = self._db.execute(
+            "SELECT last_proactive_at FROM subscribers WHERE chat_id=?",
+            (int(chat_id),)).fetchone()
+        return int(row[0]) if row and row[0] else 0
+
+    def _db_log_aux_event(
+        self,
+        event_type: str,
+        chat_id: Optional[int] = None,
+        hs: Optional[str] = None,
+        proactive_mode: Optional[str] = None,
+        note: str = "",
+        commit: bool = True) -> None:
+        """Log a link/selection analytics event, never crashing the caller.
+
+        These event types are part of the chat_events CHECK constraint, so inserts
+        succeed on a current schema. The wrapper is purely defensive: any unexpected
+        DB error is logged at WARN and swallowed so proactive/link flows never break.
+        """
+        try:
+            self._db_log_event(
+                event_type=event_type,
+                chat_id=chat_id,
+                hs=hs,
+                proactive_mode=proactive_mode,
+                note=note,
+                commit=commit)
+        except Exception as exc:  # noqa: BLE001
+            self._log("WARN", f"aux event '{event_type}' not logged: {exc}")
 
     def _db_count_subscribers(self) -> int:
         if not self._db:

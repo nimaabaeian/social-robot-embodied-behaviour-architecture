@@ -127,14 +127,19 @@ flowchart LR
 
 ### alwayson_chatBot
 - **Drive-Grounded Telegram Bot**: Driven by the exact same Orexigenic drive as the physical robot. System prompts dynamically adapt to the robot's physical hunger state.
-- **Proactive Engagement**: Broadcasts to users when transitioning to hungry (HS2) or starving (HS3) states, requesting remote or in-person feeding.
+- **Priority-Based Proactive Engagement**: Sends proactive messages when transitioning to hungry (HS2) or starving (HS3) states. HS2 messages are selectively sent to the highest-priority subscribers (ranked by homeostatic reward EMA from `salienceNetwork`); HS3 and recovery messages reach all subscribers. Falls back to full broadcast when no learning data is available or when `proactive_mode=broadcast` is set.
+- **Physical-Space Linking**: Optionally links each Telegram `chat_id` to a face-recognition `person_id` from `salienceNetwork`'s homeostatic learning data, via an explicit yes/no confirmation prompt. Confirmed links drive priority scoring; unconfirmed users always receive HS3 messages.
 - **Deep Memory**: Maintains rolling conversation windows, auto-summarization, and persistent per-user psychological profiles (likes, topics, inside jokes, tone).
 
 **RPC port**: `/chatBot/rpc`
 **Commands**:
 - `status` → module status (effective HS, subscriber count, thread health)
-- `set_hs <HS1|HS2|HS3>` → force Orexigenic state via RPC (for testing)
+- `set_hs <HS0|HS1|HS2|HS3>` → force Orexigenic state via RPC (for testing)
 - `clear_hs` → revert to physical port-driven state
+- `reload_prompts` → hot-reload `prompts.json` without restarting
+- `proactive_mode [broadcast|priority]` → read or set the proactive messaging mode at runtime
+- `link_status [chat_id]` → show a user's link state, or a count of all subscribers by link state
+- `learning_reload` → force re-read of `homeostatic_learning.json` (clears mtime cache)
 
 ---
 

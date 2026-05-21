@@ -54,6 +54,8 @@ EXPORTS: Tuple[Tuple[str, str, str, Optional[str]], ...] = (
     ),
     ("chatbot", "v_chat_session_metrics", "chatbot_session_metrics.csv", None),
     ("chatbot", "v_chat_events_clean", "chatbot_events_clean.csv", None),
+    ("chatbot", "v_chat_link_events", "chatbot_link_events.csv", None),
+    ("chatbot", "v_chat_proactive_selection", "chatbot_proactive_selection.csv", None),
 )
 
 
