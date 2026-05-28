@@ -104,7 +104,7 @@ flowchart LR
 ### alwayson_salienceNetwork
 - **Interaction Priority Score (IPS)**: Ranks faces dynamically by proximity, centrality, velocity, and mutual gaze. Uses hysteresis to prevent thrashing and habituation to drive novelty.
 - **Adaptive Learning**: Shifts IPS weights per-person based on homeostatic reward received after interactions.
-- **Social & Context Gates**: Manages social state transitions (`ss1` to `ss4`), dwell-time gates for strangers, and context-aware cooldowns to pace interactions.
+- **Social & Context Gates**: Manages social state transitions (`ss1` to `ss4`), dwell-time gates for strangers, and context-aware cooldowns to pace interactions. `ss4` faces (already greeted and talked) can re-engage when their IPS reaches 1.30, triggering an `ss3` action.
 - **Persistence**: Saves daily social memory to JSON to track who was greeted or talked to.
 
 **RPC port**: `/<module_name>` (default: `/salienceNetwork`)

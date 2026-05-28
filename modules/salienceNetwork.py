@@ -149,7 +149,7 @@ class SalienceNetworkModule(yarp.RFModule):
         "ss1": 1.10, # Stranger: stricter hurdle (less proactive)
         "ss2": 0.90, # Known, not greeted: more proactive
         "ss3": 1.00, # Known, greeted, no talk: still proactive, but less than ss2
-        "ss4": 99.0, # Ultimate: never proactive
+        "ss4": 1.30, # Known, talked: re-engage with ss3 action when highly salient
     }
 
     IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
@@ -763,7 +763,7 @@ class SalienceNetworkModule(yarp.RFModule):
                                             ),
                                         })
 
-                                if eligible and ss != "ss4":
+                                if eligible:
                                     can_try_exec = True
 
                                     if current_time < self._next_exec_rpc_try_ts:
@@ -825,7 +825,6 @@ class SalienceNetworkModule(yarp.RFModule):
                                     if (
                                         now2 - last_int >= self._effective_cooldown()
                                         and candidate.get("eligible", False)
-                                        and candidate.get("social_state", "ss1") != "ss4"
                                     ):
                                         exec_face_id = pending_exec_check.get(
                                             "exec_face_id",
@@ -1309,10 +1308,6 @@ class SalienceNetworkModule(yarp.RFModule):
     def _is_eligible(self, face: Dict[str, Any]) -> bool:
         ss = face.get("social_state", "ss1")
         ips = face.get("ips", 0.0)
-
-        if ss == "ss4":
-            return False
-
         threshold = self.SS_THRESHOLDS.get(ss, 1.0)
         return ips >= threshold
 
@@ -1611,7 +1606,7 @@ class SalienceNetworkModule(yarp.RFModule):
         try:
             self._log("INFO", f"talk: start t{track_id} {face_id} {ss}")
 
-            result = self._run_executive_control(track_id, face_id, ss)
+            result = self._run_executive_control(track_id, face_id, "ss3" if ss == "ss4" else ss)
             did_run_interaction = isinstance(result, dict)
             if result:
                 self._log("INFO", f"talk: done ok={bool(result.get('success'))}")
@@ -1774,8 +1769,12 @@ class SalienceNetworkModule(yarp.RFModule):
             extracted_name = (
                 result.get("name") if result.get("name_extracted") else None
             )
-            initial_ss = result.get("initial_state", "ss1")
-            final_ss = result.get("final_state", initial_ss)
+            initial_ss = str(target.get("social_state") or result.get("initial_state", "ss1"))
+            if initial_ss == "ss4":
+                # ss4 re-engagement uses an ss3 action but the person stays ss4.
+                final_ss = "ss4"
+            else:
+                final_ss = result.get("final_state", initial_ss)
 
             greeted = final_ss in ("ss3", "ss4") and initial_ss != "ss4"
             talked = final_ss == "ss4" and initial_ss != "ss4"
