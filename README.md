@@ -53,6 +53,7 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 - **alwayson_salienceNetwork**: Selects the most salient face via IPS, manages interaction gating and cooldowns, and drives face tracking.
 - **alwayson_executiveControl**: Orchestrates the interaction state machine, speech I/O, Orexigenic drive model, QR-based feeding, and LLM-driven dialogue.
 - **alwayson_chatBot**: Telegram interface driven by the same Orexigenic state and prompts.
+- **alwayson_stomachMonitor**: Real-time visual monitor for the Orexigenic drive, rendering hunger level and digestion status.
 
 **External modules**
 - [speech2text](https://gitlab.iit.it/cognitiveInteraction/speech2text)
@@ -143,6 +144,15 @@ flowchart LR
 
 ---
 
+### alwayson_stomachMonitor
+- **Visual Orexigenic Drive Monitor**: A graphical interface rendering the robot's internal hunger state, stomach level, and digestion in real-time.
+- **Interactive Control**: Allows manual injection of meals (QR simulation) and direct manipulation of the hunger state for debugging and demonstrations.
+- **Zero-Interference**: Operates passively by polling `/executiveControl` status, ensuring it can be attached or detached without affecting the main behavior pipeline.
+
+**YARP connections**:
+- RPC polling to `/executiveControl`
+- Writes to `/alwayson/executiveControl/qr:i`
+
 ## YARP Ports and Connections
 
 **Modules**
@@ -153,6 +163,7 @@ flowchart LR
 | `alwayson_salienceNetwork` | core | icubsrv |
 | `alwayson_executiveControl` | core | icubsrv |
 | `alwayson_chatBot` | core | icubsrv |
+| `alwayson_stomachMonitor` | viewer | localhost |
 | `faceTracker` | external | icubsrv |
 | `yarpview` | viewer | localhost |
 
