@@ -42,6 +42,12 @@
         <node>icubsrv</node>
     </module>
 
+    <module>
+        <name>alwayson_stomachMonitor</name>
+        <parameters>--server /executiveControl --qr /alwayson/executiveControl/qr:i</parameters>
+        <node>localhost</node>
+    </module>
+
     <!-- ======== CONNECTIONS ======== -->
     <connection>
         <from>/icub/cam/left</from>

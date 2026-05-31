@@ -184,6 +184,7 @@ class VisionAnalyzer(yarp.RFModule):
         # --- Target command state ---
         self._current_target_track_id = -1
         self._current_target_ips = 0.0
+        self._last_target_log_ts = 0.0
 
         # QR state tracking (emit once per appearance)
         self._active_qr_value = None
@@ -726,6 +727,7 @@ class VisionAnalyzer(yarp.RFModule):
         has_target_subscriber = self.target_box_port.getOutputCount() > 0
         has_view_subscriber = self.face_detection_img_port.getOutputCount() > 0
         has_qr_subscriber = self.qr_port.getOutputCount() > 0
+        target_handled = False
 
         try:
             if has_features_subscriber or has_landmarks_subscriber or has_target_subscriber or has_view_subscriber or has_qr_subscriber:
@@ -744,6 +746,8 @@ class VisionAnalyzer(yarp.RFModule):
                     self.detect_mutual_gaze()       # Count # people looking at the camera and publish per-face details
                     self.detect_light()             # Extract from a HSV space, the V component of the image
                     self.detect_motion()            # Only presence (no magnitude or orientation)
+                    self._handle_target_command()
+                    target_handled = True
                     if has_view_subscriber:
                         self.draw_and_publish_faces_view()
                 self.timestamp = datetime.now().timestamp()
@@ -759,7 +763,8 @@ class VisionAnalyzer(yarp.RFModule):
 
         # --- Target delegation: read command from salienceNetwork, stream bbox to FaceTracker ---
         try:
-            self._handle_target_command()
+            if not target_handled:
+                self._handle_target_command()
         except Exception as err:
             self.logger.warning(f"updateModule target delegation failed: {err}")
 
@@ -1027,6 +1032,8 @@ class VisionAnalyzer(yarp.RFModule):
                     full_label += f" | {dist_str}"
                 if zone_str and zone_str != "UNKNOWN":
                     full_label += f" | {zone_str}"
+                if self._is_current_target(track_id):
+                    full_label += f" | IPS:{self._current_target_ips:.2f}"
 
                 display_labels.append(full_label)
 
@@ -1042,7 +1049,111 @@ class VisionAnalyzer(yarp.RFModule):
         else:
             annotated_image = frame
 
+        self._draw_target_overlay(annotated_image, detections)
+
         self._write_annotated_image(annotated_image)
+
+    def _is_current_target(self, track_id):
+        try:
+            return self._current_target_track_id >= 0 and int(track_id) == int(self._current_target_track_id)
+        except (TypeError, ValueError):
+            return False
+
+    def _target_box_for_overlay(self, detections):
+        tracked_id = self._current_target_track_id
+        if tracked_id < 0:
+            return None
+
+        if (
+            detections is not None
+            and len(detections) > 0
+            and getattr(detections, "tracker_id", None) is not None
+        ):
+            for i, tid in enumerate(detections.tracker_id):
+                if self._is_current_target(tid):
+                    x1, y1, x2, y2 = detections.xyxy[i].astype(int)
+                    return int(x1), int(y1), int(x2), int(y2)
+
+        for face_data in self.detected_faces:
+            if self._is_current_target(face_data.get("track_id")):
+                x, y, w, h = face_data.get("bbox", (0, 0, 0, 0))
+                return int(x), int(y), int(x + w), int(y + h)
+
+        return None
+
+    def _draw_target_overlay(self, annotated_image, detections):
+        box = self._target_box_for_overlay(detections)
+        self._log_target_overlay_state(box)
+        if box is None:
+            self._draw_target_status_banner(annotated_image, matched=False)
+            return
+
+        h, w = annotated_image.shape[:2]
+        x1, y1, x2, y2 = box
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w - 1, x2))
+        y2 = max(0, min(h - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            self._draw_target_status_banner(annotated_image, matched=False)
+            return
+
+        pulse = (np.sin(time.time() * 5.0) + 1.0) / 2.0
+        green = int(160 + 95 * pulse)
+        tracked_color = (0, green, 0)
+
+        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 90, 0), thickness=7)
+        cv2.rectangle(annotated_image, (x1, y1), (x2, y2), tracked_color, thickness=3)
+
+        ips_text = f"TRACKED  id:{self._current_target_track_id}  IPS: {self._current_target_ips:.2f}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.65
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(ips_text, font, scale, thickness)
+        text_x = max(0, min(w - tw - 4, x1))
+        text_y = y2 + th + 8
+        if text_y + baseline + 4 >= h:
+            text_y = max(th + 4, y1 - 8)
+
+        bg_x1 = max(0, text_x - 3)
+        bg_y1 = max(0, text_y - th - 4)
+        bg_x2 = min(w - 1, text_x + tw + 5)
+        bg_y2 = min(h - 1, text_y + baseline + 4)
+        cv2.rectangle(annotated_image, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 35, 0), thickness=-1)
+        cv2.putText(
+            annotated_image, ips_text, (text_x, text_y),
+            font, scale, tracked_color, thickness, cv2.LINE_AA,
+        )
+
+    def _draw_target_status_banner(self, annotated_image, matched):
+        if self._current_target_track_id < 0:
+            return
+        text = f"TARGET id:{self._current_target_track_id} IPS:{self._current_target_ips:.2f}"
+        if not matched:
+            text += " (not visible)"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+        x, y = 8, th + 10
+        cv2.rectangle(annotated_image, (4, 4), (min(annotated_image.shape[1] - 1, tw + 14), y + baseline + 5), (0, 35, 0), -1)
+        cv2.putText(annotated_image, text, (x, y), font, scale, (0, 255, 0), thickness, cv2.LINE_AA)
+
+    def _log_target_overlay_state(self, box):
+        now = time.time()
+        if now - self._last_target_log_ts < 1.0:
+            return
+        self._last_target_log_ts = now
+        if self._current_target_track_id < 0:
+            return
+        visible_ids = [fd.get("track_id") for fd in self.detected_faces]
+        if box is None:
+            self.logger.info(
+                f"target overlay: command id={self._current_target_track_id} ips={self._current_target_ips:.2f} "
+                f"but no matching visible track; visible={visible_ids}")
+        else:
+            self.logger.info(
+                f"target overlay: drawing id={self._current_target_track_id} ips={self._current_target_ips:.2f} box={box}")
 
     def _write_annotated_image(self, annotated_image_bgr):
         annotated_rgb = cv2.cvtColor(annotated_image_bgr, cv2.COLOR_BGR2RGB)
