@@ -1439,6 +1439,12 @@ class ExecutiveControlModule(yarp.RFModule):
             "hunger_state":    self._effective_hunger_state(snap),
             "hunger_level":    snap.level if snap else 100.0,
             "run_id":          self.experiment.run_id,
+            # tuning exposed so monitors/GUIs stay in sync without hardcoding
+            "meals":               dict(self._meal_mapping),
+            "qr_cooldown_sec":     self._qr_cooldown_sec,
+            "hungry_threshold":    self.hunger.hungry_threshold,
+            "starving_threshold":  self.hunger.starving_threshold,
+            "drain_hours":         self.hunger.drain_hours,
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:

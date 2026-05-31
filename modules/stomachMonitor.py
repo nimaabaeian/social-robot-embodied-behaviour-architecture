@@ -81,7 +81,8 @@ BORDER = "#E3EAF2"
 INK = "#243040"
 MUTED = "#7F8A99"
 RENDER_SS = 1
-MAX_RENDER_VIEW = 720
+MAX_RENDER_VIEW = 960    # internal PIL render resolution cap (higher = crisper)
+MAX_DISPLAY_VIEW = 1600  # final on-screen size cap (PhotoImage upload size)
 
 DECOR_SYMBOLS = ["♪", "♫", "✦", "✧", "♡", "•"]
 DECOR_COLORS = ["#D8C7FF", "#FFD6E0", "#BFEBD8", "#FFE0A8", "#CDE7FF"]
@@ -161,6 +162,7 @@ class StomachRenderer:
         # Reusable scratch buffers (avoid per-frame allocations)
         self._scratch_l = Image.new("L", (s, s), 0)
         self._scratch_rgba = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        self._scratch_rgba_m = Image.new("RGBA", (s, s), (0, 0, 0, 0))
 
         # Surface wave x-coordinates (constant, only y varies per frame)
         self._surf_x0 = self.minx - 24 * ss
@@ -200,6 +202,8 @@ class StomachRenderer:
         liquid, ldark, empty, outline = [hx(c) for c in PALETTE[state]]
         edark = tuple(int(c * 0.92) for c in empty)
         base = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        # Bake the (static) drop shadow into the base so it costs nothing per frame.
+        base.alpha_composite(self.shadow)
 
         tube = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         td = ImageDraw.Draw(tube)
@@ -316,7 +320,8 @@ class StomachRenderer:
             spr.alpha_composite(self._clip(bl, liquid_mask))
 
         if not off and 1 < level < 99:
-            ml = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            ml = self._scratch_rgba_m
+            ml.paste((0, 0, 0, 0), (0, 0, s, s))  # clear reusable buffer
             ImageDraw.Draw(ml).line(
                 surf, fill=meniscus_col,
                 width=3 * ss, joint="curve")
@@ -411,24 +416,14 @@ class StomachRenderer:
                 d.text((p["x"] * ss, p["y"] * ss), "♡", font=self.font,
                        fill=(255, 150, 170, a), anchor="mm")
 
-    def frame(self, sprite_pil, dx, dy, scale=1.0):
-        s = self.w
-        f = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        f.paste(self.shadow, (0, 0), self.shadow)
-        if abs(scale - 1.0) > 0.001:
-            nw = max(1, int(sprite_pil.width * scale))
-            nh = max(1, int(sprite_pil.height * scale))
-            sprite_pil = sprite_pil.resize((nw, nh), self._bilinear)
-            px = int((s - nw) / 2 + dx * self.ss)
-            py = int((s - nh) / 2 + dy * self.ss)
-        else:
-            px = int(dx * self.ss)
-            py = int(dy * self.ss)
-        f.paste(sprite_pil, (px, py), sprite_pil)
-        # At SS=1 the output size equals internal size; skip downscale
-        if self.W == s:
-            return f
-        return f.resize((self.W, self.W), self._bilinear)
+    def present(self, sprite_pil, disp_size, scale=1.0):
+        """Single resize from render size to on-screen size, scale pulse folded
+        in. Shadow is baked into the sprite; bob/shake is applied by the caller
+        via canvas coordinates, so no oversized buffer or extra paste is needed."""
+        target = max(1, int(round(disp_size * scale)))
+        if abs(target - self.w) <= 1:
+            return sprite_pil
+        return sprite_pil.resize((target, target), self._bilinear)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -508,7 +503,12 @@ class StomachApp:
         self.backend = backend
         self.server_name = server_name
         self.view = VIEW
-        self.renderer = StomachRenderer(view=self.view, ss=RENDER_SS) if HAVE_PIL else None
+        self._renderer_cache: Dict[int, "StomachRenderer"] = {}
+        self.renderer = self._get_renderer(self.view)
+
+        # Display tuning; overwritten live from the controller status when present.
+        self.meals = dict(MEALS)
+        self.qr_cooldown = QR_COOLDOWN_SEC
 
         self.state = "HS0"
         self.prev_state = "HS0"
@@ -533,6 +533,7 @@ class StomachApp:
         self._last_frame_time = time.perf_counter()
         self._last_bg = None
         self._last_badge = None
+        self._disp_size = self.view  # actual displayed image size (may differ from render size)
 
         root.title("iCub · Stomach Monitor")
         root.configure(bg=BG)
@@ -648,14 +649,27 @@ class StomachApp:
         target = getattr(self, '_pending_view', self.view)
         self._set_view_size(target)
 
+    def _get_renderer(self, view):
+        """Build-or-reuse a renderer for a given size. Caching avoids the heavy
+        full rebuild (4 base composites + gradients + blurred shadow) every time
+        the window is resized or fullscreen is toggled."""
+        if not HAVE_PIL:
+            return None
+        r = self._renderer_cache.get(view)
+        if r is None:
+            if len(self._renderer_cache) >= 4:
+                self._renderer_cache.clear()
+            r = StomachRenderer(view=view, ss=RENDER_SS)
+            self._renderer_cache[view] = r
+        return r
+
     def _set_view_size(self, new_view):
         new_view = max(320, min(MAX_RENDER_VIEW, new_view))
         if abs(new_view - self.view) < 24:
             return
         old_view = self.view
         self.view = new_view
-        if HAVE_PIL:
-            self.renderer = StomachRenderer(view=self.view, ss=RENDER_SS)
+        self.renderer = self._get_renderer(self.view)
         scale = self.view / max(1, old_view)
         for p in self.particles:
             if "x" in p:
@@ -669,14 +683,15 @@ class StomachApp:
         width = width or self.canvas.winfo_width()
         height = height or self.canvas.winfo_height()
         cx, cy = width // 2, height // 2
+        ds = self._disp_size
         self.canvas.coords(self.img_item, cx, cy)
-        self.canvas.coords(self.title_item, cx, max(36, cy - self.view // 2 + 24))
-        badge_w, badge_h = 260, 34
+        self.canvas.coords(self.title_item, cx, max(36, cy - ds // 2 + 24))
+        badge_w = 260
         self.canvas.coords(
             self.badge_bg,
-            cx - badge_w // 2, cy + self.view // 2 - 38,
-            cx + badge_w // 2, cy + self.view // 2 - 4)
-        self.canvas.coords(self.badge_item, cx, cy + self.view // 2 - 21)
+            cx - badge_w // 2, cy + ds // 2 - 38,
+            cx + badge_w // 2, cy + ds // 2 - 4)
+        self.canvas.coords(self.badge_item, cx, cy + ds // 2 - 21)
 
     def _create_decor(self):
         for _ in range(10):
@@ -795,9 +810,9 @@ class StomachApp:
         if self.backend.cmd_meal(payload) is False:
             self._add_event("Feed rejected by backend")
             return
-        self.cooldown_until = now + QR_COOLDOWN_SEC
+        self.cooldown_until = now + self.qr_cooldown
         self._spawn_pellet(payload)
-        self._add_event(f"{payload.replace('_', ' ').title()} received +{int(MEALS[payload])}")
+        self._add_event(f"{payload.replace('_', ' ').title()} received +{int(self.meals.get(payload, 0))}")
         self._refresh_buttons()
 
     def _shutdown(self):
@@ -812,20 +827,7 @@ class StomachApp:
                 "r": random.uniform(2.2, 5.0), "sp": random.uniform(0.004, 0.011)}
 
     def _spawn_pellet(self, payload):
-        col = {"SMALL_MEAL": "#9fcf7a", "MEDIUM_MEAL": "#e8a06a",
-               "LARGE_MEAL": "#e87a5c"}.get(payload, "#cccccc")
-        delta = MEALS.get(payload, 0)
-        count = {"SMALL_MEAL": 4, "MEDIUM_MEAL": 7, "LARGE_MEAL": 11}.get(payload, 5)
-        for _ in range(count):
-            self.particles.append({
-                "kind": "pellet",
-                "x": self.view * random.uniform(0.44, 0.56),
-                "y": self.view * random.uniform(0.02, 0.09),
-                "vy": random.uniform(-130.0, 45.0),
-                "vx": random.uniform(-90.0, 90.0),
-                "r": random.uniform(3.5, 7.5),
-                "col": col,
-            })
+        delta = self.meals.get(payload, 0)
         self.particles.append({"kind": "text", "x": self.view * 0.34, "y": self.view * 0.30,
                                "txt": f"+{int(delta)}", "life": 1.0})
 
@@ -836,6 +838,13 @@ class StomachApp:
         self.connected = snap["connected"]
         self.enabled = snap["enabled"]
         self.busy = snap.get("busy", False)
+        # Adopt live tuning from the controller when it advertises it.
+        meals = snap.get("meals")
+        if isinstance(meals, dict) and meals:
+            self.meals = meals
+        qcs = snap.get("qr_cooldown_sec")
+        if qcs:
+            self.qr_cooldown = qcs
         err = str(snap.get("last_error") or "")
         if err and err != self._last_error_seen:
             self._last_error_seen = err
@@ -856,8 +865,6 @@ class StomachApp:
         self.target_level = snap["level"]
         if self.enabled and self.target_level - self.last_level > 1.5:
             delta = self.target_level - self.last_level
-            self.particles.append({"kind": "pellet", "x": self.view * 0.5, "y": self.view * 0.06,
-                                   "vy": 0.0, "r": 8, "col": "#dddddd"})
             if time.monotonic() > self.cooldown_until:
                 self._add_event(f"Meal received +{int(round(delta))}")
         self.last_level = self.target_level
@@ -875,10 +882,10 @@ class StomachApp:
         elif self.state == "HS0":
             state_label = "Drive unavailable"
         self.lbl_state.config(text=state_label, fg=acc)
-        self.lbl_level.config(text=("OFF" if not self.enabled else f"{self.disp_level:0.0f}%"),
+        self.lbl_level.config(text=("OFF" if not self.enabled else f"{self.disp_level:.1f}%"),
                               fg=(MUTED if not self.enabled else acc))
-        fill_w = 0 if not self.enabled else max(0, min(150, int(150 * self.disp_level / 100.0)))
-        self.level_bar.coords(self.level_fill, 0, 0, fill_w, 6)
+        if not self.enabled:
+            self.level_bar.coords(self.level_fill, 0, 0, 0, 6)
         self.level_bar.itemconfig(self.level_fill, fill=(MUTED if not self.enabled else acc))
         self.lbl_busy.config(text=("● interacting…" if self.busy else "○ idle"))
         if self.connected:
@@ -910,7 +917,7 @@ class StomachApp:
                 "MEDIUM_MEAL": "Meal",
                 "LARGE_MEAL": "Feast",
             }[k]
-            delta = int(MEALS[k])
+            delta = int(self.meals.get(k, 0))
             if not self.enabled:
                 self._set_button_colors(b, "#f0f1f3", "#c2c7cc", "#f0f1f3", state="disabled")
                 b.config(text=f"{label}  +{delta}")
@@ -964,7 +971,12 @@ class StomachApp:
             else:
                 self._render_vector()
         except Exception:
-            pass
+            # Don't let a render glitch silently freeze the frame: surface the
+            # first few and then periodically, rate-limited so we never spam.
+            self._render_errors = getattr(self, "_render_errors", 0) + 1
+            if self._render_errors <= 3 or self._render_errors % 300 == 0:
+                print(f"[WARN] stomachMonitor render error #{self._render_errors}")
+                traceback.print_exc()
         finally:
             elapsed = time.perf_counter() - start
             target = 1.0 / max(1, FPS)
@@ -997,11 +1009,16 @@ class StomachApp:
                 self.bubbles[i] = self._new_bubble()
 
         if self.enabled:
-            # Throttle label updates — only when displayed text changes
-            new_text = f"{self.disp_level:0.0f}%"
+            # Update label (1 decimal so even slow passive drain is visible)
+            new_text = f"{self.disp_level:.1f}%"
             if getattr(self, '_last_level_text', '') != new_text:
                 self._last_level_text = new_text
                 self.lbl_level.config(text=new_text)
+            # Update bar at full 30 fps so it tracks the animated disp_level
+            fill_w = max(0, min(150, int(150 * self.disp_level / 100.0)))
+            if getattr(self, '_last_fill_w', -1) != fill_w:
+                self._last_fill_w = fill_w
+                self.level_bar.coords(self.level_fill, 0, 0, fill_w, 6)
 
         if self.renderer:
             wy_disp = self.renderer.water_y_disp(self.disp_level)
@@ -1089,8 +1106,19 @@ class StomachApp:
             scale = 1.0 + 0.016 * math.sin(self.phase * 1.9)
         elif self.state == "HS3":
             scale = 1.0 + 0.022 * math.sin(self.phase * 3.3) + 0.006 * math.sin(self.phase * 8.0)
-        frame = r.frame(spr, dx, dy, scale)
+        # One resize: render size -> on-screen size, with the scale pulse folded
+        # in. Bob/shake is applied by moving the (center-anchored) canvas item,
+        # which is free, instead of re-compositing into a larger buffer.
+        cw = self.canvas.winfo_width() or self.view
+        ch = self.canvas.winfo_height() or self.view
+        disp = max(self.view, min(cw - 16, ch - 16, MAX_DISPLAY_VIEW))
+        frame = r.present(spr, disp, scale)
+        if disp != self._disp_size:
+            self._disp_size = disp
+            self._position_canvas_items(cw, ch)
         self._photo = ImageTk.PhotoImage(frame)
+        f = disp / float(self.view)
+        self.canvas.coords(self.img_item, cw // 2 + dx * f, ch // 2 + dy * f)
         self.canvas.itemconfig(self.img_item, image=self._photo)
 
     # ── vector fallback (no Pillow) ──────────────────────────────────────────────
@@ -1150,6 +1178,8 @@ class StomachMonitorModule(_RFModuleBase):
         self._sim_backend: Optional[SimBackend] = None
         self._root: Optional[tk.Tk] = None
         self._app: Optional[StomachApp] = None
+        self._io_thread: Optional[threading.Thread] = None
+        self._io_stop = threading.Event()
 
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         try:
@@ -1213,16 +1243,18 @@ class StomachMonitorModule(_RFModuleBase):
             return dict(self._snap)
 
     def cmd_rpc(self, words):
+        # Non-blocking: enqueue and let the I/O thread do the blocking write so
+        # button clicks never stall the UI / animation.
         if self._sim_backend is not None:
             return self._sim_backend.cmd_rpc(words)
-        self._ensure_links()
-        return self._send_rpc(words)
+        self._cmds.put(("rpc", list(words)))
+        return True
 
     def cmd_meal(self, payload):
         if self._sim_backend is not None:
             return self._sim_backend.cmd_meal(payload)
-        self._ensure_links()
-        return self._send_meal(payload)
+        self._cmds.put(("meal", payload))
+        return True
 
     def start(self):
         pass
@@ -1250,27 +1282,35 @@ class StomachMonitorModule(_RFModuleBase):
     def run_tk_mainloop(self) -> bool:
         if self._root is None:
             return False
-        self._root.after(20, self._tk_backend_tick)
+        # Producer/consumer split: a background thread owns all blocking YARP I/O
+        # (polling + sending), the Tk main thread only renders and reads the
+        # lock-protected snapshot. Nothing on the UI thread can block on the net.
+        if self._sim_backend is None:
+            self._io_stop.clear()
+            self._io_thread = threading.Thread(
+                target=self._io_loop, name="stomachMonitor-io", daemon=True)
+            self._io_thread.start()
         try:
             self._root.mainloop()
         finally:
             self._running = False
+            self._io_stop.set()
         return True
 
-    def _tk_backend_tick(self) -> None:
-        if not self._running or self._root is None:
-            return
-        try:
-            if self._sim_backend is None:
+    def _io_loop(self) -> None:
+        """All blocking YARP I/O lives here, off the Tk/UI thread."""
+        while self._running and not self._io_stop.is_set():
+            try:
                 self._ensure_links()
                 self._drain_cmds()
                 now = time.monotonic()
                 if now >= self._next_poll:
                     self._poll_status()
                     self._next_poll = now + self.poll_period
-        finally:
-            if self._running and self._root is not None:
-                self._root.after(20, self._tk_backend_tick)
+            except Exception as e:
+                with self._lock:
+                    self._snap["last_error"] = str(e)
+            self._io_stop.wait(0.02)
 
     def respond(self, cmd: yarp.Bottle, reply: yarp.Bottle) -> bool:
         reply.clear()
@@ -1309,6 +1349,7 @@ class StomachMonitorModule(_RFModuleBase):
 
     def interruptModule(self):
         self._running = False
+        self._io_stop.set()
         for port in (self._rpc_port, self._controller_rpc, self._qr_port):
             try:
                 if port is not None:
@@ -1326,6 +1367,14 @@ class StomachMonitorModule(_RFModuleBase):
         if self._closed:
             return True
         self._closed = True
+        # Stop the I/O thread before closing ports so it never touches a dead port.
+        self._io_stop.set()
+        if self._io_thread is not None:
+            try:
+                self._io_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self._io_thread = None
         for port in (self._rpc_port, self._controller_rpc, self._qr_port):
             try:
                 if port is not None:
@@ -1377,6 +1426,20 @@ class StomachMonitorModule(_RFModuleBase):
                     level=float(data.get("hunger_level", 100.0)),
                     state=str(data.get("hunger_state", "HS0")),
                     busy=bool(data.get("busy", False)))
+                # Live tuning from the controller (keeps the GUI in sync; no
+                # hardcoded copies that can silently drift).
+                meals = data.get("meals")
+                if isinstance(meals, dict) and meals:
+                    try:
+                        self._snap["meals"] = {str(k): float(v) for k, v in meals.items()}
+                    except (TypeError, ValueError):
+                        pass
+                qcs = data.get("qr_cooldown_sec")
+                if qcs is not None:
+                    try:
+                        self._snap["qr_cooldown_sec"] = float(qcs)
+                    except (TypeError, ValueError):
+                        pass
         except Exception:
             with self._lock:
                 self._snap["connected"] = self._controller_rpc.getOutputCount() > 0
