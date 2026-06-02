@@ -1248,7 +1248,9 @@ class ExecutiveControlModule(yarp.RFModule):
         meal_payload: Optional[str] = None,
         result: Optional[InteractionResult] = None,
         reason: Optional[str] = None,
-        force: bool = False) -> None:
+        force: bool = False,
+        feeder_track_id: Optional[int] = None,
+        feeder_face_id: Optional[str] = None) -> None:
         try:
             snap = self.hunger.snapshot()
             after = float(level_after if level_after is not None else snap.level)
@@ -1280,6 +1282,8 @@ class ExecutiveControlModule(yarp.RFModule):
                 "social_state": getattr(result, "initial_state", None) if result else None,
                 "interaction_tag": getattr(result, "interaction_tag", None) if result else None,
                 "exec_interaction_id": self._get_iid(),
+                "feeder_track_id": feeder_track_id,
+                "feeder_face_id": feeder_face_id,
             }))
         except Exception as e:
             self._log("WARNING", f"hunger_level_event log failed: {e}")
@@ -2286,6 +2290,30 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._qr_stop.wait(0.02)
                     continue
 
+                # For ambient feeds (no active hunger tree) require a face in the
+                # scene — the QR could be a stray scan with nobody present.
+                # During an active hunger tree the robot is already talking to
+                # someone, so the gate does not apply; use the known track_id.
+                if self._hunger_tree_active.is_set():
+                    feeder_tid = self._current_track_id
+                    feeder_fid = None
+                else:
+                    scene_faces = self._latest_faces_snapshot(staleness=3.0)
+                    scene_candidates = [
+                        (f.get("track_id"), str(f.get("face_id", "")).strip(),
+                         (f.get("bbox", [0, 0, 0, 0])[2] * f.get("bbox", [0, 0, 0, 0])[3])
+                         if isinstance(f.get("bbox"), (list, tuple)) and len(f.get("bbox", [])) >= 4 else 0)
+                        for f in scene_faces
+                        if isinstance(f.get("track_id"), int) and f.get("track_id", -1) >= 0
+                    ]
+                    if not scene_candidates:
+                        self._log("DEBUG", f"Ignoring QR '{val}' (no face in scene)")
+                        self._qr_stop.wait(0.02)
+                        continue
+                    best_face  = max(scene_candidates, key=lambda c: c[2])
+                    feeder_tid = best_face[0]
+                    feeder_fid = best_face[1] or None
+
                 now_mono = time.monotonic()
                 if now_mono - self._last_scan_ts_mono < self._qr_cooldown_sec:
                     self._qr_stop.wait(0.02)
@@ -2310,8 +2338,10 @@ class ExecutiveControlModule(yarp.RFModule):
                     meal_delta=delta,
                     meal_payload=val,
                     reason="qr_feed",
-                    force=True)
-                self._log("INFO", f"QR: {val} (+{delta}) → stomach {snap.level:.1f} ({snap.state})")
+                    force=True,
+                    feeder_track_id=feeder_tid,
+                    feeder_face_id=feeder_fid)
+                self._log("INFO", f"QR: {val} (+{delta}) → stomach {snap.level:.1f} ({snap.state}) feeder=track{feeder_tid}/{feeder_fid}")
                 if snap.state != hs_before:
                     self._set_face_emotion(snap.state)
 
@@ -2323,8 +2353,8 @@ class ExecutiveControlModule(yarp.RFModule):
                         self._charge_energy(self.FEED_ACK_ENERGY_COST, None, "ambient_feed_ack")
                     self._db_enqueue(("reactive", {
                         "type":                 "qr_feed",
-                        "track_id":             None,
-                        "name":                 None,
+                        "track_id":             feeder_tid,
+                        "name":                 feeder_fid,
                         "payload":              val,
                         "hunger_state_before":  hs_before,
                         "stomach_level_before": snap_before.level,
@@ -3666,10 +3696,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 trigger_mode TEXT,
                 social_state TEXT,
                 interaction_tag TEXT,
-                exec_interaction_id TEXT
+                exec_interaction_id TEXT,
+                feeder_track_id INTEGER,
+                feeder_face_id TEXT
             )""")
             c.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','5') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','6') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             for key, value in self.experiment.experiment_fields().items():
@@ -3838,7 +3870,9 @@ class ExecutiveControlModule(yarp.RFModule):
                        trigger_mode,
                        social_state,
                        interaction_tag,
-	                       exec_interaction_id
+	                       exec_interaction_id,
+	                       feeder_track_id,
+	                       feeder_face_id
 	                FROM hunger_level_events""",
             "v_interaction_turns": """
                 SELECT interaction_id,
@@ -4352,8 +4386,9 @@ class ExecutiveControlModule(yarp.RFModule):
                  hunger_drive_enabled,hunger_state_before,hunger_state_after,
                  stomach_level_before,stomach_level_after,level_delta,
                  active_energy_cost,meal_delta,meal_payload,trigger_mode,
-                 social_state,interaction_tag,exec_interaction_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 social_state,interaction_tag,exec_interaction_id,
+                 feeder_track_id,feeder_face_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     ts["timestamp_utc"],
                     ts["timestamp_local"],
@@ -4381,7 +4416,9 @@ class ExecutiveControlModule(yarp.RFModule):
                     data.get("trigger_mode"),
                     data.get("social_state"),
                     data.get("interaction_tag"),
-                    data.get("exec_interaction_id")))
+                    data.get("exec_interaction_id"),
+                    data.get("feeder_track_id"),
+                    data.get("feeder_face_id")))
             conn.commit()
         except Exception as e:
             self._log("ERROR", f"DB save_hunger_level_event failed: {e}")
