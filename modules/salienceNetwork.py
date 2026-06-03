@@ -152,7 +152,6 @@ class SalienceNetworkModule(yarp.RFModule):
         "ss4": 1.30, # Known, talked: re-engage with ss3 action when highly salient
     }
 
-    IPS_HYSTERESIS_BONUS = 0.3  # Stickiness for the current target
     HABITUATION_LAMBDA = 0.20  # Habituation decay
     HOMEOSTATIC_WEIGHT_SHIFT_RATE = 0.15
     HOMEOSTATIC_REWARD_SCALE = 0.005
@@ -220,7 +219,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self.current_target_track_id: int = -1  # For applying Hysteresis
         self._target_decay_track_id: int = -1
         self._target_decay_started_at: float = 0.0
-        self._decay_caps: Dict[int, float] = {}
+        self._recovery_tracks: Dict[int, Tuple[float, float]] = {}  # track_id → (start_time, multiplier_at_switch)
 
         # Guards memory dicts and file I/O
         self._memory_lock = threading.Lock()
@@ -234,7 +233,7 @@ class SalienceNetworkModule(yarp.RFModule):
         self.cooldown_default: float = 5.0
         self.min_track_ips: float = 0.6
         self.track_stop_hysteresis: float = 0.1
-        self.track_switch_hysteresis: float = 0.05
+        self.track_switch_hysteresis: float = 0.1
         self.track_stop_debounce_sec: float = 2.0
         self.exec_rpc_retry_sec: float = 1.0
         self.unknown_ss1_wait_sec: float = 5.0
@@ -1205,16 +1204,21 @@ class SalienceNetworkModule(yarp.RFModule):
         else:
             self._target_decay_track_id = -1
             self._target_decay_started_at = 0.0
-            self._decay_caps.clear()
+            self._recovery_tracks.clear()
 
         active_track_id = self._active_attention_track_id()
+        now = time.time()
         for face in faces:
             track_id = int(face.get("track_id", -1))
             if track_id == active_track_id:
+                self._recovery_tracks.pop(track_id, None)
                 continue
-            cap = self._decay_caps.get(track_id)
-            if cap is not None:
-                face["ips"] = min(float(face.get("ips", 0.0)), float(cap))
+            recovery = self._recovery_tracks.get(track_id)
+            if recovery is not None:
+                rec_start, m0 = recovery
+                elapsed = max(0.0, now - rec_start)
+                rec_multiplier = 1.0 - (1.0 - m0) * math.exp(-self.HABITUATION_LAMBDA * elapsed)
+                face["ips"] = float(face.get("ips", 0.0)) * rec_multiplier
 
         for face in faces:
             face["eligible"] = self._is_eligible(face)
@@ -1228,8 +1232,8 @@ class SalienceNetworkModule(yarp.RFModule):
         self._unknown_ss1_since = {
             t: ts for t, ts in self._unknown_ss1_since.items() if t in active
         }
-        self._decay_caps = {
-            t: cap for t, cap in self._decay_caps.items() if t in active
+        self._recovery_tracks = {
+            t: rec for t, rec in self._recovery_tracks.items() if t in active
         }
         self._last_face_ips_log = {
             key: val for key, val in self._last_face_ips_log.items() if key[0] in active
@@ -1367,7 +1371,6 @@ class SalienceNetworkModule(yarp.RFModule):
         """Calculates IPS using personal weights and optional Habituation Decay."""
         vars_norm = self._calculate_ips_variables(face)
         weights = self._get_person_weights(person_id)
-        active_track_id = self._active_attention_track_id()
 
         # Base Formula
         base_ips = (
@@ -1381,13 +1384,6 @@ class SalienceNetworkModule(yarp.RFModule):
         if apply_habituation:
             ips *= self._habituation_multiplier(face, person_id)
 
-        # Hysteresis Bonus
-        if (
-            face.get("track_id", -1) != -1
-            and face.get("track_id") == active_track_id
-        ):
-            ips += self.IPS_HYSTERESIS_BONUS
-
         return ips
 
     def _habituation_multiplier(self, face: Dict[str, Any], person_id: str) -> float:
@@ -1398,6 +1394,12 @@ class SalienceNetworkModule(yarp.RFModule):
 
         now = time.time()
         if self._target_decay_track_id != track_id:
+            old_track_id = self._target_decay_track_id
+            if old_track_id >= 0 and self._target_decay_started_at > 0.0:
+                elapsed = max(0.0, now - self._target_decay_started_at)
+                self._recovery_tracks[old_track_id] = (
+                    now, math.exp(-self.HABITUATION_LAMBDA * elapsed)
+                )
             self._target_decay_track_id = track_id
             self._target_decay_started_at = now
             return 1.0
@@ -1487,12 +1489,6 @@ class SalienceNetworkModule(yarp.RFModule):
                 self.current_target_track_id = active_track_id
                 return active_face
 
-            if best_track_id != active_track_id and len(visible_faces) > 1:
-                old_ips = float(active_face.get("ips", 0.0))
-                prev_cap = self._decay_caps.get(active_track_id)
-                self._decay_caps[active_track_id] = (
-                    old_ips if prev_cap is None else min(prev_cap, old_ips)
-                )
             self.current_target_track_id = int(best_face.get("track_id", -1))
             return best_face
 
