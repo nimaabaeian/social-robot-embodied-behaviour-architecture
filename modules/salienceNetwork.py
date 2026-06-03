@@ -146,13 +146,13 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # Minimum IPS by social state
     SS_THRESHOLDS = {
-        "ss1": 1.10, # Stranger: stricter hurdle (less proactive)
-        "ss2": 0.90, # Known, not greeted: more proactive
-        "ss3": 1.00, # Known, greeted, no talk: still proactive, but less than ss2
-        "ss4": 1.30, # Known, talked: re-engage with ss3 action when highly salient
+        "ss1": 0.80, # Stranger: stricter hurdle (less proactive)
+        "ss2": 0.65, # Known, not greeted: more proactive
+        "ss3": 0.75, # Known, greeted, no talk: still proactive, but less than ss2
+        "ss4": 0.85, # Known, talked: re-engage with ss3 action when highly salient
     }
 
-    HABITUATION_LAMBDA = 0.20  # Habituation decay
+    HABITUATION_LAMBDA = 0.06  # Habituation decay (~11.6 s half-life, only active after dwell)
     HOMEOSTATIC_WEIGHT_SHIFT_RATE = 0.15
     HOMEOSTATIC_REWARD_SCALE = 0.005
     MAX_WEIGHT_SHIFT_PER_INTERACTION = 0.08
@@ -217,6 +217,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
         self.area_history: Dict[int, float] = {}  # Maps track_id to previous bbox area
         self.current_target_track_id: int = -1  # For applying Hysteresis
+        self._attention_target_since: float = 0.0  # When current_target_track_id last changed
         self._target_decay_track_id: int = -1
         self._target_decay_started_at: float = 0.0
         self._recovery_tracks: Dict[int, Tuple[float, float]] = {}  # track_id → (start_time, multiplier_at_switch)
@@ -234,6 +235,8 @@ class SalienceNetworkModule(yarp.RFModule):
         self.min_track_ips: float = 0.6
         self.track_stop_hysteresis: float = 0.1
         self.track_switch_hysteresis: float = 0.1
+        self.min_gaze_dwell_sec: float = 5.0  # Min hold after a switch before another IPS switch (human-like dwell)
+        self.habituation_competitor_margin: float = 0.2  # Habituate only when a competitor is within this IPS margin of the target
         self.track_stop_debounce_sec: float = 2.0
         self.exec_rpc_retry_sec: float = 1.0
         self.unknown_ss1_wait_sec: float = 5.0
@@ -326,6 +329,14 @@ class SalienceNetworkModule(yarp.RFModule):
             if rf.check("track_switch_hysteresis"):
                 self.track_switch_hysteresis = max(
                     0.0, rf.find("track_switch_hysteresis").asFloat64()
+                )
+            if rf.check("min_gaze_dwell_sec"):
+                self.min_gaze_dwell_sec = max(
+                    0.0, rf.find("min_gaze_dwell_sec").asFloat64()
+                )
+            if rf.check("habituation_competitor_margin"):
+                self.habituation_competitor_margin = max(
+                    0.0, rf.find("habituation_competitor_margin").asFloat64()
                 )
             if rf.check("track_stop_debounce_sec"):
                 self.track_stop_debounce_sec = max(
@@ -1188,7 +1199,17 @@ class SalienceNetworkModule(yarp.RFModule):
                     )
                 )
                 before_ips = float(current_face.get("ips", 0.0))
-                decay = self._habituation_multiplier(current_face, person_id)
+                dwell_elapsed = time.time() - self._attention_target_since
+                has_competitor = any(
+                    int(f.get("track_id", -1)) != current_track_id
+                    and float(f.get("ips", 0.0)) >= before_ips - self.habituation_competitor_margin
+                    for f in faces
+                )
+                decay = (
+                    self._habituation_multiplier(current_face, person_id)
+                    if has_competitor and dwell_elapsed >= self.min_gaze_dwell_sec
+                    else 1.0
+                )
                 after_ips = before_ips * decay
                 current_face["habituation_applied"] = True
                 current_face["habituation_multiplier"] = decay
@@ -1407,6 +1428,12 @@ class SalienceNetworkModule(yarp.RFModule):
         elapsed = max(0.0, now - self._target_decay_started_at)
         return math.exp(-self.HABITUATION_LAMBDA * elapsed)
 
+    def _set_attention_target(self, track_id: int) -> None:
+        """Assign the attention target, timestamping any change for dwell gating."""
+        if track_id != self.current_target_track_id:
+            self._attention_target_since = time.time()
+        self.current_target_track_id = track_id
+
     def _active_attention_track_id(self) -> int:
         """Return the track that is actually holding the robot's attention."""
         if self.interaction_busy and self.selected_target is not None:
@@ -1460,18 +1487,18 @@ class SalienceNetworkModule(yarp.RFModule):
         """Simple tracking policy: decay current target, then track the highest visible IPS."""
         if override_tid >= 0:
             override_face = self._find_face_by_track_id(override_tid)
-            self.current_target_track_id = override_tid if override_face is not None else -1
+            self._set_attention_target(override_tid if override_face is not None else -1)
             return override_face if override_face is not None else {"track_id": override_tid, "ips": 0.0}
 
         if self.interaction_busy and self.selected_target:
             active_track_id = int(self.selected_target.get("track_id", -1))
             active_face = self._find_face_by_track_id(active_track_id)
-            self.current_target_track_id = active_track_id if active_face is not None else -1
+            self._set_attention_target(active_track_id if active_face is not None else -1)
             return active_face if active_face is not None else dict(self.selected_target)
 
         visible_faces = self._visible_tracked_faces(faces)
         if not visible_faces:
-            self.current_target_track_id = -1
+            self._set_attention_target(-1)
             return None
 
         best_face = max(visible_faces, key=lambda f: float(f.get("ips", 0.0)))
@@ -1481,22 +1508,30 @@ class SalienceNetworkModule(yarp.RFModule):
             active_ips = float(active_face.get("ips", 0.0))
             best_ips = float(best_face.get("ips", 0.0))
             best_track_id = int(best_face.get("track_id", -1))
+            # Hold the current target if the challenger is within the hysteresis
+            # margin, or if the minimum gaze dwell time has not yet elapsed. The
+            # dwell gate bounds switch frequency directly, so habituation cannot
+            # erode the margin into rapid oscillation between two faces.
+            dwell_elapsed = time.time() - self._attention_target_since
             if (
                 best_track_id != active_track_id
                 and len(visible_faces) > 1
-                and best_ips <= (active_ips + self.track_switch_hysteresis)
+                and (
+                    best_ips <= (active_ips + self.track_switch_hysteresis)
+                    or dwell_elapsed < self.min_gaze_dwell_sec
+                )
             ):
-                self.current_target_track_id = active_track_id
+                self._set_attention_target(active_track_id)
                 return active_face
 
-            self.current_target_track_id = int(best_face.get("track_id", -1))
+            self._set_attention_target(int(best_face.get("track_id", -1)))
             return best_face
 
         if float(best_face.get("ips", 0.0)) < self.min_track_ips:
-            self.current_target_track_id = -1
+            self._set_attention_target(-1)
             return None
 
-        self.current_target_track_id = int(best_face.get("track_id", -1))
+        self._set_attention_target(int(best_face.get("track_id", -1)))
         return best_face
 
     # ==================== Face Selection (Best IPS) ====================
