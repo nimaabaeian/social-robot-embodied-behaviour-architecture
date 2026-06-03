@@ -1449,6 +1449,7 @@ class ExecutiveControlModule(yarp.RFModule):
             "hungry_threshold":    self.hunger.hungry_threshold,
             "starving_threshold":  self.hunger.starving_threshold,
             "drain_hours":         self.hunger.drain_hours,
+            "face_present":        bool(self._latest_faces_snapshot(staleness=3.0)),
         })
 
     def _cmd_help(self, reply: yarp.Bottle) -> bool:

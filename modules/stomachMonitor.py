@@ -73,8 +73,16 @@ PALETTE = {
 }
 ACCENT = {"HS0": "#6E767D", "HS1": "#2C8A60", "HS2": "#B9821C", "HS3": "#B23A26"}
 
+# Per-state ambient theming for the whole window (canvas bg, panel, labels, card
+# borders). Lets the entire UI breathe with the mood, not just the stomach.
+THEME = {
+    "HS0": {"bg": "#ECEFF1", "panel": "#F4F6F8", "label": "#5A6470", "border": "#DCE2E8"},
+    "HS1": {"bg": "#F3F8F5", "panel": "#F0F8F3", "label": "#2C5E47", "border": "#CFE7DA"},
+    "HS2": {"bg": "#FFF7E8", "panel": "#FFF3DC", "label": "#7A5A18", "border": "#F0DEB4"},
+    "HS3": {"bg": "#2F2526", "panel": "#1E1A1B", "label": "#D0C8C9", "border": "#3A3233"},
+}
+
 BG = "#F6F8FB"
-CARD = "#FFFFFF"
 PANEL_BG = "#FFFFFF"
 SUBTLE = "#F1F5F9"
 BORDER = "#E3EAF2"
@@ -177,7 +185,6 @@ class StomachRenderer:
 
         # Resolve resampler once
         self._bilinear = getattr(Image, "Resampling", Image).BILINEAR
-        self._lanczos = getattr(Image, "Resampling", Image).LANCZOS
 
         self.cache = {st: self._build_base(st) for st in PALETTE}
 
@@ -230,6 +237,28 @@ class StomachRenderer:
         gm.paste(gloss, (0, 0), self.mask)
         base.alpha_composite(gm)
 
+        # Layered depth: a soft ambient-occlusion pool at the bottom of the sac and
+        # a faint rim-light hugging the top edge. Both clipped to the sac and baked
+        # into the base, so they read as 3D volume at zero per-frame cost.
+        h_span = self.maxy - self.miny
+        depth = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        ImageDraw.Draw(depth).ellipse(
+            [self.minx, self.miny + 0.50 * h_span,
+             self.maxx, self.maxy + 0.12 * h_span], fill=(20, 28, 36, 70))
+        depth = depth.filter(ImageFilter.GaussianBlur(16 * ss))
+        dpm = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        dpm.paste(depth, (0, 0), self.mask)
+        base.alpha_composite(dpm)
+
+        rim = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        ImageDraw.Draw(rim).ellipse(
+            [self.minx, self.miny - 0.06 * h_span,
+             self.maxx, self.miny + 0.34 * h_span], fill=(255, 255, 255, 55))
+        rim = rim.filter(ImageFilter.GaussianBlur(10 * ss))
+        rpm = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        rpm.paste(rim, (0, 0), self.mask)
+        base.alpha_composite(rpm)
+
         ImageDraw.Draw(base).line(self.poly + [self.poly[0]],
                                   fill=outline + (255,), width=int(5 * ss), joint="curve")
 
@@ -263,10 +292,6 @@ class StomachRenderer:
         layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
         return layer
 
-    def water_y_disp(self, level):
-        frac = max(0.0, min(1.0, level / 100.0))
-        return (self.maxy - frac * (self.maxy - self.miny)) / self.ss
-
     def _surface_points(self, water_y, phase, amp):
         ss = self.ss
         xs = self._surf_xs
@@ -277,11 +302,11 @@ class StomachRenderer:
                  + amp4 * math.sin(c2 + x * k2))
                 for x in xs]
 
-    def compose(self, state, level, phase, blink, bubbles, particles):
+    def compose(self, state, level, phase, blink, bubbles, particles, gaze=(0.0, 0.0)):
         s, ss = self.w, self.ss
         cc = self.cache[state]
         spr = cc["base"].copy()
-        liquid, ink = cc["liquid"], cc["ink"]
+        ink = cc["ink"]
         bub_col = cc["bub_col"]
         meniscus_col = cc["meniscus_col"]
         off = (state == "HS0")
@@ -327,16 +352,29 @@ class StomachRenderer:
                 width=3 * ss, joint="curve")
             spr.alpha_composite(self._clip(ml, self.mask))
 
-        self._draw_face(spr, state, blink, ink, off)
+        # Caustic shimmer: a faint bright band drifting just beneath the surface,
+        # clipped to the liquid. One extra polyline per frame (negligible cost).
+        if not off and level > 12:
+            cl = self._scratch_rgba
+            cl.paste((0, 0, 0, 0), (0, 0, s, s))
+            caustic = self._surface_points(water_y + 12 * ss, phase * 1.7 + 2.0, amp * 0.6)
+            ImageDraw.Draw(cl).line(caustic, fill=(255, 255, 255, 42),
+                                    width=2 * ss, joint="curve")
+            spr.alpha_composite(self._clip(cl, liquid_mask))
+
+        self._draw_face(spr, state, blink, ink, off, gaze)
         self._draw_particles(spr, particles, ink)
         return spr
 
-    def _draw_face(self, spr, state, blink, ink, off):
+    def _draw_face(self, spr, state, blink, ink, off, gaze=(0.0, 0.0)):
         ss = self.ss
         d = ImageDraw.Draw(spr)
         fcx, fcy = self.fcx, self.fcy
         edx, er = self.edx, self.er
         eyl, eyr = self.eyl, self.eyr
+        # Idle look-around: normalized gaze (-1..1) nudges the pupils within the eye.
+        gx_off = gaze[0] * er * 0.55
+        gy_off = gaze[1] * er * 0.45
 
         def arc(cx, cy, rw, rh, a0, a1, wd):
             d.arc([cx - rw, cy - rh, cx + rw, cy + rh], a0, a1, fill=ink, width=int(wd))
@@ -348,6 +386,7 @@ class StomachRenderer:
             d = ImageDraw.Draw(spr)
 
         def round_eye(cx, cy):
+            cx += gx_off; cy += gy_off
             eh = er * (0.12 + 0.88 * (1 - blink))
             d.ellipse([cx - er, cy - eh, cx + er, cy + eh], fill=ink)
             if blink < 0.5:
@@ -393,17 +432,7 @@ class StomachRenderer:
         ss = self.ss
         d = ImageDraw.Draw(spr)
         for p in particles:
-            if p["kind"] == "pellet":
-                x, y, r = p["x"] * ss, p["y"] * ss, p["r"] * ss
-                col = hx(p["col"])
-                d.ellipse([x - r, y - r, x + r, y + r], fill=col + (255,))
-                d.ellipse([x - r * 0.4, y - r * 0.5, x, y], fill=(255, 255, 255, 120))
-            elif p["kind"] == "ring":
-                x, y, r = p["x"] * ss, p["y"] * ss, p["r"] * ss
-                a = int(180 * p["life"])
-                d.ellipse([x - r, y - r * 0.5, x + r, y + r * 0.5],
-                          outline=(255, 255, 255, a), width=int(2 * ss))
-            elif p["kind"] == "text":
+            if p["kind"] == "text":
                 a = int(255 * min(1.0, p["life"]))
                 d.text((p["x"] * ss, p["y"] * ss), p["txt"], font=self.font,
                        fill=ink + (a,), anchor="mm")
@@ -416,14 +445,18 @@ class StomachRenderer:
                 d.text((p["x"] * ss, p["y"] * ss), "♡", font=self.font,
                        fill=(255, 150, 170, a), anchor="mm")
 
-    def present(self, sprite_pil, disp_size, scale=1.0):
-        """Single resize from render size to on-screen size, scale pulse folded
-        in. Shadow is baked into the sprite; bob/shake is applied by the caller
-        via canvas coordinates, so no oversized buffer or extra paste is needed."""
-        target = max(1, int(round(disp_size * scale)))
-        if abs(target - self.w) <= 1:
+    def present(self, sprite_pil, disp_size, scale=1.0, squash=0.0):
+        """Single resize from render size to on-screen size, scale pulse + squash
+        folded in. Shadow is baked into the sprite; bob/shake is applied by the
+        caller via canvas coordinates, so no oversized buffer / extra paste needed.
+        `squash` is a volume-preserving stretch: +x widens / -y flattens."""
+        sx = scale * (1.0 + squash)
+        sy = scale * (1.0 - squash)
+        tw = max(1, int(round(disp_size * sx)))
+        th = max(1, int(round(disp_size * sy)))
+        if abs(tw - self.w) <= 1 and abs(th - self.w) <= 1:
             return sprite_pil
-        return sprite_pil.resize((target, target), self._bilinear)
+        return sprite_pil.resize((tw, th), self._bilinear)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -457,7 +490,7 @@ class SimBackend:
             self._drain()
             return {"connected": True, "enabled": self.enabled,
                     "level": self.level, "state": self._state(),
-                    "busy": False, "backend": "SIM"}
+                    "busy": False, "backend": "SIM", "face_present": True}
 
     def cmd_rpc(self, words):
         with self._lock:
@@ -495,6 +528,170 @@ class SimBackend:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Pill-shaped button (Tk has no native rounded widgets, so we draw on a Canvas)
+# ══════════════════════════════════════════════════════════════════════════════
+class PillButton(tk.Canvas):
+    """A rounded 'pill' button. API-compatible with the subset of tk.Button used
+    by StomachApp: config/cget for bg (= pill fill), fg, activebackground
+    (= hover fill), state and text, plus click handling via `command`. Meal
+    buttons can show a proportional calorie dot via set_calorie_dot()."""
+
+    def __init__(self, parent, text="", font=None, command=None,
+                 surface=None, height=38):
+        surface = surface or parent.cget("bg")
+        super().__init__(parent, height=height, width=10, bg=surface,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._text = text
+        self._font = font
+        self._command = command
+        self._surface = surface
+        self._fill = SUBTLE
+        self._fg = INK
+        self._hover = "#E9EEF3"
+        self._state = "normal"
+        self._hovering = False
+        self._pressed = False
+        self._dot_frac = None       # None => no calorie dot (non-meal buttons)
+        self._dot_color = INK
+        self._pad_x = 20            # horizontal text padding inside the pill
+        self._refit()               # size the canvas to its text (layout may grow it)
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # tk.Button-compatible config: here 'bg' is the pill fill, not the canvas bg.
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        redraw = refit = False
+        for key in ("bg", "background"):
+            if key in kw:
+                self._fill = kw.pop(key); redraw = True
+        for key in ("fg", "foreground"):
+            if key in kw:
+                self._fg = kw.pop(key); redraw = True
+        if "activebackground" in kw:
+            self._hover = kw.pop("activebackground")
+        if "state" in kw:
+            self._state = kw.pop("state"); redraw = True
+        if "text" in kw:
+            self._text = kw.pop("text"); redraw = refit = True
+        if "font" in kw:
+            self._font = kw.pop("font"); redraw = refit = True
+        if "command" in kw:
+            self._command = kw.pop("command")
+        if "relief" in kw:
+            self._pressed = (kw.pop("relief") == "sunken"); redraw = True
+        # Swallow tk.Button-only options that don't apply to a Canvas.
+        for key in ("padx", "pady", "bd", "borderwidth", "compound",
+                    "anchor", "justify", "width"):
+            kw.pop(key, None)
+        if kw:
+            super().configure(**kw)
+        if refit:
+            self._refit()
+        if redraw:
+            self._redraw()
+        return None
+
+    config = configure
+
+    def cget(self, key):
+        vals = {"state": self._state, "text": self._text, "bg": self._fill,
+                "fg": self._fg, "activebackground": self._hover}
+        return vals[key] if key in vals else super().cget(key)
+
+    def set_surface(self, color):
+        """Set the real canvas background (match the card behind the pill so the
+        rounded corners blend in)."""
+        self._surface = color
+        super().configure(bg=color)
+        self._redraw()
+
+    def set_calorie_dot(self, frac, color):
+        first = self._dot_frac is None
+        self._dot_frac = max(0.0, min(1.0, frac))
+        self._dot_color = color
+        if first:
+            self._refit()  # reserve room for the dot the first time it's shown
+        self._redraw()
+
+    def _refit(self):
+        """Set the canvas's requested width to fit the text (+ dot + padding) so
+        the pill never clips its label; layout (fill/expand) may stretch it wider."""
+        try:
+            tw = self._font.measure(self._text) if self._font is not None \
+                else len(self._text) * 8
+        except Exception:
+            tw = len(self._text) * 8
+        need = tw + 2 * self._pad_x
+        if self._dot_frac is not None:
+            need += 2 * 6 + 12  # dot diameter + gap
+        super().configure(width=max(int(need), 56))
+
+    def _on_enter(self, _e):
+        if self._state != "disabled":
+            self._hovering = True; self._redraw()
+
+    def _on_leave(self, _e):
+        self._hovering = False; self._redraw()
+
+    def _on_press(self, _e):
+        if self._state != "disabled":
+            self._pressed = True; self._redraw()
+
+    def _on_release(self, _e):
+        if self._state != "disabled":
+            self._pressed = False; self._redraw()
+            if self._command is not None:
+                self._command()
+        return "break"
+
+    @staticmethod
+    def _shade(hexcol, factor):
+        try:
+            r, g, b = hx(hexcol)
+        except Exception:
+            return hexcol
+        return "#%02X%02X%02X" % (min(255, int(r * factor)),
+                                  min(255, int(g * factor)),
+                                  min(255, int(b * factor)))
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width(); h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return  # not laid out yet; <Configure> will fire and call us again
+        fill = self._fill
+        if self._state != "disabled":
+            if self._pressed:
+                fill = self._shade(self._fill, 0.90)
+            elif self._hovering:
+                fill = self._hover
+        r = h / 2
+        # Pill = two end-caps + middle rect (radius == height/2 => fully round).
+        self.create_oval(0, 0, h, h, fill=fill, outline="")
+        self.create_oval(w - h, 0, w, h, fill=fill, outline="")
+        self.create_rectangle(r, 0, w - r, h, fill=fill, outline="")
+        text_cx = w / 2
+        if self._dot_frac is not None:
+            dr = 6
+            dx = max(r, 15)
+            dy = h / 2
+            self.create_oval(dx - dr, dy - dr, dx + dr, dy + dr,
+                             outline=self._fg, width=1)
+            if self._dot_frac > 0:
+                self.create_arc(dx - dr, dy - dr, dx + dr, dy + dr, start=90,
+                                extent=-359.999 * self._dot_frac,
+                                style="pieslice", fill=self._dot_color, outline="")
+            text_cx = w / 2 + dr
+        self.create_text(text_cx, h / 2, text=self._text, fill=self._fg,
+                         font=self._font)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GUI
 # ══════════════════════════════════════════════════════════════════════════════
 class StomachApp:
@@ -514,6 +711,7 @@ class StomachApp:
         self.prev_state = "HS0"
         self.trans = 1.0
         self.enabled = False
+        self.face_present = True
         self.connected = False
         self._last_connected = None
         self._last_error_seen = ""
@@ -530,10 +728,19 @@ class StomachApp:
         self.events = deque(maxlen=6)
         self.decor_items = []
         self._photo = None
+        self._photo_size = (0, 0)  # track Tk image size to reuse it via paste()
         self._last_frame_time = time.perf_counter()
         self._last_bg = None
         self._last_badge = None
         self._disp_size = self.view  # actual displayed image size (may differ from render size)
+        self._squash_t = -10.0           # perf_counter time of last feed kick
+        self._gaze = [0.0, 0.0]          # current eased eye offset (normalized)
+        self._gaze_target = [0.0, 0.0]   # desired eye offset
+        self._next_gaze = time.monotonic() + random.uniform(1.5, 4.0)
+        self._level_hist = deque(maxlen=120)  # recent levels for the sparkline
+        self._cards = []                 # card frames, for per-state border theming
+        self._separators = []            # separator frames, themed alongside cards
+        self._bar_rgb = list(hx(ACCENT["HS0"]))  # eased level-bar color (rgb)
 
         root.title("iCub · Stomach Monitor")
         root.configure(bg=BG)
@@ -544,7 +751,8 @@ class StomachApp:
             "-fullscreen", not bool(root.attributes("-fullscreen"))))
 
         self.f_title = tkfont.Font(family="Helvetica", size=14, weight="bold")
-        self.f_big = tkfont.Font(family="Helvetica", size=26, weight="bold")
+        # Monospaced counter so the % digits don't shift width as the value changes.
+        self.f_big = tkfont.Font(family="DejaVu Sans Mono", size=24, weight="bold")
         self.f_lbl = tkfont.Font(family="Helvetica", size=8, weight="bold")
         self.f_small = tkfont.Font(family="Helvetica", size=8)
         self.f_btn = tkfont.Font(family="Helvetica", size=9, weight="bold")
@@ -560,8 +768,16 @@ class StomachApp:
         self.canvas = tk.Canvas(self.wrap, width=self.view, height=self.view, bg=BG,
                                 highlightthickness=0)
         self.canvas.pack(side="top", fill="both", expand=True)
+        # Soft vignette / light-pool behind everything (created first => lowest).
+        self._vignette_src = self._build_vignette_src() if HAVE_PIL else None
+        self._vignette_photo = None
+        self._vignette_size = None
+        self._vignette_item = (self.canvas.create_image(0, 0, anchor="nw")
+                               if HAVE_PIL else None)
         self.img_item = self.canvas.create_image(self.view // 2, self.view // 2, anchor="center")
-        self.badge_bg = self.canvas.create_rectangle(0, 0, 1, 1, outline="", fill="")
+        self.badge_bg = self.canvas.create_polygon(0, 0, 0, 0, 0, 0,
+                                                   smooth=True, outline="", fill="")
+        self.badge_dot = self.canvas.create_oval(0, 0, 0, 0, outline="", fill="")
         self.badge_item = self.canvas.create_text(0, 0, text="", font=self.f_title, fill=INK)
         self.title_item = self.canvas.create_text(
             self.view // 2, self.view // 2, text="", font=self.f_title, fill=INK)
@@ -580,8 +796,11 @@ class StomachApp:
 
     # ── panel ───────────────────────────────────────────────────────────────────
     def _card(self, title, expand=False):
-        outer = tk.Frame(self.panel, bg=PANEL_BG)
+        # Elevated card: thin themed border so each control group reads as a panel.
+        outer = tk.Frame(self.panel, bg=PANEL_BG, highlightthickness=1,
+                         highlightbackground=BORDER, bd=0)
         outer.pack(side="left", fill="both", expand=expand, padx=(0, 2))
+        self._cards.append(outer)
         inner = tk.Frame(outer, bg=PANEL_BG)
         inner.pack(fill="both", expand=True, padx=12, pady=10)
         if title:
@@ -590,41 +809,18 @@ class StomachApp:
         return inner
 
     def _mkbtn(self, parent, text, cmd):
-        btn = tk.Button(parent, text=text, font=self.f_btn, command=lambda: None,
-                        relief="flat", bd=0, cursor="hand2", padx=14, pady=10,
-                        bg=SUBTLE, fg=INK, activebackground="#E9EEF3",
-                        highlightthickness=0)
-        self._add_hover(btn, SUBTLE, "#E9EEF3")
-        def _press(_event, b=btn):
-            if str(b.cget("state")) != "disabled":
-                b.config(relief="sunken")
-
-        def _release(_event, b=btn, fn=cmd):
-            if str(b.cget("state")) != "disabled":
-                b.config(relief="flat")
-                fn()
-            return "break"
-
-        btn.bind("<ButtonPress-1>", _press)
-        btn.bind("<ButtonRelease-1>", _release)
+        btn = PillButton(parent, text=text, font=self.f_btn, command=cmd,
+                         surface=parent.cget("bg"))
+        btn.configure(bg=SUBTLE, fg=INK, activebackground="#E9EEF3")
         return btn
 
-    def _add_hover(self, btn, normal, hover):
-        btn._normal_bg = normal
-        btn._hover_bg = hover
-        btn.bind("<Enter>", lambda _e, b=btn: b.config(bg=getattr(b, "_hover_bg", hover))
-                 if str(b.cget("state")) != "disabled" else None)
-        btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=getattr(b, "_normal_bg", normal))
-                 if str(b.cget("state")) != "disabled" else None)
-
     def _set_button_colors(self, btn, bg, fg=INK, hover=None, state="normal"):
-        btn._normal_bg = bg
-        btn._hover_bg = hover or bg
-        btn.config(bg=bg, fg=fg, activebackground=btn._hover_bg, state=state)
+        btn.config(bg=bg, fg=fg, activebackground=(hover or bg), state=state)
 
     def _separator(self):
         sep = tk.Frame(self.panel, bg=BORDER, width=1)
         sep.pack(side="left", fill="y", pady=18, padx=8)
+        self._separators.append(sep)
 
     def _add_event(self, text):
         self.events.appendleft(f"{time.strftime('%H:%M:%S')}  {text}")
@@ -637,6 +833,7 @@ class StomachApp:
     def _on_canvas_resize(self, event):
         usable = max(320, min(event.width - 40, event.height - 72))
         target = int(usable)
+        self._update_vignette(event.width, event.height)
         self._position_canvas_items(event.width, event.height)
         # Debounce: delay expensive renderer rebuild until resizing stops
         self._pending_view = target
@@ -679,6 +876,12 @@ class StomachApp:
             if "r" in p:
                 p["r"] *= scale
 
+    @staticmethod
+    def _round_rect_pts(x1, y1, x2, y2, r):
+        # Point list for a smooth (spline) canvas polygon with rounded corners.
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
     def _position_canvas_items(self, width=None, height=None):
         width = width or self.canvas.winfo_width()
         height = height or self.canvas.winfo_height()
@@ -686,12 +889,18 @@ class StomachApp:
         ds = self._disp_size
         self.canvas.coords(self.img_item, cx, cy)
         self.canvas.coords(self.title_item, cx, max(36, cy - ds // 2 + 24))
-        badge_w = 260
-        self.canvas.coords(
-            self.badge_bg,
-            cx - badge_w // 2, cy + ds // 2 - 38,
-            cx + badge_w // 2, cy + ds // 2 - 4)
-        self.canvas.coords(self.badge_item, cx, cy + ds // 2 - 21)
+        # Generously padded, rounded badge pill with a colored left dot.
+        badge_w, badge_h = 300, 42
+        bx0, bx1 = cx - badge_w // 2, cx + badge_w // 2
+        by1 = cy + ds // 2 - 6
+        by0 = by1 - badge_h
+        bmid = (by0 + by1) / 2
+        self.canvas.coords(self.badge_bg, *self._round_rect_pts(bx0, by0, bx1, by1, 12))
+        dot_r = 6
+        dot_cx = bx0 + 26
+        self.canvas.coords(self.badge_dot, dot_cx - dot_r, bmid - dot_r,
+                           dot_cx + dot_r, bmid + dot_r)
+        self.canvas.coords(self.badge_item, cx + 14, bmid)
 
     def _create_decor(self):
         for _ in range(10):
@@ -722,16 +931,40 @@ class StomachApp:
             self.canvas.coords(d["id"], x, y)
             self.canvas.itemconfig(d["id"], state=("hidden" if hidden else "normal"))
 
+    def _build_vignette_src(self):
+        """A theme-independent radial darkening mask (black with edge-weighted
+        alpha). Built once at low res; scaled up per window size on resize."""
+        n = 256
+        m = Image.new("L", (n, n), 255)
+        ImageDraw.Draw(m).ellipse([n * 0.04, n * 0.04, n * 0.96, n * 0.96], fill=0)
+        m = m.filter(ImageFilter.GaussianBlur(n * 0.20))
+        m = m.point(lambda v: int(v * 0.42))  # cap edge darkening (~107/255)
+        v = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        v.putalpha(m)
+        return v
+
+    def _update_vignette(self, w, h):
+        if not HAVE_PIL or self._vignette_src is None or w < 2 or h < 2:
+            return
+        if self._vignette_size == (w, h):
+            return
+        self._vignette_size = (w, h)
+        img = self._vignette_src.resize((w, h), Image.BILINEAR)
+        self._vignette_photo = ImageTk.PhotoImage(img)
+        self.canvas.itemconfig(self._vignette_item, image=self._vignette_photo)
+        self.canvas.coords(self._vignette_item, 0, 0)
+        self.canvas.tag_lower(self._vignette_item)
+
     def _build_panel(self):
         s = self._card("STATUS")
         self.lbl_state = tk.Label(s, text="—", font=self.f_title, bg=PANEL_BG, fg=INK)
         self.lbl_state.pack(anchor="w")
         self.lbl_level = tk.Label(s, text="—", font=self.f_big, bg=PANEL_BG, fg=INK)
         self.lbl_level.pack(anchor="w")
-        self.level_bar = tk.Canvas(s, width=150, height=6, bg=PANEL_BG, highlightthickness=0)
+        self.level_bar = tk.Canvas(s, width=150, height=10, bg=PANEL_BG, highlightthickness=0)
         self.level_bar.pack(anchor="w", pady=(0, 7))
-        self.level_track = self.level_bar.create_rectangle(0, 0, 150, 6, outline="", fill="#E7EBEF")
-        self.level_fill = self.level_bar.create_rectangle(0, 0, 1, 6, outline="", fill=ACCENT["HS0"])
+        self.spark = tk.Canvas(s, width=150, height=22, bg=PANEL_BG, highlightthickness=0)
+        self.spark.pack(anchor="w", pady=(0, 5))
         self.lbl_busy = tk.Label(s, text="", font=self.f_small, bg=PANEL_BG, fg=MUTED)
         self.lbl_busy.pack(anchor="w")
         self.lbl_conn = tk.Label(s, text="", font=self.f_small, bg=PANEL_BG, fg=MUTED)
@@ -768,10 +1001,12 @@ class StomachApp:
         self._separator()
         fd = self._card("Feed")
         fgr = tk.Frame(fd, bg=PANEL_BG); fgr.pack(fill="x")
+        self.cd_ring = tk.Canvas(fd, width=26, height=26, bg=PANEL_BG, highlightthickness=0)
+        self.cd_ring.pack(anchor="e", pady=(5, 0))
         self.meal_btns = {}
         for col, (key, txt) in enumerate(
-                [("SMALL_MEAL", "Mini snack  +10"), ("MEDIUM_MEAL", "Meal  +25"),
-                 ("LARGE_MEAL", "Feast  +45")]):
+                [("SMALL_MEAL", "Beverage  +10"), ("MEDIUM_MEAL", "Snack  +25"),
+                 ("LARGE_MEAL", "Meal  +45")]):
             b = self._mkbtn(fgr, txt, lambda k=key: self._feed(k))
             b.grid(row=0, column=col, sticky="ew", padx=2)
             fgr.columnconfigure(col, weight=1)
@@ -807,13 +1042,21 @@ class StomachApp:
         if not self.enabled or now < self.cooldown_until:
             self._add_event("Feed ignored: drive unavailable" if not self.enabled else "Feed ignored: cooldown")
             return
+        if not self.face_present:
+            self._add_event("Feed rejected: no face in scene")
+            return
         if self.backend.cmd_meal(payload) is False:
             self._add_event("Feed rejected by backend")
             return
         self.cooldown_until = now + self.qr_cooldown
-        self._spawn_pellet(payload)
+        self._spawn_feed_popup(payload)
+        self._kick_squash()
         self._add_event(f"{payload.replace('_', ' ').title()} received +{int(self.meals.get(payload, 0))}")
         self._refresh_buttons()
+
+    def _kick_squash(self):
+        # Trigger the squash-and-stretch impulse (decays over ~0.6s in _render_pil).
+        self._squash_t = time.perf_counter()
 
     def _shutdown(self):
         if messagebox.askyesno("Shutdown module",
@@ -826,7 +1069,7 @@ class StomachApp:
         return {"x": random.uniform(0, 1), "y": random.uniform(0.05, 0.95),
                 "r": random.uniform(2.2, 5.0), "sp": random.uniform(0.004, 0.011)}
 
-    def _spawn_pellet(self, payload):
+    def _spawn_feed_popup(self, payload):
         delta = self.meals.get(payload, 0)
         self.particles.append({"kind": "text", "x": self.view * 0.34, "y": self.view * 0.30,
                                "txt": f"+{int(delta)}", "life": 1.0})
@@ -837,6 +1080,7 @@ class StomachApp:
         old_connected = self.connected
         self.connected = snap["connected"]
         self.enabled = snap["enabled"]
+        self.face_present = snap.get("face_present", True)
         self.busy = snap.get("busy", False)
         # Adopt live tuning from the controller when it advertises it.
         meals = snap.get("meals")
@@ -867,9 +1111,12 @@ class StomachApp:
             delta = self.target_level - self.last_level
             if time.monotonic() > self.cooldown_until:
                 self._add_event(f"Meal received +{int(round(delta))}")
+                self._kick_squash()  # react to meals arriving via QR too
         self.last_level = self.target_level
+        self._level_hist.append(self.target_level if self.enabled else 0.0)
         self._refresh_labels()
         self._refresh_buttons()
+        self._render_sparkline()
         self.root.after(180, self._poll_backend)
 
     def _refresh_labels(self):
@@ -884,9 +1131,6 @@ class StomachApp:
         self.lbl_state.config(text=state_label, fg=acc)
         self.lbl_level.config(text=("OFF" if not self.enabled else f"{self.disp_level:.1f}%"),
                               fg=(MUTED if not self.enabled else acc))
-        if not self.enabled:
-            self.level_bar.coords(self.level_fill, 0, 0, 0, 6)
-        self.level_bar.itemconfig(self.level_fill, fill=(MUTED if not self.enabled else acc))
         self.lbl_busy.config(text=("● interacting…" if self.busy else "○ idle"))
         if self.connected:
             self.lbl_conn.config(text=f"● {self.server_name}", fg="#2e9e6e")
@@ -913,9 +1157,9 @@ class StomachApp:
         remain = self.cooldown_until - time.monotonic()
         for k, b in self.meal_btns.items():
             label = {
-                "SMALL_MEAL": "Mini snack",
-                "MEDIUM_MEAL": "Meal",
-                "LARGE_MEAL": "Feast",
+                "SMALL_MEAL": "Beverage",
+                "MEDIUM_MEAL": "Snack",
+                "LARGE_MEAL": "Meal",
             }[k]
             delta = int(self.meals.get(k, 0))
             if not self.enabled:
@@ -924,22 +1168,106 @@ class StomachApp:
             elif remain > 0:
                 self._set_button_colors(b, "#f0f1f3", "#b6bbc1", "#f0f1f3", state="disabled")
                 b.config(text=f"{label}  {remain:0.1f}s")
+            elif not self.face_present:
+                self._set_button_colors(b, "#FEF3C7", "#92400E", "#FDE68A")
+                b.config(text=f"{label}  ⚠ no face")
             else:
                 self._set_button_colors(b, SUBTLE, INK, "#E9EEF3")
                 b.config(text=f"{label}  +{delta}")
+            # Calorie dot: fills proportionally to this meal vs. the largest meal.
+            maxmeal = max(self.meals.values()) if self.meals else 1.0
+            active = self.enabled and remain <= 0 and self.face_present
+            dot_col = ACCENT.get(self.state, MUTED) if active else "#C2C7CC"
+            b.set_calorie_dot((delta / maxmeal) if maxmeal else 0.0, dot_col)
+        if hasattr(self, "cd_ring"):
+            self.cd_ring.delete("cd")
+            if remain > 0 and self.qr_cooldown > 0:
+                frac = max(0.0, min(1.0, remain / self.qr_cooldown))
+                acc = ACCENT.get(self.state, MUTED)
+                self.cd_ring.create_oval(3, 3, 23, 23, outline="#E0E4E8",
+                                         width=3, tags="cd")
+                self.cd_ring.create_arc(3, 3, 23, 23, start=90, extent=-360 * frac,
+                                        style="arc", outline=acc, width=3, tags="cd")
         if remain > 0:
             self.root.after(100, self._refresh_buttons)
 
+    def _render_sparkline(self):
+        if not hasattr(self, "spark"):
+            return
+        self.spark.delete("spark")
+        hist = list(self._level_hist)
+        if len(hist) < 2:
+            return
+        w, h = 150, 22
+        acc = ACCENT.get(self.state, MUTED)
+        n = len(hist)
+        pts = []
+        for i, v in enumerate(hist):
+            x = w * i / (n - 1)
+            y = h - 1 - (h - 2) * max(0.0, min(100.0, v)) / 100.0
+            pts += [x, y]
+        self.spark.create_line(*pts, fill=acc, width=2, tags="spark", smooth=True)
+
+    @staticmethod
+    def _pill_on_canvas(c, x0, x1, h, fill):
+        # Rounded-end horizontal bar = two caps + middle rect.
+        r = h / 2
+        c.create_oval(x0, 0, x0 + h, h, fill=fill, outline="", tags="bar")
+        c.create_oval(x1 - h, 0, x1, h, fill=fill, outline="", tags="bar")
+        c.create_rectangle(x0 + r, 0, x1 - r, h, fill=fill, outline="", tags="bar")
+
+    def _render_level_bar(self):
+        c = self.level_bar
+        c.delete("bar")
+        W, H = 150, 10
+        self._pill_on_canvas(c, 0, W, H, "#E7EBEF")  # track
+        if self.enabled:
+            frac = max(0.0, min(1.0, self.disp_level / 100.0))
+            if frac > 0:
+                fw = max(H, frac * W)  # keep a full rounded cap even when tiny
+                col = "#%02X%02X%02X" % tuple(int(v) for v in self._bar_rgb)
+                self._pill_on_canvas(c, 0, fw, H, col)
+
+    def _propagate_bg(self, widget, bg, fg):
+        for child in widget.winfo_children():
+            if isinstance(child, PillButton):
+                child.set_surface(bg)  # pill 'bg' is the fill; set canvas bg instead
+                continue
+            try:
+                child.configure(bg=bg)
+            except tk.TclError:
+                pass
+            try:
+                if child.winfo_class() in ("Label", "Button"):
+                    child.configure(fg=fg)
+            except tk.TclError:
+                pass
+            self._propagate_bg(child, bg, fg)
+
     def _update_canvas_chrome(self):
         acc = ACCENT.get(self.state, MUTED)
-        bg = {"HS0": "#ECEFF1", "HS1": "#F3F8F5", "HS2": "#FFF7E8", "HS3": "#2F2526"}.get(self.state, BG)
+        th = THEME.get(self.state, {"bg": BG, "panel": PANEL_BG, "label": INK, "border": BORDER})
+        bg = th["bg"]
         if bg != self._last_bg:
             self.root.configure(bg=bg)
             self.wrap.configure(bg=bg)
             self.canvas.configure(bg=bg)
             self._last_bg = bg
-        width = self.canvas.winfo_width() or self.view
-        height = self.canvas.winfo_height() or self.view
+            panel_bg = th["panel"]
+            label_col = th["label"]
+            card_border = th["border"]
+            self.panel.configure(bg=panel_bg)
+            self._propagate_bg(self.panel, panel_bg, label_col)
+            for c in self._cards:
+                c.configure(highlightbackground=card_border)
+            for sep in self._separators:
+                sep.configure(bg=card_border)
+            # _propagate_bg recolored every label; restore the status labels that
+            # carry their own meaning-colors, and re-assert button styles.
+            self.lbl_state.configure(fg=acc)
+            self.lbl_level.configure(fg=(MUTED if not self.enabled else acc))
+            self.lbl_conn.configure(fg=("#2e9e6e" if self.connected else "#c0392b"))
+            self._refresh_buttons()
         badge = ""
         if self.state == "HS0":
             badge = "Drive unavailable"
@@ -948,11 +1276,12 @@ class StomachApp:
         elif self.state == "HS3":
             badge = "Critical"
         if badge != self._last_badge:
-            self.canvas.itemconfig(self.badge_item, text=badge, fill=("#fff" if self.state == "HS3" else acc))
             badge_state = "normal" if badge else "hidden"
-            self.canvas.itemconfig(self.badge_item, state=badge_state)
+            self.canvas.itemconfig(self.badge_item, text=badge, state=badge_state,
+                                   fill=("#fff" if self.state == "HS3" else acc))
             self.canvas.itemconfig(self.badge_bg, state=badge_state,
                                    fill=("#5B2020" if self.state == "HS3" else "#FFFFFF"))
+            self.canvas.itemconfig(self.badge_dot, state=badge_state, fill=acc)
             self._last_badge = badge
         self._position_canvas_items()
 
@@ -962,7 +1291,11 @@ class StomachApp:
     def _tick(self):
         start = time.perf_counter()
         now = time.perf_counter()
-        dt = min(1.0 / FPS, now - self._last_frame_time)
+        # Use real elapsed time (not capped to the frame budget) so motion stays
+        # tied to the wall clock. When a heavy fullscreen frame overruns 1/FPS,
+        # capping dt at 1/FPS would make the animation crawl in uneven slow
+        # motion; the 0.1s cap only guards against huge jumps after a GC stall.
+        dt = min(0.1, now - self._last_frame_time)
         self._last_frame_time = now
         try:
             self._step(dt)
@@ -991,10 +1324,22 @@ class StomachApp:
         self.disp_level = self._damp(self.disp_level, self.target_level, 9.0, dt)
         self.phase += self._PHASE_SPEED.get(self.state, 3.0) * dt
         if self.trans < 1.0:
-            self.trans = min(1.0, self.trans + 3.2 * dt)
+            # Slower transition => the cross-fade between cached state sprites
+            # reads as a smooth eased color shift (green↔amber↔red).
+            self.trans = min(1.0, self.trans + 2.4 * dt)
         self._animate_decor(dt)
 
         now = time.monotonic()
+        # Idle look-around: occasionally pick a new gaze target, then ease toward it.
+        if now >= self._next_gaze:
+            if random.random() < 0.4:
+                self._gaze_target = [0.0, 0.0]
+            else:
+                self._gaze_target = [random.uniform(-1.0, 1.0), random.uniform(-0.6, 0.6)]
+            self._next_gaze = now + random.uniform(1.2, 3.5)
+        ge = min(1.0, 8.0 * dt)
+        self._gaze[0] += (self._gaze_target[0] - self._gaze[0]) * ge
+        self._gaze[1] += (self._gaze_target[1] - self._gaze[1]) * ge
         if now >= self._next_blink:
             self.blink = 1.0
             if now >= self._next_blink + 0.12:
@@ -1014,35 +1359,16 @@ class StomachApp:
             if getattr(self, '_last_level_text', '') != new_text:
                 self._last_level_text = new_text
                 self.lbl_level.config(text=new_text)
-            # Update bar at full 30 fps so it tracks the animated disp_level
-            fill_w = max(0, min(150, int(150 * self.disp_level / 100.0)))
-            if getattr(self, '_last_fill_w', -1) != fill_w:
-                self._last_fill_w = fill_w
-                self.level_bar.coords(self.level_fill, 0, 0, fill_w, 6)
-
-        if self.renderer:
-            wy_disp = self.renderer.water_y_disp(self.disp_level)
-        else:
-            frac = max(0.0, min(1.0, self.disp_level / 100.0))
-            wy_disp = self.view * (0.86 - 0.6 * frac)
+        # Ease the level-bar color between state accents (same _damp as disp_level)
+        # and redraw the rounded fill so it tracks disp_level at full frame rate.
+        target = hx(ACCENT.get(self.state, MUTED) if self.enabled else MUTED)
+        for i in range(3):
+            self._bar_rgb[i] = self._damp(self._bar_rgb[i], target[i], 6.0, dt)
+        self._render_level_bar()
 
         alive = []
         for p in self.particles:
-            if p["kind"] == "pellet":
-                p["vy"] += 900.0 * dt
-                p["y"] += p["vy"] * dt
-                p["x"] += p.get("vx", 0.0) * dt
-                p["vx"] = p.get("vx", 0.0) * math.exp(-3.2 * dt)
-                if p["y"] >= wy_disp:
-                    self.particles.append({"kind": "ring", "x": p["x"], "y": wy_disp,
-                                           "r": 5, "life": 1.0})
-                    continue
-                alive.append(p)
-            elif p["kind"] == "ring":
-                p["r"] += 72.0 * dt; p["life"] -= 2.8 * dt
-                if p["life"] > 0:
-                    alive.append(p)
-            elif p["kind"] == "text":
+            if p["kind"] == "text":
                 p["y"] -= 42.0 * dt; p["life"] -= 0.72 * dt
                 if p["life"] > 0:
                     alive.append(p)
@@ -1065,35 +1391,44 @@ class StomachApp:
                                    "y": self.view * random.uniform(0.34, 0.48),
                                    "txt": "grr"})
 
+    @staticmethod
+    def _heartbeat(t):
+        # Two quick thumps (lub-dub) per cycle then a rest — an anxious pulse.
+        x = (t * 0.45) % 1.0
+        lub = math.exp(-((x - 0.08) / 0.045) ** 2)
+        dub = 0.6 * math.exp(-((x - 0.20) / 0.05) ** 2)
+        return lub + dub
+
     def _bob_shake(self):
         t = self.phase
         if self.state == "HS0":
             return 0.0, 0.0
         if self.state == "HS3":
-            dx = math.sin(t * 5.7) * 5.5 + math.sin(t * 13.1) * 2.0
-            dy = math.sin(t * 4.2) * 2.8
+            dx = math.sin(t * 5.7) * 2.6 + math.sin(t * 13.1) * 1.0
+            dy = math.sin(t * 4.2) * 1.4
             return dx, dy
         if self.state == "HS2":
-            dx = math.sin(t * 2.6) * 2.4
-            dy = math.sin(t * 1.8) * 1.8
+            dx = math.sin(t * 2.6) * 1.3
+            dy = math.sin(t * 1.8) * 1.0
             return dx, dy
-        dx = math.sin(t * 0.8) * 0.8
-        dy = math.sin(t * 1.2) * 2.4
+        dx = math.sin(t * 0.8) * 0.6
+        dy = math.sin(t * 1.2) * 1.4
         return dx, dy
 
     def _render_pil(self):
         r = self.renderer
         bub = self.bubbles if self.enabled else []
+        gaze = (self._gaze[0], self._gaze[1])
         if self.trans >= 1.0:
             spr = r.compose(self.state, self.disp_level, self.phase, self.blink,
-                            bub, self.particles)
+                            bub, self.particles, gaze)
         else:
             # Optimized transition: compose ONCE with the target state, then
             # alpha-blend a lightweight old-state base on top. This is ~40%
             # cheaper than rendering two full sprites.
             t = ease_out_cubic(self.trans)
             spr = r.compose(self.state, self.disp_level, self.phase, self.blink,
-                            bub, self.particles)
+                            bub, self.particles, gaze)
             if t < 0.95:  # skip blend when nearly done
                 old = r.compose(self.prev_state, self.disp_level, self.phase, self.blink,
                                 [], [])  # old state without particles/bubbles = cheaper
@@ -1105,21 +1440,35 @@ class StomachApp:
         elif self.state == "HS2":
             scale = 1.0 + 0.016 * math.sin(self.phase * 1.9)
         elif self.state == "HS3":
-            scale = 1.0 + 0.022 * math.sin(self.phase * 3.3) + 0.006 * math.sin(self.phase * 8.0)
+            # Heartbeat tempo: an anxious double-thump pulse instead of a sine.
+            scale = 1.0 + 0.030 * self._heartbeat(self.phase)
+        # Feed reaction: a brief decaying squash-and-stretch impulse.
+        squash = 0.0
+        sq_dt = time.perf_counter() - self._squash_t
+        if sq_dt < 0.6:
+            squash = 0.18 * math.exp(-6.0 * sq_dt) * math.cos(sq_dt * 22.0)
         # One resize: render size -> on-screen size, with the scale pulse folded
         # in. Bob/shake is applied by moving the (center-anchored) canvas item,
         # which is free, instead of re-compositing into a larger buffer.
         cw = self.canvas.winfo_width() or self.view
         ch = self.canvas.winfo_height() or self.view
         disp = max(self.view, min(cw - 16, ch - 16, MAX_DISPLAY_VIEW))
-        frame = r.present(spr, disp, scale)
+        frame = r.present(spr, disp, scale, squash)
         if disp != self._disp_size:
             self._disp_size = disp
             self._position_canvas_items(cw, ch)
-        self._photo = ImageTk.PhotoImage(frame)
+        # Reuse the existing Tk photo when the size is unchanged: paste() repaints
+        # the pixel buffer in place, avoiding a fresh PhotoImage allocation (+ GC of
+        # the old one) every frame. Allocation only happens on resize / first frame.
+        size = (frame.width, frame.height)
+        if self._photo is not None and self._photo_size == size:
+            self._photo.paste(frame)
+        else:
+            self._photo = ImageTk.PhotoImage(frame)
+            self._photo_size = size
+            self.canvas.itemconfig(self.img_item, image=self._photo)
         f = disp / float(self.view)
         self.canvas.coords(self.img_item, cw // 2 + dx * f, ch // 2 + dy * f)
-        self.canvas.itemconfig(self.img_item, image=self._photo)
 
     # ── vector fallback (no Pillow) ──────────────────────────────────────────────
     def _vector_setup(self):
@@ -1171,6 +1520,7 @@ class StomachMonitorModule(_RFModuleBase):
             "level": 100.0,
             "state": "HS0",
             "busy": False,
+            "face_present": True,
             "backend": "YARP",
             "last_error": "",
         }
@@ -1425,7 +1775,8 @@ class StomachMonitorModule(_RFModuleBase):
                     enabled=bool(data.get("hunger_enabled", False)),
                     level=float(data.get("hunger_level", 100.0)),
                     state=str(data.get("hunger_state", "HS0")),
-                    busy=bool(data.get("busy", False)))
+                    busy=bool(data.get("busy", False)),
+                    face_present=bool(data.get("face_present", True)))
                 # Live tuning from the controller (keeps the GUI in sync; no
                 # hardcoded copies that can silently drift).
                 meals = data.get("meals")
