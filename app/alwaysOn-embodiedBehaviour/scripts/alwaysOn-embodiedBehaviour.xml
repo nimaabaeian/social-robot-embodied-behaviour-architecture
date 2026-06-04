@@ -7,7 +7,7 @@
 
     <!-- ======== MODULES ======== -->
     <module>
-        <name>alwayson_vision</name>
+        <name>alwayson_embodiedBehaviour_vision</name>
         <parameters></parameters>
         <node>icubsrv</node>
     </module>

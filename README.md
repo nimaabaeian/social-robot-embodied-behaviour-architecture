@@ -1,7 +1,6 @@
 ![Always On Embodied Behaviour](media/embodiedbehaviour.png)
 
-This repository provides the **embodied behaviour module** for the iCub humanoid robot, functioning as a core subsystem of the [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git).
-
+This repository provides the **embodied behaviour module** for the iCub humanoid robot, functioning as a core subsystem of the **Developmental Cognitive Architecture**
 At its core, the module synthesizes a primary internal homeostatic motivation, the **Orexigenic Drive**. By embedding this drive directly into the continuous cognitive architecture, it enables the iCub to exhibit autonomous, lifelike, and drive-regulated social behaviors over extended periods.
 
 ## Tech Stack
@@ -56,10 +55,11 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 - **alwayson_stomachMonitor**: Real-time visual monitor for the Orexigenic drive, rendering hunger level and digestion status.
 
 **External modules**
-- [speech2text](https://gitlab.iit.it/cognitiveInteraction/speech2text)
-- [acapelaSpeak](https://gitlab.iit.it/cognitiveInteraction/acapelaspeech)
-- [Developmental Cognitive Architecture](https://gitlab.iit.it/cognitiveInteraction/developmental-cognitive-architecture.git)
-- [faceTracker](https://gitlab.iit.it/cognitiveInteraction/faceTracker.git)
+- [speech2text]
+- [acapelaSpeak]
+- [faceTracker]
+- [faceTracker]
+- [faceExpressions]
 
 ### Interaction Flow (High Level)
 1. Vision processes camera frames and publishes per-face landmarks, annotated face view, and QR events.
@@ -159,7 +159,7 @@ flowchart LR
 
 | Module | Type | Node |
 |---|---|---|
-| `alwayson_alwayson_embodiedBehaviour_vision` | core | icubsrv |
+| `alwayson_embodiedBehaviour_vision` | core | icubsrv |
 | `alwayson_salienceNetwork` | core | icubsrv |
 | `alwayson_executiveControl` | core | icubsrv |
 | `alwayson_chatBot` | core | icubsrv |
