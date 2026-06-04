@@ -112,6 +112,11 @@ class ChatBotModule(yarp.RFModule):
     HS2_HUNGER_EVERY_N: int = 3  # force Orexigenic drive mention after N messages without one
     SESSION_GAP_SEC: float = 1800.0  # 30 min inactivity = new session
 
+    # ---- Proactive anti-spam: debounce a flapping drive signal + latch per episode ----
+    HS_DWELL_SEC: float = 60.0                 # a new HS level must persist this long before proactive logic acts on it
+    HS2_ENTRY_MIN_INTERVAL_SEC: int = 30 * 60  # min spacing between HS2-entry proactive bursts
+    HS3_RECOVERY_MIN_INTERVAL_SEC: int = 30 * 60  # min spacing between HS3-recovery proactive bursts
+
     # ---- Priority-based proactive messaging (reads salienceNetwork's learning file) ----
     LEARNING_FILENAME: str = "homeostatic_learning.json"
     LEARNING_CACHE_TTL_SEC: float = 30.0   # min seconds between disk stat() checks
@@ -121,7 +126,11 @@ class ChatBotModule(yarp.RFModule):
     MIN_INTERACTIONS_FOR_TRUST: int = 3    # below this, treat reward_ema as too noisy
     PRIORITY_EMA_WEIGHT: float = 0.7       # blend: 70% reward_ema, 30% approach-from-weights
     PRIORITY_THRESHOLD_HS2: float = 0.05   # priority score needed to be selectively pinged on HS2
-    REWARD_EMA_CLAMP: float = 30.0         # matches salienceNetwork.py reward clamp
+    # reward_ema lives within salienceNetwork's asymmetric per-interaction reward clamp
+    # (HOMEOSTATIC_REWARD_CLAMP_NEG / _POS). Mirror both bounds so the normalized signal
+    # spans the full [-1, +1] instead of saturating positives above +30.
+    REWARD_EMA_CLAMP_NEG: float = -30.0    # matches salienceNetwork.HOMEOSTATIC_REWARD_CLAMP_NEG
+    REWARD_EMA_CLAMP_POS: float = 45.0     # matches salienceNetwork.HOMEOSTATIC_REWARD_CLAMP_POS
     FAIRNESS_ROTATION_DAYS: int = 7        # subscriber not pinged in this long gets boosted
     DEFAULT_PROACTIVE_MODE: str = "priority"  # set to "broadcast" to disable everything below
 
@@ -155,7 +164,17 @@ class ChatBotModule(yarp.RFModule):
         self._raw_hs: str = ""
         self._last_hs_update: float = 0.0
         self._hs_source: str = "none"
-        self._prev_effective_hs: str = ""
+
+        # Debounced ("stable") drive level + per-episode proactive latches (anti-spam).
+        # Proactive messaging keys off _stable_hs, not the raw/flapping effective level.
+        self._stable_hs: str = ""
+        self._prev_stable_hs: str = ""
+        self._pending_hs: str = ""               # candidate level awaiting dwell confirmation
+        self._pending_hs_since: float = 0.0      # monotonic time the candidate first appeared
+        self._hs2_entry_armed: bool = True       # allow one HS2-entry ping per hunger episode
+        self._hs3_recovery_armed: bool = False   # armed on entering HS3, fired once on recovery
+        self._last_hs2_entry_mono: float = -1e9
+        self._last_hs3_recovery_mono: float = -1e9
 
         # Prompts
         self._prompts_path: str = os.path.join(self._script_dir, self.PROMPTS_FILENAME)
@@ -390,9 +409,9 @@ class ChatBotModule(yarp.RFModule):
     def updateModule(self) -> bool:
         self._read_hunger()
         self._process_tg_updates(max_per_cycle=25)
+        self._update_stable_hs()
         self._maybe_hs3_proactive()
         self._maybe_hs_transition_proactive()
-        self._prev_effective_hs = self._effective_hs()
         return self._running
 
     def interruptModule(self) -> bool:
@@ -599,6 +618,30 @@ class ChatBotModule(yarp.RFModule):
         if self._hs_source == "port" and not self._is_hs_stale() and self._raw_hs in self.VALID_HS:
             return self._raw_hs
         return "HS0"
+
+    def _update_stable_hs(self) -> None:
+        """Advance the debounced ("stable") drive level used by proactive messaging.
+
+        A new effective level must persist continuously for ``HS_DWELL_SEC`` before it
+        becomes the stable level. This absorbs boundary flapping (e.g. a noisy signal
+        bouncing HS1<->HS2) so a single hunger episode produces a single transition
+        instead of a burst. After this call, ``_prev_stable_hs`` holds the previous
+        cycle's level and ``_stable_hs`` the current one; they differ only on a
+        confirmed transition. Replies/status keep using the raw ``_effective_hs()``.
+        """
+        eff = self._effective_hs()
+        now = time.monotonic()
+        self._prev_stable_hs = self._stable_hs
+        if eff == self._stable_hs:
+            self._pending_hs = ""
+            return
+        if eff != self._pending_hs:
+            self._pending_hs = eff
+            self._pending_hs_since = now
+            return
+        if (now - self._pending_hs_since) >= self.HS_DWELL_SEC:
+            self._stable_hs = eff
+            self._pending_hs = ""
 
     # ------------------------- Prompts -------------------------
     def _resolve_prompts_path(self) -> str:
@@ -1214,7 +1257,10 @@ class ChatBotModule(yarp.RFModule):
                 return None
 
             ema = float(homeostasis.get("reward_ema", 0.0) or 0.0)
-            ema_clamped = max(-self.REWARD_EMA_CLAMP, min(self.REWARD_EMA_CLAMP, ema))
+            ema_clamped = max(self.REWARD_EMA_CLAMP_NEG, min(self.REWARD_EMA_CLAMP_POS, ema))
+            # Normalize to [-1, +1] per-side, since the clamp is asymmetric.
+            ema_norm = ema_clamped / (self.REWARD_EMA_CLAMP_POS if ema_clamped >= 0.0
+                                      else -self.REWARD_EMA_CLAMP_NEG)
 
             w = profile.get("weights")
             if not isinstance(w, dict):
@@ -1229,7 +1275,7 @@ class ChatBotModule(yarp.RFModule):
             approach_baseline = base["prox"] + base["vel"] + 0.5 * base["cent"] - base["gaze"]
             approach_centered = approach - approach_baseline
 
-            score = (self.PRIORITY_EMA_WEIGHT * (ema_clamped / self.REWARD_EMA_CLAMP)
+            score = (self.PRIORITY_EMA_WEIGHT * ema_norm
                      + (1.0 - self.PRIORITY_EMA_WEIGHT) * approach_centered)
             return float(score)
         except Exception:  # noqa: BLE001
@@ -1286,11 +1332,10 @@ class ChatBotModule(yarp.RFModule):
 
     # ------------------------- HS3 Broadcast -------------------------
     def _maybe_hs3_proactive(self) -> None:
-        eff = self._effective_hs()
-        if eff != "HS3":
+        if self._stable_hs != "HS3":
             return
 
-        entering = self._prev_effective_hs != "HS3"
+        entering = self._prev_stable_hs != "HS3"
         now = int(time.time())
 
         # on entry send to all; otherwise apply per-user cooldown
@@ -1357,15 +1402,37 @@ class ChatBotModule(yarp.RFModule):
             self._db_commit()
 
     def _maybe_hs_transition_proactive(self) -> None:
-        prev = self._prev_effective_hs
-        curr = self._effective_hs()
+        prev = self._prev_stable_hs
+        curr = self._stable_hs
         if prev == curr:
             return
-        self._log("INFO", f"HS effective: {prev or 'none'} -> {curr or 'none'}")
-        if prev == "HS3" and curr not in ("HS3", "HS0"):
-            self._proactive_hs3_recovery(curr)
-        if prev == "HS1" and curr == "HS2":
+        self._log("INFO", f"HS stable: {prev or 'none'} -> {curr or 'none'}")
+
+        # Re-arm episode latches when the drive returns to a satisfied/neutral level,
+        # and arm the recovery latch on entering starvation.
+        if curr in ("HS0", "HS1"):
+            self._hs2_entry_armed = True
+        if curr == "HS3":
+            self._hs3_recovery_armed = True
+
+        now = time.monotonic()
+
+        # HS2 entry: at most once per hunger episode (latch) and never within the
+        # minimum interval (guards against a quick fed -> hungry-again bounce).
+        if (curr == "HS2" and prev in ("HS0", "HS1")
+                and self._hs2_entry_armed
+                and (now - self._last_hs2_entry_mono) >= self.HS2_ENTRY_MIN_INTERVAL_SEC):
+            self._hs2_entry_armed = False
+            self._last_hs2_entry_mono = now
             self._proactive_hs2_entry()
+
+        # HS3 recovery: once on leaving starvation for a non-HS0 level (genuine feeding).
+        if (prev == "HS3" and curr not in ("HS3", "HS0")
+                and self._hs3_recovery_armed
+                and (now - self._last_hs3_recovery_mono) >= self.HS3_RECOVERY_MIN_INTERVAL_SEC):
+            self._hs3_recovery_armed = False
+            self._last_hs3_recovery_mono = now
+            self._proactive_hs3_recovery(curr)
 
     def _proactive_hs2_entry(self) -> None:
         all_subs = self._db_list_subscribers()

@@ -157,6 +157,13 @@ class SalienceNetworkModule(yarp.RFModule):
     HOMEOSTATIC_REWARD_SCALE = 0.005
     MAX_WEIGHT_SHIFT_PER_INTERACTION = 0.08
     HOMEOSTATIC_REWARD_EPSILON = 0.2
+    # Reward clamp is asymmetric: costs accrue in small frequent increments while a
+    # feed is a rare large positive. A symmetric +/-30 cap truncated a full meal
+    # (LARGE_MEAL = +45) down to +30, so feeders could never fully offset their cost.
+    # The positive cap matches the largest single meal; the negative cap still bounds
+    # one costly conversation's downward pull on the weights.
+    HOMEOSTATIC_REWARD_CLAMP_NEG = -30.0
+    HOMEOSTATIC_REWARD_CLAMP_POS = 45.0
     REWARD_EMA_ALPHA = 0.25
     SHORT_INTERACTION_MIN_TURNS = 2
     SHORT_INTERACTION_REWARD_THRESHOLD = 5.0
@@ -1995,7 +2002,9 @@ class SalienceNetworkModule(yarp.RFModule):
         Negative reward makes the robot more conservative/reactive.
         """
         person_id = str(person_id or "").strip()
-        reward = max(-30.0, min(30.0, self._homeostatic_reward_from_result(result)))
+        reward = max(
+            self.HOMEOSTATIC_REWARD_CLAMP_NEG,
+            min(self.HOMEOSTATIC_REWARD_CLAMP_POS, self._homeostatic_reward_from_result(result)))
 
         if not self._is_face_known(person_id):
             self._log_homeostatic_delta(
@@ -2017,8 +2026,14 @@ class SalienceNetworkModule(yarp.RFModule):
             )
             return
 
+        # Skip brief interactions unless they carried a real positive signal (a feed).
+        # Using `reward <` rather than `abs(reward) <` means a short interaction that
+        # merely burned a little energy (greeting/abort) is treated as noise instead of
+        # teaching "avoid this person" - a <2-turn contact is too short to conclude the
+        # person depletes us, and dropping it keeps the learned/recorded set unbiased.
+        # Genuinely costly interactions are multi-turn and bypass this gate.
         n_turns = self._result_int(result, "n_turns", 0)
-        if n_turns < self.SHORT_INTERACTION_MIN_TURNS and abs(reward) < self.SHORT_INTERACTION_REWARD_THRESHOLD:
+        if n_turns < self.SHORT_INTERACTION_MIN_TURNS and reward < self.SHORT_INTERACTION_REWARD_THRESHOLD:
             old_weights = self._get_person_weights(person_id)
             self._log_homeostatic_delta(
                 result, person_id, reward, "skipped", "short_interaction_noise", old_weights, old_weights
@@ -2062,7 +2077,14 @@ class SalienceNetworkModule(yarp.RFModule):
                 reason = self._homeostatic_reason(result, outcome, reward)
 
             interactions_prev = self._result_int(homeostasis, "interactions", 0)
-            total_reward_prev = self._result_float(homeostasis, "total_reward", 0.0)
+            # lifetime_energy_balance is a non-decaying running sum: it trends negative
+            # for anyone who isn't a net feeder and is NOT a relationship/quality score.
+            # reward_ema is the behavioral signal (recent standing). Read the legacy
+            # "total_reward" key as a fallback so existing profiles carry forward.
+            balance_prev = self._result_float(
+                homeostasis,
+                "lifetime_energy_balance",
+                self._result_float(homeostasis, "total_reward", 0.0))
             ema_prev = self._result_float(homeostasis, "reward_ema", 0.0)
             reward_ema = (
                 reward
@@ -2074,7 +2096,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 "weights": weights,
                 "homeostasis": {
                     "interactions": interactions_prev + 1,
-                    "total_reward": total_reward_prev + reward,
+                    "lifetime_energy_balance": balance_prev + reward,
                     "reward_ema": reward_ema,
                     "last_reward": reward,
                     "last_stomach_level_start": self._result_float(result, "stomach_level_start", 100.0),

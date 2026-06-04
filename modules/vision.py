@@ -154,13 +154,12 @@ class VisionAnalyzer(yarp.RFModule):
         self.debug = False
         self.identity_sticky_sec = 1.5
         self.max_enroll_samples = 5
-        self.unknown_retry_interval_sec = 2.0
-        self.unknown_retry_max_attempts = 3
+        self.unknown_retry_interval_sec = 2.5
 
         self.known_faces = {}
         self.tracked_faces = {}
         self.last_known_identity = {}  # dict[track_id] -> (name, confidence, timestamp)
-        self.unknown_retry_state = {}  # dict[track_id] -> (attempt_count, last_retry_ts)
+        self.unknown_retry_state = {}  # dict[track_id] -> last_retry_ts
         self._face_identity_lock = threading.Lock()
         self.objects = []
         self.last_frame = None
@@ -656,8 +655,7 @@ class VisionAnalyzer(yarp.RFModule):
         self.tolerance = rf.check("id_tolerance", yarp.Value(0.62)).asFloat32()
         self.identity_sticky_sec = rf.check("identity_sticky_sec", yarp.Value(1.5)).asFloat64()
         self.max_enroll_samples = rf.check("id_enroll_samples", yarp.Value(5)).asInt64()
-        self.unknown_retry_interval_sec = rf.check("unknown_retry_interval_sec", yarp.Value(1.0)).asFloat64()
-        self.unknown_retry_max_attempts = rf.check("unknown_retry_max_attempts", yarp.Value(3)).asInt64()
+        self.unknown_retry_interval_sec = rf.check("unknown_retry_interval_sec", yarp.Value(2.5)).asFloat64()
         self.verbose = rf.check("verbose_yolo", yarp.Value(False)).asBool()
         self.debug = rf.check("debug", yarp.Value(False)).asBool()
         self.auto_download_model = rf.check("auto_download_model", yarp.Value(True)).asBool()
@@ -894,9 +892,8 @@ class VisionAnalyzer(yarp.RFModule):
 
                     with self._face_identity_lock:
                         if face_id in ("unknown", "recognizing"):
-                            # Publish unknown while retrying in the background on a timer.
                             self.tracked_faces[tid] = ("unknown", 0.0)
-                            self.unknown_retry_state[tid] = (1, current_time)
+                            self.unknown_retry_state[tid] = current_time
                         else:
                             self.tracked_faces[tid] = (face_id, id_conf)
                             self.last_known_identity[tid] = (face_id, float(id_conf), current_time)
@@ -906,12 +903,9 @@ class VisionAnalyzer(yarp.RFModule):
                     cached_name, retry_meta = tracked_entry
                     if cached_name in ("recognizing", "unknown"):
                         with self._face_identity_lock:
-                            attempts, last_try_ts = self.unknown_retry_state.get(tid, (0, 0.0))
+                            last_try_ts = self.unknown_retry_state.get(tid, 0.0)
 
-                        should_retry = (
-                            attempts < self.unknown_retry_max_attempts
-                            and (current_time - last_try_ts) >= self.unknown_retry_interval_sec
-                        )
+                        should_retry = (current_time - last_try_ts) >= self.unknown_retry_interval_sec
 
                         if should_retry:
                             face_id, id_conf = self._compare_embeddings(frame, box)
@@ -919,7 +913,7 @@ class VisionAnalyzer(yarp.RFModule):
                             if face_id in ("unknown", "recognizing"):
                                 with self._face_identity_lock:
                                     self.tracked_faces[tid] = ("unknown", 0.0)
-                                    self.unknown_retry_state[tid] = (attempts + 1, current_time)
+                                    self.unknown_retry_state[tid] = current_time
                             else:
                                 with self._face_identity_lock:
                                     self.tracked_faces[tid] = (face_id, id_conf)

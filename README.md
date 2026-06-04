@@ -128,7 +128,7 @@ flowchart LR
 
 ### alwayson_chatBot
 - **Drive-Grounded Telegram Bot**: Driven by the exact same Orexigenic drive as the physical robot. System prompts dynamically adapt to the robot's physical hunger state.
-- **Priority-Based Proactive Engagement**: Sends proactive messages when transitioning to hungry (HS2) or starving (HS3) states. HS2 messages are selectively sent to the highest-priority subscribers (ranked by homeostatic reward EMA from `salienceNetwork`); HS3 and recovery messages reach all subscribers. Falls back to full broadcast when no learning data is available or when `proactive_mode=broadcast` is set.
+- **Priority-Based Proactive Engagement**: Sends proactive messages when transitioning to hungry (HS2) or starving (HS3) states. A dwell-time debounce on the drive level plus per-episode latches suppress duplicate bursts from a flapping signal, so a single hunger episode yields a single transition. HS2 messages are selectively sent to the highest-priority subscribers (ranked by homeostatic reward EMA from `salienceNetwork`); HS3 and recovery messages reach all subscribers. Falls back to full broadcast when no learning data is available or when `proactive_mode=broadcast` is set.
 - **Physical-Space Linking**: Optionally links each Telegram `chat_id` to a face-recognition `person_id` from `salienceNetwork`'s homeostatic learning data, via an explicit yes/no confirmation prompt. Confirmed links drive priority scoring; unconfirmed users always receive HS3 messages.
 - **Deep Memory**: Maintains rolling conversation windows, auto-summarization, and persistent per-user psychological profiles (likes, topics, inside jokes, tone).
 

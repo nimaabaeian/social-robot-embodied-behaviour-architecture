@@ -2764,10 +2764,25 @@ class ExecutiveControlModule(yarp.RFModule):
 
                 found = any(int(f.get("track_id", -1)) == track_id for f in faces)
                 if not found and expected_norm:
-                    found = any(
-                        self._norm_name(str(f.get("face_id", ""))) == expected_norm
-                        for f in faces if self._face_resolved(str(f.get("face_id", "")))
-                    )
+                    # The same named person may have left the frame and returned
+                    # under a NEW track id. Re-acquire by face name and re-bind the
+                    # interaction (and gaze) to that track instead of losing them.
+                    new_tid = next(
+                        (int(f.get("track_id", -1)) for f in faces
+                         if int(f.get("track_id", -1)) >= 0
+                         and self._face_resolved(str(f.get("face_id", "")))
+                         and self._norm_name(str(f.get("face_id", ""))) == expected_norm),
+                        -1)
+                    if new_tid >= 0:
+                        found = True
+                        if new_tid != track_id:
+                            self._log(
+                                "INFO",
+                                f"Monitor: '{expected_face}' re-acquired under new "
+                                f"track {new_tid} (was {track_id})")
+                            track_id = new_tid
+                            self._current_track_id = new_tid
+                            self._selector_set_track(new_tid)
 
                 if found:
                     last_seen = time.monotonic()
