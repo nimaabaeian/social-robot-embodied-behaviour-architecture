@@ -121,10 +121,9 @@ class ChatBotModule(yarp.RFModule):
     LEARNING_FILENAME: str = "homeostatic_learning.json"
     LEARNING_CACHE_TTL_SEC: float = 30.0   # min seconds between disk stat() checks
     HS2_PRIORITY_TOPK: int = 5             # max selective recipients for HS2 entry
-    HS2_PRIORITY_FLOOR: int = 2            # min recipients; fill from unknown if below
     HS3_PRIORITY_FLOOR: int = 3            # if filtered count < this, fall back to broadcast
     MIN_INTERACTIONS_FOR_TRUST: int = 3    # below this, a person's affinity is too noisy to trust
-    PRIORITY_THRESHOLD_HS2: float = 0.05   # affinity needed to be selectively pinged on HS2
+    PRIORITY_THRESHOLD_HS2: float = 0.20   # affinity needed to be selectively pinged on HS2
     FAIRNESS_ROTATION_DAYS: int = 7        # subscriber not pinged in this long gets boosted
     DEFAULT_PROACTIVE_MODE: str = "priority"  # set to "broadcast" to disable everything below
 
@@ -958,16 +957,18 @@ class ChatBotModule(yarp.RFModule):
 
         # --- Time context: current time + gap since last message ---
         effective_ts = msg_date or int(time.time())
+        _time_tpl = self._prompts.get("time_context_current", "The user sent this message on a {time}.")
         time_ctx_parts: List[str] = [
-            f"The user sent this message on a {self._format_message_time(effective_ts, self.DEFAULT_TZ)}."
+            _time_tpl.format(time=self._format_message_time(effective_ts, self.DEFAULT_TZ))
         ]
         last_user_ts = next(
             (int(m["ts"]) for m in reversed(history)
              if m.get("role") == "user" and m.get("ts")),
             None)
         if last_user_ts:
+            _gap_tpl = self._prompts.get("time_context_gap", "Their previous message was {gap}.")
             time_ctx_parts.append(
-                f"Their previous message was {self._format_time_gap(last_user_ts, effective_ts)}."
+                _gap_tpl.format(gap=self._format_time_gap(last_user_ts, effective_ts))
             )
         messages.append({"role": "system", "content": " ".join(time_ctx_parts)})
 
@@ -1256,9 +1257,9 @@ class ChatBotModule(yarp.RFModule):
 
         ``mode`` is one of ``hs3_enter``, ``hs3_cooldown``, ``hs2_entry``, ``hs3_recovery``.
         In ``broadcast`` proactive mode (or for unknown modes) this is a no-op that returns
-        every subscriber. Unknown users (no confirmed link / no trustworthy data) are never
-        excluded from HS3 messaging and backfill the HS2 selection when the priority pool
-        is short.
+        every subscriber. HS3 messages reach all subscribers (scored by affinity + unknowns).
+        HS2 messages are sent only to confirmed-link subscribers whose affinity exceeds
+        ``PRIORITY_THRESHOLD_HS2``; unknowns and low-affinity users are skipped.
         """
         if self._proactive_mode == "broadcast":
             return list(all_subs)
@@ -1286,12 +1287,7 @@ class ChatBotModule(yarp.RFModule):
             return [cid for _, cid in scored] + unknown
 
         if mode == "hs2_entry":
-            positive = [cid for s, cid in scored if s > self.PRIORITY_THRESHOLD_HS2]
-            target = positive[: self.HS2_PRIORITY_TOPK]
-            if len(target) < self.HS2_PRIORITY_FLOOR:
-                need = self.HS2_PRIORITY_FLOOR - len(target)
-                target.extend([cid for cid in unknown if cid not in target][:need])
-            return target
+            return [cid for s, cid in scored if s > self.PRIORITY_THRESHOLD_HS2][: self.HS2_PRIORITY_TOPK]
 
         return list(all_subs)  # defensive fall-through
 
@@ -1699,7 +1695,8 @@ class ChatBotModule(yarp.RFModule):
             if likes:
                 parts.append(f"They like: {', '.join(likes)}.")
             if parts:
-                known_facts = "Known facts (always include these): " + " ".join(parts) + "\n\n"
+                _kf_tpl = self._prompts.get("summarize_known_facts_prefix", "Known facts (always include these): {facts}\n\n")
+                known_facts = _kf_tpl.format(facts=" ".join(parts))
 
         msgs = [
             {"role": "system", "content": self._summarize_system_prompt()},
@@ -2135,17 +2132,9 @@ class ChatBotModule(yarp.RFModule):
         if not parts:
             return ""
 
-        # Wrap facts in a clear instruction: treat as background only, never force into conversation
         facts = " ".join(parts)
-        wrapped = (
-            "[Background info about this user — treat as silent context only. "
-            "NEVER reference, mention, or allude to any of these facts unless the user brings up "
-            "the exact same topic first in this conversation. "
-            "Do NOT volunteer this information, do NOT use it to make small talk, "
-            "do NOT weave it in proactively. "
-            "Only use a fact if the user's current message directly touches on it.] "
-            + facts
-        )
+        _ctx_tpl = self._prompts.get("user_context_wrapper", "[Background info: {facts}]")
+        wrapped = _ctx_tpl.format(facts=facts)
         if len(wrapped) > 600:
             wrapped = wrapped[:597].rsplit(" ", 1)[0] + "..."
         return wrapped
