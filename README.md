@@ -104,7 +104,7 @@ flowchart LR
 
 ### alwayson_salienceNetwork
 - **Interaction Priority Score (IPS)**: Ranks faces dynamically by proximity, centrality, velocity, and mutual gaze. Uses hysteresis to prevent thrashing and habituation to drive novelty.
-- **Adaptive Learning**: Shifts IPS weights per-person based on homeostatic reward received after interactions.
+- **Adaptive Learning**: Learns a per-person homeostatic affinity scalar that modulates eligibility thresholds after interactions.
 - **Social & Context Gates**: Manages social state transitions (`ss1` to `ss4`), dwell-time gates for strangers, and context-aware cooldowns to pace interactions. `ss4` faces (already greeted and talked) can re-engage when their IPS reaches 1.30, triggering an `ss3` action.
 - **Persistence**: Saves daily social memory to JSON to track who was greeted or talked to.
 
@@ -128,7 +128,7 @@ flowchart LR
 
 ### alwayson_chatBot
 - **Drive-Grounded Telegram Bot**: Driven by the exact same Orexigenic drive as the physical robot. System prompts dynamically adapt to the robot's physical hunger state.
-- **Priority-Based Proactive Engagement**: Sends proactive messages when transitioning to hungry (HS2) or starving (HS3) states. A dwell-time debounce on the drive level plus per-episode latches suppress duplicate bursts from a flapping signal, so a single hunger episode yields a single transition. HS2 messages are selectively sent to the highest-priority subscribers (ranked by homeostatic reward EMA from `salienceNetwork`); HS3 and recovery messages reach all subscribers. Falls back to full broadcast when no learning data is available or when `proactive_mode=broadcast` is set.
+- **Priority-Based Proactive Engagement**: Sends proactive messages when transitioning to hungry (HS2) or starving (HS3) states. A dwell-time debounce on the drive level plus per-episode latches suppress duplicate bursts from a flapping signal, so a single hunger episode yields a single transition. HS2 messages are selectively sent to the highest-priority subscribers (ranked by homeostatic affinity from `salienceNetwork`); HS3 and recovery messages reach all subscribers. Falls back to full broadcast when no learning data is available or when `proactive_mode=broadcast` is set.
 - **Physical-Space Linking**: Optionally links each Telegram `chat_id` to a face-recognition `person_id` from `salienceNetwork`'s homeostatic learning data, via an explicit yes/no confirmation prompt. Confirmed links drive priority scoring; unconfirmed users always receive HS3 messages.
 - **Deep Memory**: Maintains rolling conversation windows, auto-summarization, and persistent per-user psychological profiles (likes, topics, inside jokes, tone).
 
