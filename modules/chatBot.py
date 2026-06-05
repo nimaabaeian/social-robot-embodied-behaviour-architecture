@@ -123,14 +123,8 @@ class ChatBotModule(yarp.RFModule):
     HS2_PRIORITY_TOPK: int = 5             # max selective recipients for HS2 entry
     HS2_PRIORITY_FLOOR: int = 2            # min recipients; fill from unknown if below
     HS3_PRIORITY_FLOOR: int = 3            # if filtered count < this, fall back to broadcast
-    MIN_INTERACTIONS_FOR_TRUST: int = 3    # below this, treat reward_ema as too noisy
-    PRIORITY_EMA_WEIGHT: float = 0.7       # blend: 70% reward_ema, 30% approach-from-weights
-    PRIORITY_THRESHOLD_HS2: float = 0.05   # priority score needed to be selectively pinged on HS2
-    # reward_ema lives within salienceNetwork's asymmetric per-interaction reward clamp
-    # (HOMEOSTATIC_REWARD_CLAMP_NEG / _POS). Mirror both bounds so the normalized signal
-    # spans the full [-1, +1] instead of saturating positives above +30.
-    REWARD_EMA_CLAMP_NEG: float = -30.0    # matches salienceNetwork.HOMEOSTATIC_REWARD_CLAMP_NEG
-    REWARD_EMA_CLAMP_POS: float = 45.0     # matches salienceNetwork.HOMEOSTATIC_REWARD_CLAMP_POS
+    MIN_INTERACTIONS_FOR_TRUST: int = 3    # below this, a person's affinity is too noisy to trust
+    PRIORITY_THRESHOLD_HS2: float = 0.05   # affinity needed to be selectively pinged on HS2
     FAIRNESS_ROTATION_DAYS: int = 7        # subscriber not pinged in this long gets boosted
     DEFAULT_PROACTIVE_MODE: str = "priority"  # set to "broadcast" to disable everything below
 
@@ -1236,11 +1230,11 @@ class ChatBotModule(yarp.RFModule):
         return None
 
     def _person_priority(self, person_id: str) -> Optional[float]:
-        """Compute a roughly [-1, +1] priority score for a confirmed person_id.
+        """Return a person's learned affinity in [-1, +1] as their proactive priority.
 
-        Blends the homeostatic reward EMA with an approach signal derived from learned IPS
-        weights. Returns ``None`` when the person is unknown or has too few interactions to
-        trust (``< MIN_INTERACTIONS_FOR_TRUST``). Never raises on a malformed entry.
+        This is salienceNetwork's per-person affinity (EMA of normalized reward): >0 means
+        engaging them tends to feed the robot, <0 means they're an energy sink. Returns
+        ``None`` when unknown or below ``MIN_INTERACTIONS_FOR_TRUST``. Never raises.
         """
         if not person_id:
             return None
@@ -1248,43 +1242,14 @@ class ChatBotModule(yarp.RFModule):
             profile = self._load_learning().get("people", {}).get(person_id)
             if not isinstance(profile, dict):
                 return None
-
-            homeostasis = profile.get("homeostasis")
-            if not isinstance(homeostasis, dict):
+            interactions = profile.get("interactions")
+            affinity = profile.get("affinity")
+            if (not isinstance(interactions, int) or interactions < self.MIN_INTERACTIONS_FOR_TRUST
+                    or not isinstance(affinity, (int, float))):
                 return None
-            interactions = int(homeostasis.get("interactions", 0) or 0)
-            if interactions < self.MIN_INTERACTIONS_FOR_TRUST:
-                return None
-
-            ema = float(homeostasis.get("reward_ema", 0.0) or 0.0)
-            ema_clamped = max(self.REWARD_EMA_CLAMP_NEG, min(self.REWARD_EMA_CLAMP_POS, ema))
-            # Normalize to [-1, +1] per-side, since the clamp is asymmetric.
-            ema_norm = ema_clamped / (self.REWARD_EMA_CLAMP_POS if ema_clamped >= 0.0
-                                      else -self.REWARD_EMA_CLAMP_NEG)
-
-            w = profile.get("weights")
-            if not isinstance(w, dict):
-                w = {}
-            base = self._sn_baseline_weights()
-            prox = float(w.get("prox", base["prox"]) or base["prox"])
-            vel = float(w.get("vel", base["vel"]) or base["vel"])
-            cent = float(w.get("cent", base["cent"]) or base["cent"])
-            gaze = float(w.get("gaze", base["gaze"]) or base["gaze"])
-
-            approach = prox + vel + 0.5 * cent - gaze
-            approach_baseline = base["prox"] + base["vel"] + 0.5 * base["cent"] - base["gaze"]
-            approach_centered = approach - approach_baseline
-
-            score = (self.PRIORITY_EMA_WEIGHT * ema_norm
-                     + (1.0 - self.PRIORITY_EMA_WEIGHT) * approach_centered)
-            return float(score)
+            return max(-1.0, min(1.0, float(affinity)))
         except Exception:  # noqa: BLE001
             return None
-
-    @staticmethod
-    def _sn_baseline_weights() -> Dict[str, float]:
-        # Mirrors salienceNetwork.py BASELINE_WEIGHTS (read-only reference).
-        return {"prox": 0.5, "cent": 0.15, "vel": 0.3, "gaze": 0.5}
 
     def _rank_proactive_targets(self, all_subs: List[int], mode: str) -> List[int]:
         """Order/filter subscribers for a proactive event according to learned priority.

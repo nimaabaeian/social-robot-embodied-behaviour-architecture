@@ -880,7 +880,8 @@ class ExecutiveControlModule(yarp.RFModule):
     SS2_GREET_TIMEOUT        = 18.0
     SS3_STT_TIMEOUT          = 18.0
     LLM_TIMEOUT              = 8.0
-    SS3_MAX_TURNS            = 3
+    SS3_FULL_TURNS           = 3      # full-length replies for the first N turns
+    SS3_ENGAGED_MIN_TURNS    = 2      # >= this many turns ⇒ a real conversation (clean end)
     STT_POLL_INTERVAL_SEC    = 0.05
 
     # TTS timing
@@ -893,9 +894,9 @@ class ExecutiveControlModule(yarp.RFModule):
     # Conversation latency tuning
     SS3_STARTER_MAX_TOKENS     = 40
     SS3_FOLLOWUP_MAX_TOKENS    = 56
-    SS3_CLOSING_MAX_TOKENS     = 18
+    SS3_WINDDOWN_MAX_TOKENS    = 18
     SS3_TURN_MAX_LEN           = 140
-    SS3_CLOSING_MAX_LEN        = 72
+    SS3_WINDDOWN_MAX_LEN       = 72
     SS3_LLM_STREAMING_ENABLED  = False
     SS3_LLM_WORKER_PARALLELISM = 3
 
@@ -923,6 +924,9 @@ class ExecutiveControlModule(yarp.RFModule):
         re.IGNORECASE)
 
     VALID_STATES    = {"ss1", "ss2", "ss3", "ss4"}
+    # Aborts that just mean the person walked away. After real engagement this is the
+    # natural way an unbounded conversation ends, not a failure.
+    TARGET_LEFT_ABORTS = frozenset({"target_lost", "face_disappeared", "target_monitor_abort"})
     HUNGER_OFF_STATE = "HS0"
     TIMEZONE        = ZoneInfo("Europe/Rome")
 
@@ -930,7 +934,6 @@ class ExecutiveControlModule(yarp.RFModule):
     _P:             Dict[str, Any] = {}
     LLM_SYS_DEFAULT: str = ""
     LLM_SYS_JSON:    str = ""
-    LLM_SYS_FAST:    str = ""
 
     # ── class-level prompt loader ─────────────────────────────────────────────
 
@@ -944,10 +947,6 @@ class ExecutiveControlModule(yarp.RFModule):
                     cls._P = data.get("executiveControl", {})
                     cls.LLM_SYS_DEFAULT = cls._P.get("system_default", "")
                     cls.LLM_SYS_JSON    = cls._P.get("system_json",   "")
-                    cls.LLM_SYS_FAST    = cls._P.get(
-                        "system_fast",
-                        "You are iCub speaking face to face. Output only one short natural spoken sentence. No markdown, no emojis, no explanations."
-                    )
                     if not cls.LLM_SYS_DEFAULT:
                         print("[ERROR] Missing executiveControl.system_default in prompts.json")
                     return
@@ -988,7 +987,6 @@ class ExecutiveControlModule(yarp.RFModule):
         self._feed_wait_timeout_sec = 8.0
         self._last_scan_ts_mono     = 0.0
         self._feed_condition        = threading.Condition()
-        self._hunger_tree_active    = threading.Event()
         self._last_hunger_level_log_mono = 0.0
         self._last_hunger_level_logged: Optional[float] = None
 
@@ -1154,7 +1152,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 # Production diagnostics are opt-in only.
                 try:
                     sys_msg = self._system_for_hs("HS1")
-                    user_msg = self._prompt_for_hs("convo_starter_prompt", "HS1", "Say hi briefly.")
+                    user_msg = self._prompt_for_hs("convo_starter_prompt", "HS1")
                     t0 = time.monotonic()
                     self.llm_client.chat.completions.create(  # type: ignore[union-attr]
                         model=self._llm_deployment,
@@ -1168,7 +1166,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
                 try:
                     sys_msg = self._system_for_hs("HS1")
-                    user_msg = self._prompt_for_hs("convo_starter_prompt", "HS1", "Say hi briefly.")
+                    user_msg = self._prompt_for_hs("convo_starter_prompt", "HS1")
                     kwargs_diag: Dict[str, Any] = {
                         "model": self._llm_deployment,
                         "messages": [{"role": "system", "content": sys_msg},
@@ -1740,7 +1738,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
         self._stt_clear()
         greet_trace = LatencyTrace(self, label=f"{tag}|greet", turn_index=0)
-        if self._speech.dispatch(self._P.get("ss1_greeting", "Hi there!"), label="ss1_greeting", trace=greet_trace) is None:
+        if self._speech.dispatch(self._text("ss1_greeting"), label="ss1_greeting", trace=greet_trace) is None:
             result.abort_reason = "tts_dispatch_failed"
             self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
             return
@@ -1769,7 +1767,7 @@ class ExecutiveControlModule(yarp.RFModule):
         result.extracted_name = name
         self._submit_face_name(track_id, name)
         self._write_last_greeted(track_id, face_id=face_id, code=name, person_key=name)
-        if self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you")):
+        if self._speak_wait(self._text("ss1_nice_to_meet")):
             self._charge_energy(self.GREETING_ENERGY_COST, result, "ss1_nice_to_meet")
         else:
             result.abort_reason = result.abort_reason or "tts_dispatch_failed"
@@ -1840,7 +1838,11 @@ class ExecutiveControlModule(yarp.RFModule):
         return None, None
 
     def _run_ss3(self, face_id: str, result: InteractionResult) -> None:
-        """Short proactive conversation (up to SS3_MAX_TURNS)."""
+        """Proactive conversation: unbounded turns, ending when the person stops engaging.
+
+        The first SS3_FULL_TURNS turns get full replies; from then on the robot only
+        gives short winding-down acknowledgements to gently let the conversation close.
+        """
         tag = f"[SS3|{face_id}]"
         self._log("INFO", f"{tag} START")
         if self._should_abort(result):
@@ -1908,32 +1910,35 @@ class ExecutiveControlModule(yarp.RFModule):
         first_utterance_mono: Optional[float] = None,
         result: Optional[InteractionResult] = None,
         prior_assistant: Optional[str] = None) -> int:
-        """Run up to SS3_MAX_TURNS follow-up turns with latest-utterance-wins semantics."""
+        """Run follow-up turns with latest-utterance-wins semantics until the person stops.
+
+        Unbounded: the loop ends only when no new input arrives or the interaction is
+        aborted (e.g. the target leaves). The first SS3_FULL_TURNS turns get full replies;
+        later turns switch to short winding-down acknowledgements. A feed scanned mid-chat
+        becomes its own turn: the robot speaks the feed acknowledgement, then waits for the
+        person's reply like any other turn.
+        """
         turns          = 0
         utterance      = first_utterance
         utterance_mono = first_utterance_mono or time.monotonic()
         interaction_id = self._get_iid()
+        person_name    = self._known_person_name(face_id)
+        feed_baseline  = time.time()
+        pending_feed: Optional[Tuple[str, str]] = None   # (payload, hs_before) awaiting an ack turn
         history: List[Tuple[str, str]] = []
         if prior_assistant:
             history.append(("assistant", prior_assistant))
 
-        while utterance and turns < self.SS3_MAX_TURNS:
+        while True:
             if result is not None and self._should_abort(result):
+                break
+            if pending_feed is None and not utterance:
                 break
             if result is not None:
                 result.replied_any = True
 
             next_turn = turns + 1
-            is_last   = next_turn >= self.SS3_MAX_TURNS
-            trace = LatencyTrace(
-                self,
-                label=tag,
-                turn_index=next_turn,
-                utterance=utterance,
-                started_mono=utterance_mono)
-            trace.mark_at("stt_final_received", utterance_mono, utterance_chars=len(utterance))
-            trace.mark_at("end_of_turn_detected", utterance_mono)
-            self._log("INFO", f"{tag} turn {next_turn}/{self.SS3_MAX_TURNS}: '{utterance}'")
+            winddown  = next_turn > self.SS3_FULL_TURNS
 
             reply: Optional[str] = None
             request_id: Optional[int] = None
@@ -1941,118 +1946,155 @@ class ExecutiveControlModule(yarp.RFModule):
             fallback_reason: Optional[str] = None
             interrupted = 0
             superseded = 0
-            if self._is_greeting(utterance):
-                reply = self._local_reply_fallback(utterance, is_last, face_id)
-                response_source = "local"
-                fallback_reason = "greeting_detected"
+            turn_user_utterance = ""
+            energy_cost = self.CONVERSATION_TURN_ENERGY_COST
+            energy_reason = "ss3_conversation_turn"
+            dispatch_label = "ss3_reply"
+
+            if pending_feed is not None:
+                payload, hs_before = pending_feed
+                pending_feed = None
+                reply = self._feed_ack(hs_before, person_name)
+                response_source = "feed_ack"
+                energy_cost = self.FEED_ACK_ENERGY_COST
+                energy_reason = "feed_ack"
+                dispatch_label = "ss3_feed_ack"
+                if result is not None:
+                    result.meals_eaten_count += 1
+                    result.last_meal_payload = payload
+                trace = LatencyTrace(self, label=tag, turn_index=next_turn)
                 now = time.monotonic()
-                trace.mark_at(
-                    "first_token_received",
-                    now,
-                    time_to_first_response_sec=now - trace.started_mono,
-                    source="local")
-                trace.mark_at("last_token_received", now, text_chars=len(reply), source="local")
-                trace.mark("local_reply_selected", reason="greeting_detected", text_chars=len(reply))
+                trace.mark_at("first_token_received", now, time_to_first_response_sec=0.0, source="feed")
+                trace.mark_at("last_token_received", now, text_chars=len(reply), source="feed")
+                trace.mark("feed_ack_selected", payload=payload, text_chars=len(reply))
+                self._log("INFO", f"{tag} turn {next_turn} (feed:{payload})")
             else:
-                hs = self._current_hs()
-                req = self._build_reply_request(
-                    utterance,
-                    is_last=is_last,
-                    hs=hs,
+                turn_user_utterance = utterance
+                trace = LatencyTrace(
+                    self,
+                    label=tag,
                     turn_index=next_turn,
-                    interaction_id=interaction_id,
-                    history=tuple(history))
-                request_id = self._llm_turn_worker.submit(req)
-                trace.request_id = request_id
-                trace.mark(
-                    "llm_request_submitted",
-                    max_tokens=req.max_tokens,
-                    stream=int(req.stream))
+                    utterance=utterance,
+                    started_mono=utterance_mono)
+                trace.mark_at("stt_final_received", utterance_mono, utterance_chars=len(utterance))
+                trace.mark_at("end_of_turn_detected", utterance_mono)
+                self._log("INFO", f"{tag} turn {next_turn}{' (winddown)' if winddown else ''}: '{utterance}'")
 
-                superseding_utterance: Optional[str] = None
-                superseding_mono: Optional[float] = None
-                while True:
-                    if result is not None and self._should_abort(result):
-                        return turns
+                if self._is_greeting(utterance):
+                    reply = self._local_reply_fallback(utterance, winddown, face_id)
+                    response_source = "local"
+                    fallback_reason = "greeting_detected"
+                    now = time.monotonic()
+                    trace.mark_at(
+                        "first_token_received",
+                        now,
+                        time_to_first_response_sec=now - trace.started_mono,
+                        source="local")
+                    trace.mark_at("last_token_received", now, text_chars=len(reply), source="local")
+                    trace.mark("local_reply_selected", reason="greeting_detected", text_chars=len(reply))
+                else:
+                    hs = self._current_hs()
+                    req = self._build_reply_request(
+                        utterance,
+                        winddown=winddown,
+                        hs=hs,
+                        turn_index=next_turn,
+                        interaction_id=interaction_id,
+                        history=tuple(history))
+                    request_id = self._llm_turn_worker.submit(req)
+                    trace.request_id = request_id
+                    trace.mark(
+                        "llm_request_submitted",
+                        max_tokens=req.max_tokens,
+                        stream=int(req.stream))
 
-                    # Keep listening while generation is in flight so a newer
-                    # utterance can supersede this request without blocking.
-                    self._speech.maybe_mark_done(trace=trace)
-                    event = self._llm_turn_worker.poll_event(self.STT_POLL_INTERVAL_SEC)
-                    if event is not None:
-                        if event.request_id != request_id:
-                            if event.kind in ("final", "error", "cancelled") and event.request_id < request_id:
-                                self._log("DEBUG", f"{tag} discard stale llm event kind={event.kind} req={event.request_id} current={request_id}")
-                            continue
-                        if event.kind == "first_token":
-                            trace.mark_at(
-                                "first_token_received",
-                                event.at_mono,
-                                time_to_first_response_sec=event.at_mono - trace.started_mono)
-                            continue
-                        if event.kind == "final":
-                            if not trace.has("first_token_received"):
+                    superseding_utterance: Optional[str] = None
+                    superseding_mono: Optional[float] = None
+                    while True:
+                        if result is not None and self._should_abort(result):
+                            break
+
+                        # Keep listening while generation is in flight so a newer
+                        # utterance can supersede this request without blocking.
+                        self._speech.maybe_mark_done(trace=trace)
+                        event = self._llm_turn_worker.poll_event(self.STT_POLL_INTERVAL_SEC)
+                        if event is not None:
+                            if event.request_id != request_id:
+                                if event.kind in ("final", "error", "cancelled") and event.request_id < request_id:
+                                    self._log("DEBUG", f"{tag} discard stale llm event kind={event.kind} req={event.request_id} current={request_id}")
+                                continue
+                            if event.kind == "first_token":
                                 trace.mark_at(
                                     "first_token_received",
                                     event.at_mono,
                                     time_to_first_response_sec=event.at_mono - trace.started_mono)
-                            trace.mark_at("last_token_received", event.at_mono, text_chars=len(event.text))
-                            reply = event.text.strip()
-                            response_source = "llm"
-                            break
-                        if event.kind == "error":
-                            trace.mark_at("llm_error", event.at_mono, error=event.error or "unknown")
-                            reply = self._local_reply_fallback(utterance, is_last, face_id)
-                            response_source = "local_fallback"
-                            fallback_reason = event.error or "llm_error"
-                            fallback_mono = time.monotonic()
-                            if not trace.has("first_token_received"):
+                                continue
+                            if event.kind == "final":
+                                if not trace.has("first_token_received"):
+                                    trace.mark_at(
+                                        "first_token_received",
+                                        event.at_mono,
+                                        time_to_first_response_sec=event.at_mono - trace.started_mono)
+                                trace.mark_at("last_token_received", event.at_mono, text_chars=len(event.text))
+                                reply = event.text.strip()
+                                response_source = "llm"
+                                break
+                            if event.kind == "error":
+                                trace.mark_at("llm_error", event.at_mono, error=event.error or "unknown")
+                                reply = self._local_reply_fallback(utterance, winddown, face_id)
+                                response_source = "local_fallback"
+                                fallback_reason = event.error or "llm_error"
+                                fallback_mono = time.monotonic()
+                                if not trace.has("first_token_received"):
+                                    trace.mark_at(
+                                        "first_token_received",
+                                        fallback_mono,
+                                        time_to_first_response_sec=fallback_mono - trace.started_mono,
+                                        source="local_fallback")
                                 trace.mark_at(
-                                    "first_token_received",
+                                    "last_token_received",
                                     fallback_mono,
-                                    time_to_first_response_sec=fallback_mono - trace.started_mono,
+                                    text_chars=len(reply),
                                     source="local_fallback")
-                            trace.mark_at(
-                                "last_token_received",
-                                fallback_mono,
-                                text_chars=len(reply),
-                                source="local_fallback")
-                            trace.mark("local_fallback", reason=event.error or "llm_error", text_chars=len(reply))
-                            break
-                        if event.kind == "cancelled":
-                            trace.mark_at("llm_cancelled", event.at_mono, reason="superseded")
+                                trace.mark("local_fallback", reason=event.error or "llm_error", text_chars=len(reply))
+                                break
+                            if event.kind == "cancelled":
+                                trace.mark_at("llm_cancelled", event.at_mono, reason="superseded")
+                                interrupted = 1
+                                superseded = 1
+                                break
+
+                        newer = self._stt_read_once()
+                        if newer:
+                            superseding_utterance = newer
+                            superseding_mono = time.monotonic()
+                            trace.mark("interruption", reason="new_user_utterance_before_reply", utterance_chars=len(newer))
                             interrupted = 1
                             superseded = 1
                             break
 
-                    newer = self._stt_read_once()
-                    if newer:
-                        superseding_utterance = newer
-                        superseding_mono = time.monotonic()
-                        trace.mark("interruption", reason="new_user_utterance_before_reply", utterance_chars=len(newer))
-                        interrupted = 1
-                        superseded = 1
-                        break
+                    if superseding_utterance:
+                        if result is not None:
+                            result.turns.append(self._build_turn_record(
+                                interaction_id=interaction_id,
+                                turn_index=next_turn,
+                                tag=tag,
+                                result=result,
+                                user_utterance=utterance,
+                                assistant_utterance=None,
+                                request_id=request_id,
+                                response_source=response_source,
+                                fallback_reason=fallback_reason,
+                                interrupted=interrupted,
+                                superseded=superseded,
+                                trace=trace,
+                                dispatch=None))
+                        utterance = superseding_utterance
+                        utterance_mono = superseding_mono or time.monotonic()
+                        continue
 
-                if superseding_utterance:
-                    if result is not None:
-                        result.turns.append(self._build_turn_record(
-                            interaction_id=interaction_id,
-                            turn_index=next_turn,
-                            tag=tag,
-                            result=result,
-                            user_utterance=utterance,
-                            assistant_utterance=None,
-                            request_id=request_id,
-                            response_source=response_source,
-                            fallback_reason=fallback_reason,
-                            interrupted=interrupted,
-                            superseded=superseded,
-                            trace=trace,
-                            dispatch=None))
-                    utterance = superseding_utterance
-                    utterance_mono = superseding_mono or time.monotonic()
-                    continue
+            if result is not None and self._should_abort(result):
+                break
 
             if not reply:
                 if result is not None and not result.abort_reason:
@@ -2060,15 +2102,12 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._log("WARNING", f"{tag} ABORT: llm_reply_failed")
                 break
 
-            if result is not None and self._should_abort(result):
-                break
-
             reply = reply.replace("—", ", ")
 
             self._speech.wait_until_idle(trace=trace, poll_sec=self.TTS_POLL_INTERVAL_SEC)
             dispatch = self._speech.dispatch(
                 reply,
-                label="ss3_reply",
+                label=dispatch_label,
                 trace=trace,
                 request_id=trace.request_id)
             if dispatch is None:
@@ -2077,17 +2116,14 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._log("WARNING", f"{tag} ABORT: tts_dispatch_failed")
                 break
 
-            self._charge_energy(
-                self.CONVERSATION_TURN_ENERGY_COST,
-                result,
-                "ss3_conversation_turn")
+            self._charge_energy(energy_cost, result, energy_reason)
             if result is not None:
                 result.turns.append(self._build_turn_record(
                     interaction_id=interaction_id,
                     turn_index=next_turn,
                     tag=tag,
                     result=result,
-                    user_utterance=utterance,
+                    user_utterance=turn_user_utterance,
                     assistant_utterance=reply,
                     request_id=request_id,
                     response_source=response_source,
@@ -2096,21 +2132,78 @@ class ExecutiveControlModule(yarp.RFModule):
                     superseded=superseded,
                     trace=trace,
                     dispatch=dispatch))
-            history.append(("user", utterance))
-            history.append(("assistant", reply))
+            if response_source == "feed_ack":
+                history.append(("assistant", reply))
+            else:
+                history.append(("user", turn_user_utterance))
+                history.append(("assistant", reply))
 
             turns += 1
-            if is_last:
-                self._speech.wait_until_idle(trace=trace, poll_sec=self.TTS_POLL_INTERVAL_SEC)
-                break
-
             trace.mark("listen_open")
-            utterance, utterance_mono = self._wait_for_user_utterance(self.SS3_STT_TIMEOUT, trace=trace)
-            if not utterance:
+            kind, a, b, c = self._wait_conversation_input(
+                self.SS3_STT_TIMEOUT, feed_baseline=feed_baseline, trace=trace)
+            if kind == "none":
                 self._log("INFO", f"{tag} no further response")
                 break
+            if kind == "feed":
+                feed_baseline = c
+                pending_feed = (a, b)
+            else:
+                utterance, utterance_mono = a, b
+                pending_feed = None
 
+        self._normalize_conversation_end(result, turns)
         return turns
+
+    def _wait_conversation_input(
+        self,
+        timeout: float,
+        *,
+        feed_baseline: float,
+        trace: Optional[LatencyTrace] = None) -> Tuple[str, Any, Any, Any]:
+        """Wait for the next conversation driver: a feed event or a user utterance.
+
+        Feeds take priority so the robot reacts to being fed immediately. Returns one of
+        ``("feed", payload, hs_before, feed_ts)``, ``("speech", text, mono, None)`` or
+        ``("none", None, None, None)`` on timeout/abort.
+        """
+        hs_before = self._current_hs()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._abort_requested():
+                return ("none", None, None, None)
+            if trace is not None:
+                self._speech.maybe_mark_done(trace=trace)
+            feed = self._poll_feed_since(feed_baseline)
+            if feed is not None:
+                payload, feed_ts = feed
+                return ("feed", payload, hs_before, feed_ts)
+            text = self._stt_read_once()
+            if text:
+                if trace is not None:
+                    self._speech.log_interruption(reason="user_barge_in", trace=trace)
+                return ("speech", text, time.monotonic(), None)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(self.STT_POLL_INTERVAL_SEC, remaining))
+        if trace is not None:
+            self._speech.maybe_mark_done(trace=trace)
+        return ("none", None, None, None)
+
+    def _normalize_conversation_end(self, result: Optional[InteractionResult], turns: int) -> None:
+        """Reclassify how an unbounded conversation terminated.
+
+        A target-left abort after real engagement (>= SS3_ENGAGED_MIN_TURNS) is now the
+        normal way these conversations end, so it is cleared (clean success). Leaving
+        before the second turn is an early abandonment and is folded into the
+        no-response signal so learning treats it the same as never replying.
+        """
+        if result is None or result.abort_reason not in self.TARGET_LEFT_ABORTS:
+            return
+        if turns >= self.SS3_ENGAGED_MIN_TURNS:
+            result.abort_reason = None
+        else:
+            result.abort_reason = "no_response_conversation"
 
     def _build_turn_record(
         self,
@@ -2174,71 +2267,79 @@ class ExecutiveControlModule(yarp.RFModule):
     def _run_hunger_tree(self, social_state: str, hs: str, result: InteractionResult,
                          intro_text: Optional[str] = None) -> None:
         self._log("INFO", f"Hunger tree: {hs}")
-        self._hunger_tree_active.set()
-        try:
-            self._stt_clear()
-            ask = intro_text if intro_text is not None else self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")
-            if self._speak_wait(ask):
-                self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_ask_feed")
+        self._stt_clear()
+        name = self._known_person_name(result.resolved_face_id)
+        ask = intro_text if intro_text is not None else self._text("hunger_ask_feed")
+        if self._speak_wait(ask):
+            self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_ask_feed")
+        else:
+            result.abort_reason = result.abort_reason or "tts_dispatch_failed"
+            return
+        result.talked = True
+
+        meals, timeouts, max_timeouts = 0, 0, 2
+        drive_disabled = False
+        wait_since = time.time()
+
+        while not self._should_abort(result):
+            if not self.hunger_enabled:
+                drive_disabled = True
+                self._log("INFO", "Hunger tree stopped: drive disabled")
+                break
+            hs_before     = self.hunger.snapshot().state
+            fed, payload, new_ts = self._wait_feed_since(wait_since, self._feed_wait_timeout_sec)
+
+            if fed:
+                result.replied_any = True
+                meals += 1
+                result.last_meal_payload = payload
+                snap = self.hunger.snapshot()
+                self._log("INFO", f"Feed #{meals}: {payload} → stomach {snap.level:.1f}")
+                if snap.state != hs_before:
+                    self._set_face_emotion(snap.state)
+                if self._speak_wait(self._feed_ack(hs_before, name)):
+                    self._charge_energy(self.FEED_ACK_ENERGY_COST, result, "feed_ack")
+                if snap.state == "HS1":
+                    break
+                if self._speak_wait(self._text("hunger_still_hungry")):
+                    self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_still_hungry")
+                wait_since = new_ts
+                timeouts   = 0
             else:
-                result.abort_reason = result.abort_reason or "tts_dispatch_failed"
-                return
-            result.talked = True
-
-            meals, timeouts, max_timeouts = 0, 0, 2
-            drive_disabled = False
-            wait_since = time.time()
-
-            while not self._should_abort(result):
                 if not self.hunger_enabled:
                     drive_disabled = True
                     self._log("INFO", "Hunger tree stopped: drive disabled")
                     break
-                hs_before     = self.hunger.snapshot().state
-                fed, payload, new_ts = self._wait_feed_since(wait_since, self._feed_wait_timeout_sec)
+                if self._should_abort(result):
+                    break
+                timeouts += 1
+                if timeouts >= max_timeouts:
+                    if not result.abort_reason:
+                        result.abort_reason = "no_food_qr"
+                    break
+                if self._speak_wait(self._text("hunger_look_around")):
+                    self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_look_around")
+                wait_since = time.time()
 
-                if fed:
-                    result.replied_any = True
-                    meals += 1
-                    result.last_meal_payload = payload
-                    snap = self.hunger.snapshot()
-                    self._log("INFO", f"Feed #{meals}: {payload} → stomach {snap.level:.1f}")
-                    if snap.state != hs_before:
-                        self._set_face_emotion(snap.state)
-                    if self._speak_wait(self._feed_ack(hs_before)):
-                        self._charge_energy(self.FEED_ACK_ENERGY_COST, result, "feed_ack")
-                    if snap.state == "HS1":
-                        break
-                    if self._speak_wait(self._P.get("hunger_still_hungry", "I'm still hungry. Give me more please.")):
-                        self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_still_hungry")
-                    wait_since = new_ts
-                    timeouts   = 0
-                else:
-                    if not self.hunger_enabled:
-                        drive_disabled = True
-                        self._log("INFO", "Hunger tree stopped: drive disabled")
-                        break
-                    if self._should_abort(result):
-                        break
-                    timeouts += 1
-                    if timeouts >= max_timeouts:
-                        if not result.abort_reason:
-                            result.abort_reason = "no_food_qr"
-                        break
-                    if self._speak_wait(self._P.get("hunger_look_around", "Take a look around, you will find some food for me.")):
-                        self._charge_energy(self.HUNGER_PROMPT_ENERGY_COST, result, "hunger_look_around")
-                    wait_since = time.time()
+        result.meals_eaten_count = meals
+        if drive_disabled:
+            result.success = True
+        elif meals > 0:
+            result.success = True
+        elif not result.abort_reason:
+            result.abort_reason = "no_food_qr"
+        result.final_state = social_state
 
-            result.meals_eaten_count = meals
-            if drive_disabled:
-                result.success = True
-            elif meals > 0:
-                result.success = True
-            elif not result.abort_reason:
-                result.abort_reason = "no_food_qr"
-            result.final_state = social_state
-        finally:
-            self._hunger_tree_active.clear()
+    def _poll_feed_since(self, ts: float) -> Optional[Tuple[str, float]]:
+        """Non-blocking check for a feed newer than ``ts``; returns (payload, feed_ts)."""
+        if not self.hunger_enabled:
+            return None
+        with self.hunger._lock:
+            lfts    = self.hunger.last_feed_ts
+            payload = self.hunger.last_feed_payload
+        if lfts > ts and payload is not None:
+            return payload, lfts
+        return None
 
     def _wait_feed_since(self, ts: float, timeout: float) -> Tuple[bool, Optional[str], float]:
         with self._feed_condition:
@@ -2258,12 +2359,10 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._feed_condition.wait(min(wait_for, 0.5))
             return False, None, time.time()
 
-    def _feed_ack(self, hs_before: str) -> str:
-        if hs_before == "HS1":
-            return self._P.get("feed_ack_hs1", "Oh no, I'm already so full! One more bite and I might actually explode!")
-        if hs_before == "HS3":
-            return self._P.get("feed_ack_hs3", "Oh wow, thank you! You literally just saved my life!")
-        return self._P.get("feed_ack_hs2", "yummy! Thank you so much!")
+    def _feed_ack(self, hs_before: str, name: str = "") -> str:
+        key = {"HS1": "feed_ack_hs1", "HS3": "feed_ack_hs3"}.get(hs_before, "feed_ack_hs2")
+        name_frag = f" {name}" if name else ""
+        return self._text(key).format(name=name_frag)
 
     # ── QR reader loop ────────────────────────────────────────────────────────
 
@@ -2291,11 +2390,12 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._qr_stop.wait(0.02)
                     continue
 
-                # For ambient feeds (no active hunger tree) require a face in the
-                # scene — the QR could be a stray scan with nobody present.
-                # During an active hunger tree the robot is already talking to
-                # someone, so the gate does not apply; use the known track_id.
-                if self._hunger_tree_active.is_set():
+                # When an interaction is active it owns the feed acknowledgement (spoken
+                # as a conversation turn / in the hunger tree), so just credit the current
+                # target. Ambient feeds (idle robot) require a face in the scene — a stray
+                # scan with nobody present is ignored.
+                interaction_busy = self._busy_snapshot()[0]
+                if interaction_busy:
                     feeder_tid = self._current_track_id
                     feeder_fid = None
                 else:
@@ -2349,8 +2449,8 @@ class ExecutiveControlModule(yarp.RFModule):
                 with self._feed_condition:
                     self._feed_condition.notify_all()
 
-                if not self._hunger_tree_active.is_set():
-                    if self._speak(self._feed_ack(hs_before)):
+                if not interaction_busy:
+                    if self._speak(self._feed_ack(hs_before, self._known_person_name(feeder_fid or ""))):
                         self._charge_energy(self.FEED_ACK_ENERGY_COST, None, "ambient_feed_ack")
                     self._db_enqueue(("reactive", {
                         "type":                 "qr_feed",
@@ -2434,8 +2534,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._log("INFO", f"{tag} START (track={track_id})")
                 hs = self._effective_hunger_state()
                 if self.hunger_enabled and hs == "HS3":
-                    hunger_ask = self._P.get("hunger_ask_feed", "I'm so hungry, would you feed me please?")
-                    intro = f"Hello, {hunger_ask}"
+                    intro = self._text("reactive_hunger_intro").format(ask=self._text("hunger_ask_feed"))
                     self._run_hunger_tree("ss3", hs, dummy, intro_text=intro)
                     dummy.success = not dummy.aborted
                     dummy.final_state = "ss3"
@@ -2452,7 +2551,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     dummy.final_state = "ss3"
 
                 if utterance and not self._should_abort(dummy):
-                    greeting = self._P.get("reactive_greeting", "Hi {name}").format(name=name)
+                    greeting = self._text("reactive_greeting").format(name=name)
                     turns    = self._run_conversation(
                         f"[RSS3|{name}]",
                         utterance,
@@ -2522,7 +2621,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
                 # Greet without requiring a greeting response (they already said hi)
                 self._stt_clear()
-                if self._speak_wait(self._P.get("ss1_greeting", "Hi there!")):
+                if self._speak_wait(self._text("ss1_greeting")):
                     self._charge_energy(self.GREETING_ENERGY_COST, dummy, "reactive_unknown_greeting")
                     dummy.greeted = True
                 else:
@@ -2553,7 +2652,7 @@ class ExecutiveControlModule(yarp.RFModule):
                 self._submit_face_name(track_id, name)
                 self._write_last_greeted(track_id, name, name, name)
                 self._mark_greeted_today(name)
-                if self._speak_wait(self._P.get("ss1_nice_to_meet", "Nice to meet you")):
+                if self._speak_wait(self._text("ss1_nice_to_meet")):
                     self._charge_energy(self.GREETING_ENERGY_COST, dummy, "reactive_nice_to_meet")
                 else:
                     dummy.abort_reason = dummy.abort_reason or "tts_dispatch_failed"
@@ -2599,7 +2698,7 @@ class ExecutiveControlModule(yarp.RFModule):
         attempts: int = 1,
         tag:      str = "[greet]",
         result:   Optional[InteractionResult] = None) -> Optional[str]:
-        tpl = self._P.get("ss2_greeting", "Hello {name}")
+        tpl = self._text("ss2_greeting")
         for attempt in range(max(1, attempts)):
             self._log("INFO", f"{tag} greeting attempt {attempt+1}/{attempts}")
             if result is not None and self._should_abort(result):
@@ -2630,7 +2729,7 @@ class ExecutiveControlModule(yarp.RFModule):
         """Ask for name with one retry; return (name, reason)."""
         self._stt_clear()
         self._speech.wait_until_idle(poll_sec=self.TTS_POLL_INTERVAL_SEC)
-        if self._speak(self._P.get("ss1_ask_name", "We have not met, what's your name?")):
+        if self._speak(self._text("ss1_ask_name")):
             self._charge_energy(self.NAME_QUESTION_ENERGY_COST, result, "ss1_ask_name")
         else:
             return None, "tts_dispatch_failed"
@@ -2649,7 +2748,7 @@ class ExecutiveControlModule(yarp.RFModule):
             return None, "aborted"
         self._stt_clear()
         self._speech.wait_until_idle(poll_sec=self.TTS_POLL_INTERVAL_SEC)
-        if self._speak(self._P.get("ss1_ask_name_retry", "Sorry, I didn't catch that. What's your name?")):
+        if self._speak(self._text("ss1_ask_name_retry")):
             self._charge_energy(self.NAME_QUESTION_ENERGY_COST, result, "ss1_ask_name_retry")
         else:
             return None, "tts_dispatch_failed"
@@ -3324,12 +3423,31 @@ class ExecutiveControlModule(yarp.RFModule):
             self._log("WARNING", f"hs_snapshot_failed: {e}")
             return "HS1"
 
-    def _prompt_for_hs(self, base_key: str, hs: str, default_value: str) -> str:
+    def _text(self, key: str) -> str:
+        """Return a prompt string from prompts.json; warn (don't crash) if it's missing."""
+        value = self._P.get(key, "")
+        if not value:
+            self._log("WARNING", f"prompts.json missing executiveControl.{key}")
+        return value
+
+    def _choice(self, key: str) -> str:
+        """Pick a random spoken-text option from a prompts.json list, or '' if absent."""
+        options = self._P.get(key) or []
+        return random.choice(options) if options else ""
+
+    @staticmethod
+    def _known_person_name(face_id: str) -> str:
+        """Return the person's name when face_id is a real identity, else ''."""
+        if face_id and face_id.lower() not in ("unknown", "unmatched", "recognizing") and not face_id.isdigit():
+            return face_id
+        return ""
+
+    def _prompt_for_hs(self, base_key: str, hs: str) -> str:
         hs_key = f"{base_key}_{hs.lower()}"
-        return self._P.get(hs_key) or self._P.get(base_key, default_value)
+        return self._P.get(hs_key) or self._text(base_key)
 
     def _system_for_hs(self, hs: str) -> str:
-        base = self.LLM_SYS_DEFAULT or self.LLM_SYS_FAST
+        base = self.LLM_SYS_DEFAULT
         overlay_key = {
             self.HUNGER_OFF_STATE: "system_overlay_hs0",
             "HS1": "system_overlay_hs1",
@@ -3340,49 +3458,33 @@ class ExecutiveControlModule(yarp.RFModule):
         return f"{base}\n\n{overlay}".strip() if overlay else base
 
     def _local_starter_fallback(self, hs: str) -> str:
-        if hs == "HS2":
-            return random.choice([
-                "how's your day going?",
-                "what have you been up to?",
-                "how are you doing today?",
-            ])
-        return random.choice([
-            "what are you up to today?",
-            "how's your day going so far?",
-            "anything interesting going on?",
-            "how are you doing?",
-        ])
+        return self._choice(f"starter_fallback_{hs.lower()}") or self._choice("starter_fallback")
 
-    def _local_reply_fallback(self, utterance: str, is_last: bool, face_id: str = "") -> str:
+    def _local_reply_fallback(self, utterance: str, winddown: bool, face_id: str = "") -> str:
         if self._is_greeting(utterance):
-            if face_id and face_id.lower() not in ("unknown", "unmatched", "recognizing") and not face_id.isdigit():
-                return self._P.get("reactive_greeting", "Hi {name}").format(name=face_id)
-            return self._P.get("ss1_greeting", "Hi there!")
-        if is_last:
-            return "okay, thanks for talking with me"
-        return "mm tell me a little more"
+            name = self._known_person_name(face_id)
+            if name:
+                return self._text("reactive_greeting").format(name=name)
+            return self._text("ss1_greeting")
+        if winddown:
+            return self._choice("reply_fallback_winddown") or self._text("reply_fallback")
+        return self._text("reply_fallback")
 
     def _build_reply_request(
         self,
         utterance: str,
         *,
-        is_last: bool,
+        winddown: bool,
         hs: str,
         turn_index: int,
         interaction_id: Optional[str],
         history: Tuple[Tuple[str, str], ...] = ()) -> LlmTurnRequest:
-        if is_last:
-            tmpl = self._prompt_for_hs(
-                "closing_ack_prompt",
-                hs,
-                "Person said: '{last_utterance}'\nWarm acknowledgment, 4 to 8 words. No question mark. Output only.")
-            max_tokens = self.SS3_CLOSING_MAX_TOKENS
-            max_len    = self.SS3_CLOSING_MAX_LEN
+        if winddown:
+            tmpl = self._prompt_for_hs("winddown_ack_prompt", hs)
+            max_tokens = self.SS3_WINDDOWN_MAX_TOKENS
+            max_len    = self.SS3_WINDDOWN_MAX_LEN
         else:
-            tmpl = self._prompt_for_hs(
-                "followup_prompt",
-                hs,
-                "User said: '{last_utterance}'\nRespond in 1 sentence, 22 words or fewer. At most one short follow-up question. Output only.")
+            tmpl = self._prompt_for_hs("followup_prompt", hs)
             max_tokens = self.SS3_FOLLOWUP_MAX_TOKENS
             max_len    = self.SS3_TURN_MAX_LEN
 
@@ -3409,11 +3511,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
     def _llm_extract_name(self, utterance: str) -> Dict:
         failure = {"answered": False, "name": None, "confidence": 0.0}
-        tmpl    = self._P.get("extract_name_prompt",
-            'Utterance: "{utterance}"\nExtract the speaker\'s own name.\n'
-            '- Patterns: "my name is", "I\'m", "call me", "I am".\n'
-            "- Title Case, single token. If unclear: answered=false, name=null, confidence=0.0.")
-        prompt  = tmpl.format(utterance=utterance)
+        prompt  = self._text("extract_name_prompt").format(utterance=utterance)
         schema  = {
             "type": "object",
             "properties": {
@@ -3431,7 +3529,7 @@ class ExecutiveControlModule(yarp.RFModule):
         if not res.ok:
             # Plain JSON fallback
             res = self._llm_call(
-                prompt + "\nReturn ONLY compact JSON: {answered,name,confidence}.",
+                prompt + self._text("extract_name_retry_suffix"),
                 system=self.LLM_SYS_JSON, max_tokens=64, timeout=self.LLM_TIMEOUT)
 
         if not res.ok:
@@ -3456,10 +3554,7 @@ class ExecutiveControlModule(yarp.RFModule):
         return {"answered": answered, "name": name_raw.strip() if name_raw else None, "confidence": conf}
 
     def _llm_get_starter(self, hs: str) -> str:
-        prompt = self._prompt_for_hs(
-            "convo_starter_prompt",
-            hs,
-            "Ask ONE short friendly question about the person's day (6–12 words). No greeting. Output only the sentence.")
+        prompt = self._prompt_for_hs("convo_starter_prompt", hs)
         system = self._system_for_hs(hs)
 
         req = LlmTurnRequest(

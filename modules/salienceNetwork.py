@@ -131,14 +131,8 @@ class SalienceNetworkModule(yarp.RFModule):
         meals_eaten_count: Optional[int]
         n_turns: Optional[int]
         exec_interaction_id: Optional[str]
-        old_prox: Optional[float]
-        old_cent: Optional[float]
-        old_vel: Optional[float]
-        old_gaze: Optional[float]
-        new_prox: Optional[float]
-        new_cent: Optional[float]
-        new_vel: Optional[float]
-        new_gaze: Optional[float]
+        affinity_before: Optional[float]
+        affinity_after: Optional[float]
 
     # ==================== Adaptive IPS Constants ====================
     # Baseline IPS weights
@@ -149,24 +143,19 @@ class SalienceNetworkModule(yarp.RFModule):
         "ss1": 0.80, # Stranger: stricter hurdle (less proactive)
         "ss2": 0.65, # Known, not greeted: more proactive
         "ss3": 0.75, # Known, greeted, no talk: still proactive, but less than ss2
-        "ss4": 0.85, # Known, talked: re-engage with ss3 action when highly salient
+        "ss4": 0.90, # Known, talked: re-engage with ss3 action when highly salient
     }
 
     HABITUATION_LAMBDA = 0.06  # Habituation decay (~11.6 s half-life, only active after dwell)
-    HOMEOSTATIC_WEIGHT_SHIFT_RATE = 0.15
-    HOMEOSTATIC_REWARD_SCALE = 0.005
-    MAX_WEIGHT_SHIFT_PER_INTERACTION = 0.08
-    HOMEOSTATIC_REWARD_EPSILON = 0.2
-    # Reward clamp is asymmetric: costs accrue in small frequent increments while a
-    # feed is a rare large positive. A symmetric +/-30 cap truncated a full meal
-    # (LARGE_MEAL = +45) down to +30, so feeders could never fully offset their cost.
-    # The positive cap matches the largest single meal; the negative cap still bounds
-    # one costly conversation's downward pull on the weights.
-    HOMEOSTATIC_REWARD_CLAMP_NEG = -30.0
-    HOMEOSTATIC_REWARD_CLAMP_POS = 45.0
-    REWARD_EMA_ALPHA = 0.25
-    SHORT_INTERACTION_MIN_TURNS = 2
-    SHORT_INTERACTION_REWARD_THRESHOLD = 5.0
+
+    # Per-person affinity in [-1,+1]: an EMA of normalized reward. >0 feeds the drive
+    # (be more proactive), <0 is an energy sink (be more conservative).
+    AFFINITY_ALPHA = 0.25             # EMA weight on the newest interaction
+    AFFINITY_REWARD_SCALE = 25.0      # reward mapped to |1.0| (~one medium meal)
+    AFFINITY_NEUTRAL_BAND = 0.2       # |reward| within this carries no signal
+    AFFINITY_THRESHOLD_GAIN = 0.15    # how far affinity shifts the eligibility threshold
+    AFFINITY_THRESHOLD_FLOOR = 0.50   # floor so a feeder can't trip on noise
+    ENGAGED_MIN_TURNS = 2             # turns that count as real engagement
     TARGET_LOG_MIN_PERIOD_SEC = 1.0
     TARGET_LOG_IPS_DELTA = 0.15
     FACE_IPS_LOG_PERIOD_SEC = 0.5
@@ -981,15 +970,6 @@ class SalienceNetworkModule(yarp.RFModule):
             return True
         return False
 
-    @staticmethod
-    def _parse_boolish(value: Any, *, default: bool = False) -> bool:
-        text = str(value).strip().lower()
-        if text in {"1", "true", "yes", "y", "on"}:
-            return True
-        if text in {"0", "false", "no", "n", "off"}:
-            return False
-        return default
-
     def _log_face_ips_events(self, faces: List[Dict[str, Any]]) -> None:
         now = time.time()
         active_track_id = self._active_attention_track_id()
@@ -998,7 +978,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 continue
             person_id = str(face.get("person_id", face.get("face_id", "unknown")))
             vars_norm = self._calculate_ips_variables(face)
-            weights = self._get_person_weights(person_id)
+            weights = self.BASELINE_WEIGHTS
             self._db_log(
                 "face_ips_event",
                 {
@@ -1340,28 +1320,27 @@ class SalienceNetworkModule(yarp.RFModule):
     def _is_eligible(self, face: Dict[str, Any]) -> bool:
         ss = face.get("social_state", "ss1")
         ips = face.get("ips", 0.0)
-        threshold = self.SS_THRESHOLDS.get(ss, 1.0)
-        return ips >= threshold
+        person_id = str(face.get("person_id", face.get("face_id", "")))
+        return ips >= self._effective_threshold(ss, person_id)
 
-    # ==================== IPS & Habituation Math ====================
+    def _effective_threshold(self, ss: str, person_id: str) -> float:
+        """Eligibility threshold lowered for liked feeders, raised for energy sinks."""
+        base = self.SS_THRESHOLDS.get(ss, 1.0)
+        affinity = self._person_affinity(person_id)
+        return max(self.AFFINITY_THRESHOLD_FLOOR, base - self.AFFINITY_THRESHOLD_GAIN * affinity)
 
     @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(1.0, float(value)))
+    def _clamp_affinity(value: float) -> float:
+        return max(-1.0, min(1.0, float(value)))
 
-    def _get_person_weights(self, person_id: str) -> Dict[str, float]:
-        """Fetch personalized weights, or fallback to baseline for strangers."""
+    def _person_affinity(self, person_id: str) -> float:
+        """Return a person's learned affinity in [-1, +1] (0 for strangers)."""
         profile = self.homeostatic_profiles.get(person_id, {})
-        raw_weights = profile.get("weights") if isinstance(profile, dict) else None
-        if not isinstance(raw_weights, dict):
-            return self.BASELINE_WEIGHTS.copy()
-        weights = self.BASELINE_WEIGHTS.copy()
-        for key in weights:
-            try:
-                weights[key] = self._clamp01(float(raw_weights.get(key, weights[key])))
-            except (TypeError, ValueError):
-                pass
-        return weights
+        if isinstance(profile, dict) and isinstance(profile.get("affinity"), (int, float)):
+            return self._clamp_affinity(profile["affinity"])
+        return 0.0
+
+    # ==================== IPS & Habituation Math ====================
 
     def _calculate_ips_variables(self, face: Dict[str, Any]) -> Dict[str, float]:
         """Converts raw landmark data into normalized 0.0-1.0 scoring variables."""
@@ -1396,9 +1375,13 @@ class SalienceNetworkModule(yarp.RFModule):
     def _calculate_ips(
         self, face: Dict[str, Any], person_id: str, apply_habituation: bool = True
     ) -> float:
-        """Calculates IPS using personal weights and optional Habituation Decay."""
+        """Calculates IPS from fixed perceptual weights and optional Habituation Decay.
+
+        Personalization lives in the eligibility threshold (see _effective_threshold),
+        not the IPS itself, so the perceptual score stays comparable across people.
+        """
         vars_norm = self._calculate_ips_variables(face)
-        weights = self._get_person_weights(person_id)
+        weights = self.BASELINE_WEIGHTS
 
         # Base Formula
         base_ips = (
@@ -1939,29 +1922,6 @@ class SalienceNetworkModule(yarp.RFModule):
         except (TypeError, ValueError):
             return default
 
-    def _homeostatic_reward_from_result(self, result: Dict[str, Any]) -> float:
-        if "homeostatic_reward" in result:
-            return self._result_float(result, "homeostatic_reward", 0.0)
-        return (
-            self._result_float(result, "stomach_level_end", 100.0)
-            - self._result_float(result, "stomach_level_start", 100.0)
-        )
-
-    def _homeostatic_reason(self, result: Dict[str, Any], outcome: str, reward: float) -> str:
-        if outcome == "neutral":
-            return "neutral_delta"
-        if outcome == "drive_reduced":
-            return "food_received"
-
-        abort_reason = str(result.get("abort_reason") or "")
-        if abort_reason in {"target_lost", "face_disappeared", "target_monitor_abort"}:
-            return "target_lost"
-        if self._result_int(result, "n_turns", 0) > 0:
-            return "conversation_energy_cost"
-        if self._result_int(result, "meals_eaten_count", 0) == 0:
-            return "no_food_qr"
-        return "conversation_energy_cost" if reward < 0.0 else "neutral_delta"
-
     def _log_homeostatic_delta(
         self,
         result: Dict[str, Any],
@@ -1969,8 +1929,8 @@ class SalienceNetworkModule(yarp.RFModule):
         reward: float,
         outcome: str,
         reason: str,
-        old_weights: Optional[Dict[str, float]],
-        new_weights: Optional[Dict[str, float]]) -> None:
+        affinity_before: Optional[float],
+        affinity_after: Optional[float]) -> None:
         delta = self.HomeostaticLearningDelta(
             person_id=person_id,
             reward_delta=reward,
@@ -1985,135 +1945,68 @@ class SalienceNetworkModule(yarp.RFModule):
             meals_eaten_count=self._result_int(result, "meals_eaten_count", 0),
             n_turns=self._result_int(result, "n_turns", 0),
             exec_interaction_id=result.get("interaction_id"),
-            old_prox=old_weights.get("prox") if old_weights else None,
-            old_cent=old_weights.get("cent") if old_weights else None,
-            old_vel=old_weights.get("vel") if old_weights else None,
-            old_gaze=old_weights.get("gaze") if old_weights else None,
-            new_prox=new_weights.get("prox") if new_weights else None,
-            new_cent=new_weights.get("cent") if new_weights else None,
-            new_vel=new_weights.get("vel") if new_weights else None,
-            new_gaze=new_weights.get("gaze") if new_weights else None)
+            affinity_before=affinity_before,
+            affinity_after=affinity_after)
         self._db_log("homeostatic_learning_change", asdict(delta))
 
     def _apply_homeostatic_learning(self, result: Dict[str, Any], person_id: str) -> None:
-        """
-        Update a person's IPS weights using homeostatic reward.
-        Positive reward makes the robot more proactive.
-        Negative reward makes the robot more conservative/reactive.
+        """Update a person's affinity (EMA of normalized reward) from one interaction.
+
+        Fed -> reinforce; cost while barely engaged -> penalize; cost after a real chat
+        the person left, or a tiny delta -> neutral, no change.
         """
         person_id = str(person_id or "").strip()
-        reward = max(
-            self.HOMEOSTATIC_REWARD_CLAMP_NEG,
-            min(self.HOMEOSTATIC_REWARD_CLAMP_POS, self._homeostatic_reward_from_result(result)))
+        reward = self._result_float(result, "homeostatic_reward", 0.0)
 
         if not self._is_face_known(person_id):
             self._log_homeostatic_delta(
-                result, person_id or "unknown", reward, "skipped", "unknown_person", None, None
-            )
+                result, person_id or "unknown", reward, "skipped", "unknown_person", None, None)
             return
 
-        if not self._result_bool(result, "hunger_drive_enabled", True):
-            old_weights = self._get_person_weights(person_id)
-            self._log_homeostatic_delta(
-                result, person_id, reward, "skipped", "hunger_disabled", old_weights, old_weights
-            )
+        if (not self._result_bool(result, "hunger_drive_enabled", True)
+                or str(result.get("hunger_state_start", "")).upper() == "HS0"):
+            a = self._person_affinity(person_id)
+            self._log_homeostatic_delta(result, person_id, reward, "skipped", "hunger_disabled", a, a)
             return
 
-        if str(result.get("hunger_state_start", "")).upper() == "HS0":
-            old_weights = self._get_person_weights(person_id)
-            self._log_homeostatic_delta(
-                result, person_id, reward, "skipped", "hunger_disabled", old_weights, old_weights
-            )
-            return
-
-        # Skip brief interactions unless they carried a real positive signal (a feed).
-        # Using `reward <` rather than `abs(reward) <` means a short interaction that
-        # merely burned a little energy (greeting/abort) is treated as noise instead of
-        # teaching "avoid this person" - a <2-turn contact is too short to conclude the
-        # person depletes us, and dropping it keeps the learned/recorded set unbiased.
-        # Genuinely costly interactions are multi-turn and bypass this gate.
         n_turns = self._result_int(result, "n_turns", 0)
-        if n_turns < self.SHORT_INTERACTION_MIN_TURNS and reward < self.SHORT_INTERACTION_REWARD_THRESHOLD:
-            old_weights = self._get_person_weights(person_id)
-            self._log_homeostatic_delta(
-                result, person_id, reward, "skipped", "short_interaction_noise", old_weights, old_weights
-            )
-            self._log("INFO", f"homeostatic learning skipped: {person_id} short interaction (turns={n_turns} reward={reward:.2f})")
+        band = self.AFFINITY_NEUTRAL_BAND
+        positive = reward > band
+        early_abandonment = reward < -band and n_turns < self.ENGAGED_MIN_TURNS
+
+        if not positive and not early_abandonment:
+            a = self._person_affinity(person_id)
+            reason = "target_left_after_engagement" if reward < -band else "neutral_delta"
+            self._log_homeostatic_delta(result, person_id, reward, "neutral", reason, a, a)
+            self._log("INFO", f"affinity neutral: {person_id} reason={reason} (turns={n_turns} reward={reward:.1f})")
             return
+
+        r_norm = self._clamp_affinity(reward / self.AFFINITY_REWARD_SCALE)
+        outcome = "drive_reduced" if positive else "drive_depleted"
+        reason = "food_received" if positive else "no_response"
 
         with self._memory_lock:
             profile = self.homeostatic_profiles.get(person_id, {})
-            if not isinstance(profile, dict):
-                profile = {}
-            raw_homeostasis = profile.get("homeostasis", {})
-            homeostasis = raw_homeostasis if isinstance(raw_homeostasis, dict) else {}
-
-            old_weights = self._get_person_weights(person_id)
-            weights = dict(old_weights)
-            epsilon = self.HOMEOSTATIC_REWARD_EPSILON
-
-            if abs(reward) < epsilon:
-                outcome = "neutral"
-                reason = "neutral_delta"
-                shift = 0.0
-            else:
-                shift = min(
-                    self.MAX_WEIGHT_SHIFT_PER_INTERACTION,
-                    self.HOMEOSTATIC_WEIGHT_SHIFT_RATE
-                    * abs(reward)
-                    * self.HOMEOSTATIC_REWARD_SCALE)
-                if reward > epsilon:
-                    outcome = "drive_reduced"
-                    weights["prox"] = self._clamp01(weights["prox"] + shift)
-                    weights["vel"] = self._clamp01(weights["vel"] + shift)
-                    weights["cent"] = self._clamp01(weights["cent"] + shift * 0.25)
-                    weights["gaze"] = self._clamp01(weights["gaze"] - shift)
-                else:
-                    outcome = "drive_depleted"
-                    weights["prox"] = self._clamp01(weights["prox"] - shift)
-                    weights["vel"] = self._clamp01(weights["vel"] - shift)
-                    weights["cent"] = self._clamp01(weights["cent"] - shift * 0.15)
-                    weights["gaze"] = self._clamp01(weights["gaze"] + shift)
-                reason = self._homeostatic_reason(result, outcome, reward)
-
-            interactions_prev = self._result_int(homeostasis, "interactions", 0)
-            # lifetime_energy_balance is a non-decaying running sum: it trends negative
-            # for anyone who isn't a net feeder and is NOT a relationship/quality score.
-            # reward_ema is the behavioral signal (recent standing). Read the legacy
-            # "total_reward" key as a fallback so existing profiles carry forward.
-            balance_prev = self._result_float(
-                homeostasis,
-                "lifetime_energy_balance",
-                self._result_float(homeostasis, "total_reward", 0.0))
-            ema_prev = self._result_float(homeostasis, "reward_ema", 0.0)
-            reward_ema = (
-                reward
-                if interactions_prev <= 0
-                else self.REWARD_EMA_ALPHA * reward + (1.0 - self.REWARD_EMA_ALPHA) * ema_prev
-            )
-            now_iso = datetime.now(self.TIMEZONE).isoformat()
+            interactions_prev = self._result_int(profile, "interactions", 0) if isinstance(profile, dict) else 0
+            affinity_before = self._person_affinity(person_id)
+            affinity_after = self._clamp_affinity(
+                r_norm if interactions_prev <= 0
+                else affinity_before + self.AFFINITY_ALPHA * (r_norm - affinity_before))
             self.homeostatic_profiles[person_id] = {
-                "weights": weights,
-                "homeostasis": {
-                    "interactions": interactions_prev + 1,
-                    "lifetime_energy_balance": balance_prev + reward,
-                    "reward_ema": reward_ema,
-                    "last_reward": reward,
-                    "last_stomach_level_start": self._result_float(result, "stomach_level_start", 100.0),
-                    "last_stomach_level_end": self._result_float(result, "stomach_level_end", 100.0),
-                    "last_active_energy_cost": self._result_float(result, "active_energy_cost", 0.0),
-                    "last_meals_eaten_count": self._result_int(result, "meals_eaten_count", 0),
-                    "last_trigger_mode": str(result.get("trigger_mode", "proactive")),
-                    "last_outcome": outcome,
-                },
-                "updated_at": now_iso,
+                "affinity": affinity_after,
+                "interactions": interactions_prev + 1,
+                "last_reward": reward,
+                "last_outcome": outcome,
+                "last_trigger_mode": str(result.get("trigger_mode", "proactive")),
+                "updated_at": datetime.now(self.TIMEZONE).isoformat(),
             }
 
         self._enqueue_save("homeostatic_learning")
-        self._log_homeostatic_delta(result, person_id, reward, outcome, reason, old_weights, weights)
+        self._log_homeostatic_delta(result, person_id, reward, outcome, reason, affinity_before, affinity_after)
         self._log(
             "INFO",
-            f"homeostatic learning: {person_id} reward={reward:.2f} outcome={outcome} shift={shift:.4f}")
+            f"affinity: {person_id} {affinity_before:+.2f} -> {affinity_after:+.2f} "
+            f"(reward={reward:.1f} r_norm={r_norm:+.2f} {outcome})")
 
     # ==================== Last Greeted (fresh read) ====================
 
@@ -2421,14 +2314,8 @@ class SalienceNetworkModule(yarp.RFModule):
                 meals_eaten_count INTEGER,
                 n_turns INTEGER,
                 exec_interaction_id TEXT,
-                old_prox REAL,
-                old_cent REAL,
-                old_vel REAL,
-                old_gaze REAL,
-                new_prox REAL,
-                new_cent REAL,
-                new_vel REAL,
-                new_gaze REAL
+                affinity_before REAL,
+                affinity_after REAL
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS interaction_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2710,14 +2597,8 @@ class SalienceNetworkModule(yarp.RFModule):
                 meals_eaten_count,
                 n_turns,
                 exec_interaction_id,
-                old_prox,
-                old_cent,
-                old_vel,
-                old_gaze,
-                new_prox,
-                new_cent,
-                new_vel,
-                new_gaze
+                affinity_before,
+                affinity_after
             FROM homeostatic_learning_changes
             WHERE valid_for_analysis = 1
             """
@@ -2951,9 +2832,8 @@ class SalienceNetworkModule(yarp.RFModule):
                          person_id,reward_delta,outcome,reason,trigger_mode,
                          hunger_state_start,hunger_state_end,stomach_level_start,stomach_level_end,
                          active_energy_cost,meals_eaten_count,n_turns,exec_interaction_id,
-                         old_prox,old_cent,old_vel,old_gaze,
-                         new_prox,new_cent,new_vel,new_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         affinity_before,affinity_after)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2978,14 +2858,8 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("meals_eaten_count"),
                             data.get("n_turns"),
                             data.get("exec_interaction_id"),
-                            data.get("old_prox"),
-                            data.get("old_cent"),
-                            data.get("old_vel"),
-                            data.get("old_gaze"),
-                            data.get("new_prox"),
-                            data.get("new_cent"),
-                            data.get("new_vel"),
-                            data.get("new_gaze")))
+                            data.get("affinity_before"),
+                            data.get("affinity_after")))
                 elif table == "interaction_attempt":
                     c.execute(
                         """INSERT INTO interaction_attempts
