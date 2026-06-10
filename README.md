@@ -149,6 +149,8 @@ flowchart LR
 - **Interactive Control**: Allows manual injection of meals (QR simulation) and direct manipulation of the hunger state for debugging and demonstrations.
 - **Zero-Interference**: Operates passively by polling `/executiveControl` status, ensuring it can be attached or detached without affecting the main behavior pipeline.
 
+**Panel modes**: by default the monitor shows the **Status**, **Feed**, **Events**, and **Shutdown** sections. Pass `--full` to additionally expose the **Drive**, **State**, and **Reset** control sections for manual manipulation of the hunger drive.
+
 **YARP connections**:
 - RPC polling to `/executiveControl`
 - Writes to `/alwayson/executiveControl/qr:i`

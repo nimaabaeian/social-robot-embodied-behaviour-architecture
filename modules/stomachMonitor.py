@@ -13,8 +13,11 @@
 #
 # Buttons map 1:1 onto the RPC verbs (hunger_mode, hunger <hsN>, reset, quit).
 #
+# By default it shows the monitoring panel (Status / Feed / Events / Shutdown).
+# Pass --full to additionally show the Drive / State / Reset control sections.
+#
 #   alwayson_stomachMonitor --server /executiveControl
-#   alwayson_stomachMonitor --sim
+#   alwayson_stomachMonitor --server /executiveControl --full
 #
 # Requires Pillow (pip install pillow). Falls back to a basic vector view if
 # Pillow is missing, so it never hard-fails on the robot.
@@ -35,7 +38,7 @@ import tkinter as tk
 from collections import deque
 from tkinter import font as tkfont
 from tkinter import messagebox
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
@@ -460,74 +463,6 @@ class StomachRenderer:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Backends (unchanged contract: snapshot / cmd_rpc / cmd_meal / start / stop)
-# ══════════════════════════════════════════════════════════════════════════════
-class SimBackend:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.level = 100.0
-        self.enabled = True
-        self.last = time.time()
-        self._last_feed = 0.0
-
-    def _drain(self):
-        now = time.time()
-        rate = 100.0 / (DRAIN_HOURS * 3600.0)
-        self.level = max(0.0, min(100.0, self.level - (now - self.last) * rate))
-        self.last = now
-
-    def _state(self):
-        if not self.enabled:
-            return "HS0"
-        if self.level >= HUNGRY_THRESHOLD:
-            return "HS1"
-        if self.level >= STARVING_THRESHOLD:
-            return "HS2"
-        return "HS3"
-
-    def snapshot(self):
-        with self._lock:
-            self._drain()
-            return {"connected": True, "enabled": self.enabled,
-                    "level": self.level, "state": self._state(),
-                    "busy": False, "backend": "SIM", "face_present": True}
-
-    def cmd_rpc(self, words):
-        with self._lock:
-            self._drain()
-            c = words[0]
-            if c == "hunger_mode":
-                self.enabled = (len(words) > 1 and words[1] == "on")
-                self.level = 100.0
-            elif c == "hunger":
-                arg = words[1] if len(words) > 1 else ""
-                if arg == "hs0":
-                    self.enabled = False; self.level = 100.0
-                elif arg == "hs1":
-                    self.enabled = True; self.level = 100.0
-                elif arg == "hs2":
-                    self.enabled = True; self.level = 59.0
-                elif arg == "hs3":
-                    self.enabled = True; self.level = 24.0
-            elif c == "quit":
-                self.enabled = False
-            return True
-
-    def cmd_meal(self, payload):
-        with self._lock:
-            self._drain()
-            now = time.time()
-            if not self.enabled or now - self._last_feed < QR_COOLDOWN_SEC:
-                return False
-            self._last_feed = now
-            self.level = min(100.0, self.level + MEALS.get(payload, 0.0))
-            return True
-
-    def start(self): pass
-    def stop(self): pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Pill-shaped button (Tk has no native rounded widgets, so we draw on a Canvas)
 # ══════════════════════════════════════════════════════════════════════════════
 class PillButton(tk.Canvas):
@@ -537,7 +472,7 @@ class PillButton(tk.Canvas):
     buttons can show a proportional calorie dot via set_calorie_dot()."""
 
     def __init__(self, parent, text="", font=None, command=None,
-                 surface=None, height=38):
+                 surface=None, height=38, icon="", icon_font=None):
         surface = surface or parent.cget("bg")
         super().__init__(parent, height=height, width=10, bg=surface,
                          highlightthickness=0, bd=0, cursor="hand2")
@@ -554,6 +489,8 @@ class PillButton(tk.Canvas):
         self._dot_frac = None       # None => no calorie dot (non-meal buttons)
         self._dot_color = INK
         self._pad_x = 20            # horizontal text padding inside the pill
+        self._icon = icon
+        self._icon_font = icon_font
         self._refit()               # size the canvas to its text (layout may grow it)
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<Enter>", self._on_enter)
@@ -582,6 +519,10 @@ class PillButton(tk.Canvas):
             self._font = kw.pop("font"); redraw = refit = True
         if "command" in kw:
             self._command = kw.pop("command")
+        if "icon" in kw:
+            self._icon = kw.pop("icon"); redraw = True
+        if "icon_font" in kw:
+            self._icon_font = kw.pop("icon_font"); redraw = True
         if "relief" in kw:
             self._pressed = (kw.pop("relief") == "sunken"); redraw = True
         # Swallow tk.Button-only options that don't apply to a Canvas.
@@ -676,29 +617,36 @@ class PillButton(tk.Canvas):
         self.create_oval(w - h, 0, w, h, fill=fill, outline="")
         self.create_rectangle(r, 0, w - r, h, fill=fill, outline="")
         text_cx = w / 2
-        if self._dot_frac is not None:
-            dr = 6
-            dx = max(r, 15)
-            dy = h / 2
-            self.create_oval(dx - dr, dy - dr, dx + dr, dy + dr,
-                             outline=self._fg, width=1)
-            if self._dot_frac > 0:
-                self.create_arc(dx - dr, dy - dr, dx + dr, dy + dr, start=90,
-                                extent=-359.999 * self._dot_frac,
-                                style="pieslice", fill=self._dot_color, outline="")
-            text_cx = w / 2 + dr
-        self.create_text(text_cx, h / 2, text=self._text, fill=self._fg,
-                         font=self._font)
+        if self._icon:
+            self.create_text(w / 2, h * 0.32, text=self._icon, fill=self._fg,
+                             font=self._icon_font)
+            self.create_text(w / 2, h * 0.72, text=self._text, fill=self._fg,
+                             font=self._font)
+        else:
+            if self._dot_frac is not None:
+                dr = 6
+                dx = max(r, 15)
+                dy = h / 2
+                self.create_oval(dx - dr, dy - dr, dx + dr, dy + dr,
+                                 outline=self._fg, width=1)
+                if self._dot_frac > 0:
+                    self.create_arc(dx - dr, dy - dr, dx + dr, dy + dr, start=90,
+                                    extent=-359.999 * self._dot_frac,
+                                    style="pieslice", fill=self._dot_color, outline="")
+                text_cx = w / 2 + dr
+            self.create_text(text_cx, h / 2, text=self._text, fill=self._fg,
+                             font=self._font)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GUI
 # ══════════════════════════════════════════════════════════════════════════════
 class StomachApp:
-    def __init__(self, root, backend, server_name):
+    def __init__(self, root, backend, server_name, full=False):
         self.root = root
         self.backend = backend
         self.server_name = server_name
+        self.full = full  # full panel (all sections) vs. compact (Drive/State/Reset)
         self.view = VIEW
         self._renderer_cache: Dict[int, "StomachRenderer"] = {}
         self.renderer = self._get_renderer(self.view)
@@ -756,6 +704,7 @@ class StomachApp:
         self.f_lbl = tkfont.Font(family="Helvetica", size=8, weight="bold")
         self.f_small = tkfont.Font(family="Helvetica", size=8)
         self.f_btn = tkfont.Font(family="Helvetica", size=9, weight="bold")
+        self.f_icon = tkfont.Font(family="Helvetica", size=22)
 
         self.wrap = tk.Frame(root, bg=BG)
         self.wrap.pack(fill="both", expand=True, padx=10, pady=10)
@@ -795,12 +744,22 @@ class StomachApp:
         self.root.after(int(1000 / FPS), self._tick)
 
     # ── panel ───────────────────────────────────────────────────────────────────
-    def _card(self, title, expand=False):
+    def _card(self, title, expand=False, parent=None, visible=True, width=None):
         # Elevated card: thin themed border so each control group reads as a panel.
-        outer = tk.Frame(self.panel, bg=PANEL_BG, highlightthickness=1,
+        # `visible=False` parents the card into an unpacked holder so its widgets
+        # still exist (and stay updatable) without ever being shown.
+        # `width` pins a fixed card width (geometry propagation off) so it doesn't
+        # just hug its content; the expanding Events card then absorbs whatever is
+        # left, so widening a pinned card automatically shortens Events.
+        parent = parent if parent is not None else self.panel
+        outer = tk.Frame(parent, bg=PANEL_BG, highlightthickness=1,
                          highlightbackground=BORDER, bd=0)
+        if width is not None:
+            outer.configure(width=width, height=self.panel.cget("height"))
+            outer.pack_propagate(False)
         outer.pack(side="left", fill="both", expand=expand, padx=(0, 2))
-        self._cards.append(outer)
+        if visible:
+            self._cards.append(outer)
         inner = tk.Frame(outer, bg=PANEL_BG)
         inner.pack(fill="both", expand=True, padx=12, pady=10)
         if title:
@@ -956,7 +915,26 @@ class StomachApp:
         self.canvas.tag_lower(self._vignette_item)
 
     def _build_panel(self):
-        s = self._card("STATUS")
+        full = self.full
+        # The Drive/State/Reset control cards are only shown with --full. By
+        # default they're still *created* (so all the refresh logic that
+        # references their widgets keeps working) but parented into an unpacked
+        # holder, so they never show and use no panel space.
+        self._hidden = tk.Frame(self.panel, bg=PANEL_BG)
+        self._placed_any = False
+
+        def host(show):
+            return self.panel if show else self._hidden
+
+        def sep(show):
+            # Separator only between two *visible* cards (never leading/trailing).
+            if show:
+                if self._placed_any:
+                    self._separator()
+                self._placed_any = True
+
+        sep(True)
+        s = self._card("STATUS", width=300)
         self.lbl_state = tk.Label(s, text="—", font=self.f_title, bg=PANEL_BG, fg=INK)
         self.lbl_state.pack(anchor="w")
         self.lbl_level = tk.Label(s, text="—", font=self.f_big, bg=PANEL_BG, fg=INK)
@@ -970,8 +948,8 @@ class StomachApp:
         self.lbl_conn = tk.Label(s, text="", font=self.f_small, bg=PANEL_BG, fg=MUTED)
         self.lbl_conn.pack(anchor="w")
 
-        self._separator()
-        d = self._card("Drive")
+        sep(full)
+        d = self._card("Drive", parent=host(full), visible=full)
         rr = tk.Frame(d, bg=PANEL_BG); rr.pack(fill="x")
         self.btn_on = self._mkbtn(rr, "On",
                                   lambda: self._rpc(["hunger_mode", "on"], self.btn_on))
@@ -980,8 +958,8 @@ class StomachApp:
         self.btn_on.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self.btn_off.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        self._separator()
-        st = self._card("State")
+        sep(full)
+        st = self._card("State", parent=host(full), visible=full)
         g = tk.Frame(st, bg=PANEL_BG); g.pack(fill="x")
         self.btn_hs = {}
         for col, (key, txt) in enumerate(
@@ -992,33 +970,37 @@ class StomachApp:
             g.columnconfigure(col, weight=1)
             self.btn_hs[key] = b
 
-        self._separator()
-        rs = self._card("Reset")
+        sep(full)
+        rs = self._card("Reset", parent=host(full), visible=full)
         self.btn_reset = self._mkbtn(rs, "Refill tummy",
                                      lambda: self._rpc(["hunger_mode", "on"], self.btn_reset))
         self.btn_reset.pack(fill="x")
 
-        self._separator()
-        fd = self._card("Feed")
+        sep(True)
+        fd = self._card("Feed", width=540)
         fgr = tk.Frame(fd, bg=PANEL_BG); fgr.pack(fill="x")
         self.cd_ring = tk.Canvas(fd, width=26, height=26, bg=PANEL_BG, highlightthickness=0)
-        self.cd_ring.pack(anchor="e", pady=(5, 0))
+        self.cd_ring.pack(anchor="e", pady=(4, 0))
         self.meal_btns = {}
+        _meal_icons = {"SMALL_MEAL": "🥤", "MEDIUM_MEAL": "🍪", "LARGE_MEAL": "🍝"}
         for col, (key, txt) in enumerate(
                 [("SMALL_MEAL", "Beverage  +10"), ("MEDIUM_MEAL", "Snack  +25"),
                  ("LARGE_MEAL", "Meal  +45")]):
-            b = self._mkbtn(fgr, txt, lambda k=key: self._feed(k))
+            b = PillButton(fgr, text=txt, font=self.f_btn, command=lambda k=key: self._feed(k),
+                           surface=fgr.cget("bg"), height=80,
+                           icon=_meal_icons[key], icon_font=self.f_icon)
+            b.configure(bg=SUBTLE, fg=INK, activebackground="#E9EEF3")
             b.grid(row=0, column=col, sticky="ew", padx=2)
             fgr.columnconfigure(col, weight=1)
             self.meal_btns[key] = b
 
-        self._separator()
+        sep(True)
         ev = self._card("Events", expand=True)
         self.lbl_events = tk.Label(ev, text="", font=self.f_small, bg=PANEL_BG, fg=INK,
                                    justify="left", anchor="nw")
         self.lbl_events.pack(fill="both", expand=True, anchor="w")
 
-        self._separator()
+        sep(True)
         end = self._card("")
         self.btn_shutdown = self._mkbtn(end, "Shutdown", self._shutdown)
         self.btn_shutdown.config(fg="#c0392b")
@@ -1505,7 +1487,7 @@ class StomachMonitorModule(_RFModuleBase):
         self.qr_target = "/alwayson/executiveControl/qr:i"
         self.period = 1.0 / FPS
         self.poll_period = 0.25
-        self.sim = False
+        self.full = False
         self._running = True
         self._closed = False
 
@@ -1525,7 +1507,6 @@ class StomachMonitorModule(_RFModuleBase):
             "last_error": "",
         }
         self._next_poll = 0.0
-        self._sim_backend: Optional[SimBackend] = None
         self._root: Optional[tk.Tk] = None
         self._app: Optional[StomachApp] = None
         self._io_thread: Optional[threading.Thread] = None
@@ -1534,7 +1515,7 @@ class StomachMonitorModule(_RFModuleBase):
     def configure(self, rf: yarp.ResourceFinder) -> bool:
         try:
             if not HAVE_YARP:
-                print("[ERROR] YARP Python bindings unavailable; use --sim for offline preview.")
+                print("[ERROR] YARP Python bindings unavailable.")
                 return False
             if rf.check("name"):
                 self.module_name = rf.find("name").asString().lstrip("/")
@@ -1549,7 +1530,7 @@ class StomachMonitorModule(_RFModuleBase):
                 self.qr_target = f"/alwayson/{name}/qr:i"
             if rf.check("period"):
                 self.poll_period = max(0.05, rf.find("period").asFloat64())
-            self.sim = rf.check("sim")
+            self.full = rf.check("full")
 
             self._rpc_port = yarp.Port()
             if not self._rpc_port.open(f"/{self.module_name}/rpc"):
@@ -1557,27 +1538,23 @@ class StomachMonitorModule(_RFModuleBase):
                 return False
             self.attach(self._rpc_port)
 
-            if self.sim:
-                self._sim_backend = SimBackend()
-                label = "SIM"
-            else:
-                base = f"/alwayson/{self.module_name}"
-                self._controller_rpc = yarp.RpcClient()
-                self._qr_port = yarp.BufferedPortBottle()
-                if not self._controller_rpc.open(f"{base}/rpc:o"):
-                    print("[ERROR] Cannot open stomachMonitor controller RPC client")
-                    return False
-                if not self._qr_port.open(f"{base}/qr:o"):
-                    print("[ERROR] Cannot open stomachMonitor QR output port")
-                    return False
-                label = self.server
+            base = f"/alwayson/{self.module_name}"
+            self._controller_rpc = yarp.RpcClient()
+            self._qr_port = yarp.BufferedPortBottle()
+            if not self._controller_rpc.open(f"{base}/rpc:o"):
+                print("[ERROR] Cannot open stomachMonitor controller RPC client")
+                return False
+            if not self._qr_port.open(f"{base}/qr:o"):
+                print("[ERROR] Cannot open stomachMonitor QR output port")
+                return False
+            label = self.server
 
             if not HAVE_PIL:
                 print("[WARN] Pillow not installed — using a basic vector view. "
                       "For the full visuals run:  pip install pillow")
 
             self._root = tk.Tk()
-            self._app = StomachApp(self._root, self, label)
+            self._app = StomachApp(self._root, self, label, full=self.full)
             print(f"[INFO] StomachMonitorModule ready; RPC /{self.module_name}/rpc")
             return True
         except Exception as e:
@@ -1587,22 +1564,16 @@ class StomachMonitorModule(_RFModuleBase):
 
     # backend contract used by StomachApp
     def snapshot(self):
-        if self._sim_backend is not None:
-            return self._sim_backend.snapshot()
         with self._lock:
             return dict(self._snap)
 
     def cmd_rpc(self, words):
         # Non-blocking: enqueue and let the I/O thread do the blocking write so
         # button clicks never stall the UI / animation.
-        if self._sim_backend is not None:
-            return self._sim_backend.cmd_rpc(words)
         self._cmds.put(("rpc", list(words)))
         return True
 
     def cmd_meal(self, payload):
-        if self._sim_backend is not None:
-            return self._sim_backend.cmd_meal(payload)
         self._cmds.put(("meal", payload))
         return True
 
@@ -1617,16 +1588,14 @@ class StomachMonitorModule(_RFModuleBase):
         return self.period
 
     def updateModule(self) -> bool:
-        if self._sim_backend is None:
-            self._ensure_links()
-            self._drain_cmds()
-            now = time.monotonic()
-            if now >= self._next_poll:
-                self._poll_status()
-                self._next_poll = now + self.poll_period
+        self._ensure_links()
+        self._drain_cmds()
+        now = time.monotonic()
+        if now >= self._next_poll:
+            self._poll_status()
+            self._next_poll = now + self.poll_period
         self._service_tk()
-        if self._sim_backend is None:
-            self._drain_cmds()
+        self._drain_cmds()
         return self._running
 
     def run_tk_mainloop(self) -> bool:
@@ -1635,11 +1604,10 @@ class StomachMonitorModule(_RFModuleBase):
         # Producer/consumer split: a background thread owns all blocking YARP I/O
         # (polling + sending), the Tk main thread only renders and reads the
         # lock-protected snapshot. Nothing on the UI thread can block on the net.
-        if self._sim_backend is None:
-            self._io_stop.clear()
-            self._io_thread = threading.Thread(
-                target=self._io_loop, name="stomachMonitor-io", daemon=True)
-            self._io_thread.start()
+        self._io_stop.clear()
+        self._io_thread = threading.Thread(
+            target=self._io_loop, name="stomachMonitor-io", daemon=True)
+        self._io_thread.start()
         try:
             self._root.mainloop()
         finally:
@@ -1883,34 +1851,15 @@ def _run_with_signal_handling(module: StomachMonitorModule, rf: yarp.ResourceFin
         module.close()
 
 
-def _wants_sim(argv: List[str]) -> bool:
-    return any(arg == "--sim" for arg in argv[1:])
-
-
-def _run_sim_preview() -> None:
-    if not HAVE_PIL:
-        print("[WARN] Pillow not installed — using a basic vector view. "
-              "For the full visuals run:  pip install pillow")
-    root = tk.Tk()
-    StomachApp(root, SimBackend(), "SIM")
-    root.mainloop()
-
-
 if __name__ == "__main__":
     if not HAVE_YARP:
-        if _wants_sim(sys.argv):
-            _run_sim_preview()
-            raise SystemExit(0)
-        print("[ERROR] YARP Python bindings unavailable; run with --sim for offline preview.")
+        print("[ERROR] YARP Python bindings unavailable.")
         raise SystemExit(1)
 
     yarp.Network.init()
     module: Optional[StomachMonitorModule] = None
     try:
         if not yarp.Network.checkNetwork():
-            if _wants_sim(sys.argv):
-                _run_sim_preview()
-                raise SystemExit(0)
             print("[ERROR] YARP network unavailable — start yarpserver first.")
             sys.exit(1)
 
