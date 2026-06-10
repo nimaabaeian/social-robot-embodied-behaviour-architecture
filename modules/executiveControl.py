@@ -4160,7 +4160,6 @@ class ExecutiveControlModule(yarp.RFModule):
                 )
                 SELECT e.entry_id AS episode_id,
                        e.run_id,
-                       e.
                        e.day_rome,
                        e.is_test_run,
                        e.valid_for_analysis,

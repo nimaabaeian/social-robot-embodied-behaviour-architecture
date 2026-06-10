@@ -224,7 +224,9 @@ export ALWAYSON_EXPERIMENT_CONDITION="pilot"
 export ALWAYSON_IS_TEST_RUN="1"
 export ALWAYSON_VALID_FOR_ANALYSIS="0"
 ```
+### Using `set_run_env.sh`
 
+Edit [`scripts/set_run_env.sh`](scripts/set_run_env.sh) with the values for your run, then **source it** on every terminal or server where `salienceNetwork`, `executiveControl`, or `chatBot` runs — these are the three modules that write to `.db` files and must share the same `run_id`.
 ---
 
 ## Installation

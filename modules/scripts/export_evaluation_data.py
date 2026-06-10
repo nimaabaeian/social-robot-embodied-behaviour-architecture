@@ -12,7 +12,7 @@ from typing import Iterable, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "modules" / "data_collection"
+DATA_DIR = ROOT / "data_collection"
 
 
 EXPORTS: Tuple[Tuple[str, str, str, Optional[str]], ...] = (
