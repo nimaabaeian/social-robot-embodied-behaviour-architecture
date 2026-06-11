@@ -4555,8 +4555,8 @@ class ExecutiveControlModule(yarp.RFModule):
         utc_dt = datetime.fromtimestamp(ts_epoch, timezone.utc)
         local_dt = utc_dt.astimezone(self.TIMEZONE)
         return {
-            "timestamp_utc": utc_dt.isoformat(),
-            "timestamp_local": local_dt.isoformat(),
+            "timestamp_utc": utc_dt.isoformat(timespec="milliseconds"),
+            "timestamp_local": local_dt.isoformat(timespec="milliseconds"),
             "timezone": str(self.TIMEZONE),
             "timestamp_epoch": ts_epoch,
             "monotonic_sec": mono,

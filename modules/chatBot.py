@@ -2486,8 +2486,8 @@ class ChatBotModule(yarp.RFModule):
         local_dt = utc_dt.astimezone(ZoneInfo(self.DEFAULT_TZ))
         mono = time.monotonic()
         return {
-            "timestamp_utc": utc_dt.isoformat(),
-            "timestamp_local": local_dt.isoformat(),
+            "timestamp_utc": utc_dt.isoformat(timespec="milliseconds"),
+            "timestamp_local": local_dt.isoformat(timespec="milliseconds"),
             "timezone": self.DEFAULT_TZ,
             "timestamp_epoch": ts_epoch,
             "monotonic_sec": mono,
@@ -2575,7 +2575,9 @@ class ChatBotModule(yarp.RFModule):
         ts = self._time_fields()
         tg_ts_utc = None
         if telegram_message_epoch is not None:
-            tg_ts_utc = datetime.fromtimestamp(float(telegram_message_epoch), timezone.utc).isoformat()
+            tg_ts_utc = datetime.fromtimestamp(
+                float(telegram_message_epoch), timezone.utc
+            ).isoformat(timespec="milliseconds")
         safe_text = text or ""
         meta = self.experiment.experiment_fields()
         self._db.execute(
