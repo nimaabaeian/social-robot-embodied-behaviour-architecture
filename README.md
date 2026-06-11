@@ -207,6 +207,7 @@ flowchart LR
 | `run_id` | Stable identifier for one experimental run. Set `ALWAYSON_RUN_ID` for shared cross-module runs. If unset, each module generates one UUID at startup. |
 | `is_test_run` | `1` for pilot/debug/test runs, otherwise `0`. |
 | `valid_for_analysis` | `1` for rows intended for analysis. Defaults to `0` for test runs and `1` otherwise if unset. |
+| `experiment_condition` | Free-form label for the experimental arm/condition (e.g. `"baseline"`, `"drive_off"`, `"transparent"`). Stored once per DB in `schema_info`. Leave empty for single-arm studies. |
 
 ### Environment Variables
 
@@ -226,7 +227,7 @@ export ALWAYSON_VALID_FOR_ANALYSIS="0"
 ```
 ### Using `set_run_env.sh`
 
-Edit [`scripts/set_run_env.sh`](scripts/set_run_env.sh) with the values for your run, then **source it** on every terminal or server where `salienceNetwork`, `executiveControl`, or `chatBot` runs — these are the three modules that write to `.db` files and must share the same `run_id`.
+Edit [`scripts/set_run_env.sh`](scripts/set_run_env.sh) with the values for your run, then **source it** on every terminal or server where `vision`, `salienceNetwork`, `executiveControl`, or `chatBot` runs — these are the four modules that write to `.db` files and must share the same `run_id`.
 ---
 
 ## Installation

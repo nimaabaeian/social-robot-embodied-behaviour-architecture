@@ -23,12 +23,17 @@ import os
 import sys
 import subprocess
 import threading
+import queue
+import sqlite3
+import uuid
 import urllib.request
 import cv2
 import numpy as np
 import yarp
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
 from collections import deque
 
 import mediapipe as mp
@@ -110,6 +115,22 @@ class VisionAnalyzer(yarp.RFModule):
         self.image = None
         self.opt_flow_buf = deque()
         self.timestamp = None
+
+        # --- Data collection: SQLite log of organised landmarks:o output ---
+        self.TIMEZONE = ZoneInfo("Europe/Rome")
+        self._run_started_mono = time.monotonic()
+        self.run_id = (os.getenv("ALWAYSON_RUN_ID") or "").strip() or uuid.uuid4().hex
+        self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
+        self.valid_for_analysis = self._parse_bool(
+            os.getenv("ALWAYSON_VALID_FOR_ANALYSIS"), default=not self.is_test_run)
+        self.experiment_condition = (os.getenv("ALWAYSON_EXPERIMENT_CONDITION") or "").strip()
+        _module_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = str(Path(_module_dir) / "data_collection" / "vision.db")
+        self._db_queue: queue.Queue = queue.Queue(maxsize=20000)
+        self._db_thread = None
+        self._db_enabled = False
+        self._frame_seq = 0
+        self._pending_landmark_rows = []  # organised per-face dicts for the current frame
 
         self.env_dict = {
             "Faces": 0,
@@ -714,6 +735,13 @@ class VisionAnalyzer(yarp.RFModule):
             yarp.Value(3),
         ).asInt64()
 
+        # --- Data collection DB (organised landmarks:o log) ---
+        self._init_db()
+        if self._db_enabled:
+            self._db_thread = threading.Thread(
+                target=self._db_worker, name="vision_db", daemon=True)
+            self._db_thread.start()
+
         self.logger.info("Start processing video (vision monolith)")
         return True
 
@@ -723,6 +751,7 @@ class VisionAnalyzer(yarp.RFModule):
     def updateModule(self):
         self.vision_features_btl.clear()
         self.landmarks_btl.clear()
+        self._pending_landmark_rows = []
         has_features_subscriber = self.vision_features_port.getOutputCount() > 0
         has_landmarks_subscriber = self.landmarks_port.getOutputCount() > 0
         has_target_subscriber = self.target_box_port.getOutputCount() > 0
@@ -759,6 +788,11 @@ class VisionAnalyzer(yarp.RFModule):
 
                 if has_landmarks_subscriber:
                     self.landmarks_port.write(self.landmarks_btl)
+
+                # Persist the organised landmarks:o output (all faces of this
+                # frame share one millisecond timestamp + frame_id).
+                if self._db_enabled and self._pending_landmark_rows:
+                    self._flush_landmark_rows()
         except Exception as err:
             self.logger.warning(f"updateModule perception stage failed: {err}")
 
@@ -1613,6 +1647,12 @@ class VisionAnalyzer(yarp.RFModule):
             
             face_data['distance'] = distance
             face_data['attention'] = attention
+
+            row_face_id = face_data['face_id']
+            row_track_id = int(face_data['track_id'])
+            row_bbox = (float(x), float(y), float(w), float(h))
+            row_zone = zone
+            row_distance = distance
         else:
             # Unmatched face - use default/null values for all fields
             face_btl.addString("face_id")
@@ -1635,7 +1675,13 @@ class VisionAnalyzer(yarp.RFModule):
             # Add default distance
             face_btl.addString("distance")
             face_btl.addString("UNKNOWN")
-        
+
+            row_face_id = "unmatched"
+            row_track_id = -1
+            row_bbox = (0.0, 0.0, 0.0, 0.0)
+            row_zone = "UNKNOWN"
+            row_distance = "UNKNOWN"
+
         # Add gaze direction vector
         gaze_btl = face_btl.addList()
         gaze_btl.addString("gaze_direction")
@@ -1660,8 +1706,31 @@ class VisionAnalyzer(yarp.RFModule):
         face_btl.addInt32(is_talking)
         face_btl.addString("time_in_view")
         face_btl.addFloat64(float(time_in_view))
-        
+
         self.landmarks_btl.addList().read(face_btl)
+
+        # Mirror the organised bottle into a flat dict for SQLite logging.
+        if self._db_enabled:
+            self._pending_landmark_rows.append({
+                "face_id": row_face_id,
+                "track_id": row_track_id,
+                "bbox_x": row_bbox[0],
+                "bbox_y": row_bbox[1],
+                "bbox_w": row_bbox[2],
+                "bbox_h": row_bbox[3],
+                "zone": row_zone,
+                "distance": row_distance,
+                "gaze_x": float(gaze_direction[0]),
+                "gaze_y": float(gaze_direction[1]),
+                "gaze_z": float(gaze_direction[2]),
+                "pitch": float(pitch),
+                "yaw": float(yaw),
+                "roll": float(roll),
+                "cos_angle": float(cos_angle),
+                "attention": attention,
+                "is_talking": int(is_talking),
+                "time_in_view": float(time_in_view),
+            })
 
     def __img_yarp_to_cv(self, image):
 
@@ -1734,6 +1803,187 @@ class VisionAnalyzer(yarp.RFModule):
                 self.vision_features_btl.addList().read(bottle_list)
             self.vision_features_btl.addList().read(bottle)
 
+    # ------------------------------------------------------------------ #
+    #  Data collection: SQLite log of the organised landmarks:o output    #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _parse_bool(value, *, default):
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def _time_fields(self):
+        """Wall-clock + monotonic timestamp fields (millisecond ISO precision)."""
+        ts_epoch = time.time()
+        mono = time.monotonic()
+        utc_dt = datetime.fromtimestamp(ts_epoch, timezone.utc)
+        local_dt = utc_dt.astimezone(self.TIMEZONE)
+        return {
+            "timestamp_utc": utc_dt.isoformat(timespec="milliseconds"),
+            "timestamp_local": local_dt.isoformat(timespec="milliseconds"),
+            "timezone": str(self.TIMEZONE),
+            "timestamp_epoch": ts_epoch,
+            "monotonic_sec": mono,
+            "run_elapsed_sec": mono - self._run_started_mono,
+            "day_rome": local_dt.date().isoformat(),
+        }
+
+    def _init_db(self):
+        try:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS schema_info (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS landmark_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                timestamp_local TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                timestamp_epoch REAL NOT NULL,
+                monotonic_sec REAL NOT NULL,
+                run_elapsed_sec REAL NOT NULL,
+                day_rome TEXT NOT NULL,
+                run_id TEXT,
+                is_test_run INTEGER NOT NULL DEFAULT 0 CHECK (is_test_run IN (0,1)),
+                valid_for_analysis INTEGER NOT NULL DEFAULT 1 CHECK (valid_for_analysis IN (0,1)),
+                frame_id INTEGER NOT NULL,
+                faces_in_frame INTEGER NOT NULL,
+                face_index INTEGER NOT NULL,
+                face_id TEXT,
+                track_id INTEGER,
+                bbox_x REAL,
+                bbox_y REAL,
+                bbox_w REAL,
+                bbox_h REAL,
+                zone TEXT,
+                distance TEXT,
+                gaze_x REAL,
+                gaze_y REAL,
+                gaze_z REAL,
+                pitch REAL,
+                yaw REAL,
+                roll REAL,
+                cos_angle REAL,
+                attention TEXT,
+                is_talking INTEGER,
+                time_in_view REAL
+            )""")
+            c.execute(
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            for key, value in (
+                ("run_id", self.run_id),
+                ("is_test_run", int(self.is_test_run)),
+                ("valid_for_analysis", int(self.valid_for_analysis)),
+                ("experiment_condition", self.experiment_condition),
+            ):
+                c.execute(
+                    "INSERT INTO schema_info(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)))
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_landmark_events_time ON landmark_events(timestamp_utc)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_landmark_events_frame ON landmark_events(frame_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_landmark_events_track ON landmark_events(track_id)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_landmark_events_valid ON landmark_events(valid_for_analysis)"
+            )
+            c.execute("DROP VIEW IF EXISTS v_landmark_events_clean")
+            c.execute(
+                """CREATE VIEW v_landmark_events_clean AS
+                SELECT * FROM landmark_events WHERE valid_for_analysis = 1"""
+            )
+            conn.commit()
+            conn.close()
+            self._db_enabled = True
+            self.logger.info(f"DB ready: {self.db_path}")
+        except Exception as e:
+            self._db_enabled = False
+            self.logger.error(f"DB init failed: {e}")
+
+    def _open_db_connection(self, timeout):
+        conn = sqlite3.connect(self.db_path, timeout=timeout)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
+
+    def _flush_landmark_rows(self):
+        """Enqueue all faces of the current frame under one shared timestamp."""
+        rows = self._pending_landmark_rows
+        if not rows:
+            return
+        self._frame_seq += 1
+        frame_id = self._frame_seq
+        faces_in_frame = len(rows)
+        common = self._time_fields()
+        common.update({
+            "run_id": self.run_id,
+            "is_test_run": int(self.is_test_run),
+            "valid_for_analysis": int(self.valid_for_analysis),
+            "frame_id": frame_id,
+            "faces_in_frame": faces_in_frame,
+        })
+        for face_index, row in enumerate(rows):
+            data = dict(common)
+            data["face_index"] = face_index
+            data.update(row)
+            try:
+                self._db_queue.put_nowait(data)
+            except queue.Full:
+                self.logger.warning("vision DB queue full, dropping landmark row")
+
+    def _db_worker(self):
+        conn = None
+        columns = (
+            "timestamp_utc", "timestamp_local", "timezone", "timestamp_epoch",
+            "monotonic_sec", "run_elapsed_sec", "day_rome", "run_id",
+            "is_test_run", "valid_for_analysis", "frame_id", "faces_in_frame",
+            "face_index", "face_id", "track_id", "bbox_x", "bbox_y", "bbox_w",
+            "bbox_h", "zone", "distance", "gaze_x", "gaze_y", "gaze_z",
+            "pitch", "yaw", "roll", "cos_angle", "attention", "is_talking",
+            "time_in_view",
+        )
+        placeholders = ",".join("?" for _ in columns)
+        insert_sql = (
+            f"INSERT INTO landmark_events ({','.join(columns)}) VALUES ({placeholders})"
+        )
+        while True:
+            try:
+                item = self._db_queue.get(timeout=1.0)
+            except queue.Empty:
+                if not self._db_enabled:
+                    break
+                continue
+            if item is None:
+                break
+            try:
+                if conn is None:
+                    conn = self._open_db_connection(timeout=5.0)
+                conn.execute(insert_sql, tuple(item.get(col) for col in columns))
+                conn.commit()
+            except Exception as e:
+                self.logger.warning(f"vision DB insert failed: {e}")
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def interruptModule(self):
         print("stopping the module \n")
         self.img_in_port.interrupt()
@@ -1763,6 +2013,14 @@ class VisionAnalyzer(yarp.RFModule):
                 self.face_mesh.close()
             except Exception:
                 pass
+        # Stop the DB worker and flush the queue.
+        if getattr(self, "_db_thread", None) is not None:
+            self._db_enabled = False
+            try:
+                self._db_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._db_thread.join(timeout=3.0)
         return True
 
 

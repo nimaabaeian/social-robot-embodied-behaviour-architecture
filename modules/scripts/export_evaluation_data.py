@@ -86,7 +86,9 @@ EXPORTS: Tuple[Tuple[str, str, str, Optional[str]], ...] = (
         "salience_ss_changes.csv",
         "SELECT * FROM ss_changes WHERE valid_for_analysis = 1",
     ),
-    # Frame-level face attention log with full IPS breakdown and adaptive weights.
+    # Frame-level face attention log with the full IPS score breakdown. The
+    # logged weights are the fixed BASELINE_WEIGHTS (the adaptive mechanism is
+    # the affinity-shifted eligibility threshold, captured in target_selections).
     # View itself is unfiltered — apply valid_for_analysis here.
     (
         "salience",
@@ -94,7 +96,9 @@ EXPORTS: Tuple[Tuple[str, str, str, Optional[str]], ...] = (
         "salience_face_ips_timeline.csv",
         "SELECT * FROM v_face_ips_timeline WHERE valid_for_analysis = 1",
     ),
-    # Salience-engine target selections (one row per attention frame).
+    # Salience-engine target selections (one row per attention frame), including
+    # the decision-time learned values (affinity, effective_threshold) that the
+    # eligibility test used for that person at that moment.
     ("salience", "v_target_selections_clean", "salience_target_selections_clean.csv", None),
     # ── salience: homeostatic learning ───────────────────────────────────────
     # Weight-update log per person after each interaction (old_* → new_* weights).
@@ -115,6 +119,22 @@ EXPORTS: Tuple[Tuple[str, str, str, Optional[str]], ...] = (
     ("chatbot", "v_chat_link_events",         "chatbot_link_events.csv",         None),
     # Proactive campaign decisions (priority vs. broadcast, counts).
     ("chatbot", "v_chat_proactive_selection", "chatbot_proactive_selection.csv", None),
+    # ── vision: organised landmarks:o log ─────────────────────────────────────
+    # Per-face frame-level landmark output (bbox, zone, distance, gaze, head
+    # pose, attention, talking). All faces of a frame share frame_id + timestamp.
+    # v_landmark_events_clean filters valid_for_analysis = 1.
+    ("vision", "v_landmark_events_clean", "vision_landmark_events_clean.csv", None),
+    # ── data-quality audits ───────────────────────────────────────────────────
+    # Sanity tables to run before analysis: rows with NULL run_id, out-of-range
+    # stomach levels, and per-condition row counts to spot imbalance. All are
+    # intentionally unfiltered (they audit the raw tables, including invalid rows).
+    ("executive", "v_quality_hunger_invalid_levels",      "quality_executive_hunger_invalid_levels.csv",     None),
+    ("executive", "v_quality_interaction_missing_metadata", "quality_executive_interaction_missing_metadata.csv", None),
+    ("executive", "v_quality_condition_counts",           "quality_executive_condition_counts.csv",          None),
+    ("salience",  "v_quality_salience_missing_metadata",  "quality_salience_missing_metadata.csv",           None),
+    ("salience",  "v_quality_attempt_counts",             "quality_salience_attempt_counts.csv",             None),
+    ("chatbot",   "v_quality_chat_missing_metadata",      "quality_chatbot_missing_metadata.csv",            None),
+    ("chatbot",   "v_quality_chat_condition_counts",      "quality_chatbot_condition_counts.csv",            None),
 )
 
 
@@ -184,10 +204,11 @@ def main() -> int:
     parser.add_argument("--executive-db", type=Path, default=DATA_DIR / "executive_control.db")
     parser.add_argument("--salience-db", type=Path, default=DATA_DIR / "salience_network.db")
     parser.add_argument("--chatbot-db", type=Path, default=DATA_DIR / "chat_bot.db")
+    parser.add_argument("--vision-db", type=Path, default=DATA_DIR / "vision.db")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    db_paths = [args.executive_db, args.salience_db, args.chatbot_db]
+    db_paths = [args.executive_db, args.salience_db, args.chatbot_db, args.vision_db]
     run_id = _first_run_id(db_paths)
     export_name = _safe_name(run_id) if run_id else time.strftime("%Y%m%d_%H%M%S")
     out_dir = args.output_dir or (DATA_DIR / "exports" / export_name)
@@ -196,6 +217,7 @@ def main() -> int:
     _export_db("executive", args.executive_db, out_dir)
     _export_db("salience", args.salience_db, out_dir)
     _export_db("chatbot", args.chatbot_db, out_dir)
+    _export_db("vision", args.vision_db, out_dir)
     print(f"export_dir={out_dir}")
     return 0
 

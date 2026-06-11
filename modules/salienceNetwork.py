@@ -56,6 +56,7 @@ class ExperimentMetadata:
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
+        self.experiment_condition = (os.getenv("ALWAYSON_EXPERIMENT_CONDITION") or "").strip()
 
     @staticmethod
     def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -73,6 +74,7 @@ class ExperimentMetadata:
             "run_id": self.run_id,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
+            "experiment_condition": self.experiment_condition,
         }
 
 
@@ -787,6 +789,14 @@ class SalienceNetworkModule(yarp.RFModule):
                                             "reason": "candidate_ready",
                                             "last_greeted_ts": candidate.get(
                                                 "last_greeted_ts"
+                                            ),
+                                            # Decision-time learned values that
+                                            # shape eligibility for this person.
+                                            "affinity": self._person_affinity(
+                                                str(person_id)
+                                            ),
+                                            "effective_threshold": self._effective_threshold(
+                                                ss, str(person_id)
                                             ),
                                         })
 
@@ -2243,6 +2253,14 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # ==================== SQLite DB Logging ====================
 
+    @staticmethod
+    def _ensure_columns(c: sqlite3.Cursor, table: str, columns) -> None:
+        """Idempotently add missing columns to an existing table (additive only)."""
+        existing = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
     def _init_db(self):
         try:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -2274,8 +2292,14 @@ class SalienceNetworkModule(yarp.RFModule):
                 eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
                 context_label INTEGER,
                 reason TEXT,
-                last_greeted_ts TEXT
+                last_greeted_ts TEXT,
+                affinity REAL,
+                effective_threshold REAL
             )""")
+            # Additive schema evolution: ensure decision-time columns exist on a
+            # pre-existing DB (no data migration; old rows keep NULL for these).
+            self._ensure_columns(c, "target_selections",
+                                  (("affinity", "REAL"), ("effective_threshold", "REAL")))
             c.execute("""CREATE TABLE IF NOT EXISTS face_ips_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_utc TEXT NOT NULL,
@@ -2408,7 +2432,7 @@ class SalienceNetworkModule(yarp.RFModule):
                 hunger_state TEXT CHECK (hunger_state IS NULL OR hunger_state IN ('HS0','HS1','HS2','HS3'))
             )""")
             c.execute(
-                "INSERT INTO schema_info(key,value) VALUES('schema_version','4') "
+                "INSERT INTO schema_info(key,value) VALUES('schema_version','5') "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
             for key, value in self.experiment.experiment_fields().items():
@@ -2605,7 +2629,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 eligible,
                 context_label,
                 reason,
-                last_greeted_ts
+                last_greeted_ts,
+                affinity,
+                effective_threshold
             FROM target_selections
             WHERE valid_for_analysis = 1
             """
@@ -2771,8 +2797,8 @@ class SalienceNetworkModule(yarp.RFModule):
                          monotonic_sec,run_elapsed_sec,day_rome,run_id,
                          is_test_run,valid_for_analysis,track_id,face_id,
                          person_id,bbox_area,ips,ss,eligible,context_label,reason,
-                         last_greeted_ts)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         last_greeted_ts,affinity,effective_threshold)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2793,7 +2819,9 @@ class SalienceNetworkModule(yarp.RFModule):
                             int(data["eligible"]),
                             data.get("context_label"),
                             data.get("reason"),
-                            data.get("last_greeted_ts")))
+                            data.get("last_greeted_ts"),
+                            data.get("affinity"),
+                            data.get("effective_threshold")))
                 elif table == "face_ips_event":
                     c.execute(
                         """INSERT INTO face_ips_events

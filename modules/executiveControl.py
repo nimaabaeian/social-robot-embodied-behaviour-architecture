@@ -66,6 +66,7 @@ class ExperimentMetadata:
         self.is_test_run = self._parse_bool(os.getenv("ALWAYSON_IS_TEST_RUN"), default=False)
         valid_env = os.getenv("ALWAYSON_VALID_FOR_ANALYSIS")
         self.valid_for_analysis = self._parse_bool(valid_env, default=not self.is_test_run)
+        self.experiment_condition = (os.getenv("ALWAYSON_EXPERIMENT_CONDITION") or "").strip()
 
     @staticmethod
     def _parse_bool(value: Optional[str], *, default: bool) -> bool:
@@ -83,6 +84,7 @@ class ExperimentMetadata:
             "run_id": self.run_id,
             "is_test_run": int(self.is_test_run),
             "valid_for_analysis": int(self.valid_for_analysis),
+            "experiment_condition": self.experiment_condition,
         }
 
 # ──────────────────────────────────────────────────────────────────────────────
