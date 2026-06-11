@@ -142,8 +142,8 @@ class SalienceNetworkModule(yarp.RFModule):
     SS_THRESHOLDS = {
         "ss1": 0.80, # Stranger: stricter hurdle (less proactive)
         "ss2": 0.65, # Known, not greeted: more proactive
-        "ss3": 0.75, # Known, greeted, no talk: still proactive, but less than ss2
-        "ss4": 0.90, # Known, talked: re-engage with ss3 action when highly salient
+        "ss3": 0.70, # Known, greeted, no talk: still proactive, but less than ss2
+        "ss4": 0.85, # Known, talked: re-engage with ss3 action when highly salient
     }
 
     HABITUATION_LAMBDA = 0.06  # Habituation decay (~11.6 s half-life, only active after dwell)

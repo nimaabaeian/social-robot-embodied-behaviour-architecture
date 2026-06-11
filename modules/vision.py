@@ -155,11 +155,13 @@ class VisionAnalyzer(yarp.RFModule):
         self.identity_sticky_sec = 1.5
         self.max_enroll_samples = 5
         self.unknown_retry_interval_sec = 2.5
+        self.unknown_max_retries = 3  # stop re-matching a track after this many retries
 
         self.known_faces = {}
         self.tracked_faces = {}
         self.last_known_identity = {}  # dict[track_id] -> (name, confidence, timestamp)
         self.unknown_retry_state = {}  # dict[track_id] -> last_retry_ts
+        self.unknown_retry_count = {}  # dict[track_id] -> retries attempted so far
         self._face_identity_lock = threading.Lock()
         self.objects = []
         self.last_frame = None
@@ -656,6 +658,7 @@ class VisionAnalyzer(yarp.RFModule):
         self.identity_sticky_sec = rf.check("identity_sticky_sec", yarp.Value(1.5)).asFloat64()
         self.max_enroll_samples = rf.check("id_enroll_samples", yarp.Value(5)).asInt64()
         self.unknown_retry_interval_sec = rf.check("unknown_retry_interval_sec", yarp.Value(2.5)).asFloat64()
+        self.unknown_max_retries = rf.check("unknown_max_retries", yarp.Value(3)).asInt64()
         self.verbose = rf.check("verbose_yolo", yarp.Value(False)).asBool()
         self.debug = rf.check("debug", yarp.Value(False)).asBool()
         self.auto_download_model = rf.check("auto_download_model", yarp.Value(True)).asBool()
@@ -867,6 +870,8 @@ class VisionAnalyzer(yarp.RFModule):
                     del self.tracked_faces[tid]
                     if tid in self.unknown_retry_state:
                         del self.unknown_retry_state[tid]
+                    if tid in self.unknown_retry_count:
+                        del self.unknown_retry_count[tid]
 
                 stale_ids = [
                     tid
@@ -904,8 +909,15 @@ class VisionAnalyzer(yarp.RFModule):
                     if cached_name in ("recognizing", "unknown"):
                         with self._face_identity_lock:
                             last_try_ts = self.unknown_retry_state.get(tid, 0.0)
+                            retry_count = self.unknown_retry_count.get(tid, 0)
 
-                        should_retry = (current_time - last_try_ts) >= self.unknown_retry_interval_sec
+                        # Re-match only periodically, and only up to a fixed cap.
+                        # Each retry is an independent chance to mis-assign a known
+                        # name, so once the cap is reached we stop and leave the
+                        # track 'unknown' until it is lost and re-acquired.
+                        interval_ok  = (current_time - last_try_ts) >= self.unknown_retry_interval_sec
+                        under_cap    = retry_count < self.unknown_max_retries
+                        should_retry = interval_ok and under_cap
 
                         if should_retry:
                             face_id, id_conf = self._compare_embeddings(frame, box)
@@ -914,14 +926,18 @@ class VisionAnalyzer(yarp.RFModule):
                                 with self._face_identity_lock:
                                     self.tracked_faces[tid] = ("unknown", 0.0)
                                     self.unknown_retry_state[tid] = current_time
+                                    self.unknown_retry_count[tid] = retry_count + 1
                             else:
                                 with self._face_identity_lock:
                                     self.tracked_faces[tid] = (face_id, id_conf)
                                     self.last_known_identity[tid] = (face_id, float(id_conf), current_time)
                                     if tid in self.unknown_retry_state:
                                         del self.unknown_retry_state[tid]
+                                    if tid in self.unknown_retry_count:
+                                        del self.unknown_retry_count[tid]
                         else:
-                            # Keep publishing unknown, without transient recognizing labels.
+                            # Within the retry interval or past the retry cap:
+                            # keep publishing unknown, without re-matching.
                             with self._face_identity_lock:
                                 self.tracked_faces[tid] = ("unknown", 0.0)
                     elif cached_name != "unknown":

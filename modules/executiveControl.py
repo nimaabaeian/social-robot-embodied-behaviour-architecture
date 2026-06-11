@@ -1776,7 +1776,16 @@ class ExecutiveControlModule(yarp.RFModule):
 
         result.success     = True
         result.final_state = "ss3"
-        self._log("INFO", f"[SS1|{name}] DONE")
+        self._log("INFO", f"[SS1|{name}] introduced")
+
+        # If the person keeps talking after the introduction, flow straight into
+        # an SS3 conversation (as SS2 continues into SS3). No follow-up just leaves
+        # the successful introduction at ss3.
+        self._continue_into_conversation(
+            f"[SS3|{name}]",
+            face_id=name,
+            result=result,
+            prior_assistant=self._text("ss1_nice_to_meet"))
 
     def _run_ss2(self, track_id: int, face_id: str, result: InteractionResult) -> None:
         """Known but not greeted → say hello → ss3 conversation."""
@@ -1900,6 +1909,48 @@ class ExecutiveControlModule(yarp.RFModule):
         else:
             result.abort_reason = result.abort_reason or "no_response_conversation"
             self._log("WARNING", f"{tag} ABORT: {result.abort_reason}")
+
+    def _continue_into_conversation(
+        self,
+        tag: str,
+        *,
+        face_id: str,
+        result: InteractionResult,
+        prior_assistant: Optional[str] = None,
+        timeout: Optional[float] = None) -> int:
+        """If the person keeps talking, flow into an unbounded SS3 conversation.
+
+        Listens once for a follow-up utterance after an introduction or a feeding
+        acknowledgement. If the person speaks, runs the normal SS3 conversation and
+        promotes the interaction to ss4. A plain no-response — silence or the target
+        leaving — is not a failure here: the caller's prior outcome is left untouched
+        (abort checks are read-only on purpose, so a successful intro/feed is not
+        retroactively marked aborted). Returns the number of conversation turns.
+        """
+        if self._abort_requested() or result.aborted:
+            return 0
+        self._stt_clear()
+        trace = LatencyTrace(self, label=f"{tag}|followup", turn_index=0)
+        trace.mark("listen_open")
+        utterance, utterance_mono = self._wait_for_user_utterance(
+            timeout if timeout is not None else self.SS3_STT_TIMEOUT,
+            trace=trace)
+        if not utterance or self._abort_requested():
+            return 0
+        turns = self._run_conversation(
+            tag,
+            utterance,
+            face_id=face_id,
+            first_utterance_mono=utterance_mono,
+            result=result,
+            prior_assistant=prior_assistant)
+        if turns > 0:
+            result.n_turns     = turns
+            result.success     = True
+            result.talked      = True
+            result.final_state = "ss4"
+            self._log("INFO", f"{tag} DONE turns={turns}")
+        return turns
 
     def _run_conversation(
         self,
@@ -2538,6 +2589,8 @@ class ExecutiveControlModule(yarp.RFModule):
                     self._run_hunger_tree("ss3", hs, dummy, intro_text=intro)
                     dummy.success = not dummy.aborted
                     dummy.final_state = "ss3"
+                    # If the person keeps talking after being fed, continue into SS3.
+                    self._continue_into_conversation(f"[RSS3|{name}]", face_id=name, result=dummy)
                     return
 
                 utterance = self._greet_known(
