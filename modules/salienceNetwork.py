@@ -586,6 +586,27 @@ class SalienceNetworkModule(yarp.RFModule):
             reply.addString("ok")
             return True
 
+        if command == "ambient_feed":
+            if cmd.size() < 2:
+                reply.addString("error")
+                reply.addString("usage: ambient_feed <json_payload>")
+                return True
+            try:
+                payload = json.loads(cmd.get(1).asString())
+            except json.JSONDecodeError as e:
+                reply.addString("error")
+                reply.addString(f"invalid json: {e}")
+                return True
+            if not isinstance(payload, dict):
+                reply.addString("error")
+                reply.addString("payload must be a JSON object")
+                return True
+            person_id = self._resolve_attention_target_person()
+            self._apply_homeostatic_learning(payload, person_id)
+            reply.addString("ok")
+            reply.addString(person_id or "unknown")
+            return True
+
         if command == "interaction_result":
             if cmd.size() < 2:
                 reply.addString("error")
@@ -1431,6 +1452,26 @@ class SalienceNetworkModule(yarp.RFModule):
         if self._last_sent_track_id >= 0:
             return int(self._last_sent_track_id)
         return int(self.current_target_track_id)
+
+    def _resolve_attention_target_person(self) -> str:
+        """Resolve the person the robot is currently gaze-tracking.
+
+        Used to credit ambient feeds: the feeder is always the tracked person.
+        Returns a known person id when resolvable, else 'unknown' (which the
+        homeostatic-learning path will log and skip).
+        """
+        track_id = self._active_attention_track_id()
+        if track_id < 0:
+            return "unknown"
+        with self.state_lock:
+            person_id = self.track_to_person.get(track_id, "")
+        if not self._is_face_known(person_id):
+            face = self._find_face_by_track_id(track_id)
+            if face is not None:
+                face_id = str(face.get("face_id", "")).strip()
+                if self._is_face_known(face_id):
+                    person_id = face_id
+        return person_id if self._is_face_known(person_id) else "unknown"
 
     def _find_face_by_track_id(self, track_id: int) -> Optional[Dict[str, Any]]:
         if track_id < 0:

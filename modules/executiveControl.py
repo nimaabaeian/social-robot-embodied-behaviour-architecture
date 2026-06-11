@@ -2513,11 +2513,56 @@ class ExecutiveControlModule(yarp.RFModule):
                         "hunger_state_after":   snap.state,
                         "stomach_level_after":  snap.level,
                     }))
+                    self._credit_ambient_feed(
+                        val, hs_before, snap_before.level, snap)
 
                 self._qr_stop.wait(0.02)
             except Exception as e:
                 self._log("WARNING", f"QR loop error: {e}")
                 self._qr_stop.wait(0.1)
+
+    def _credit_ambient_feed(
+        self,
+        payload: str,
+        hs_before: str,
+        level_before: float,
+        snap: "HungerSnapshot") -> None:
+        """Report an ambient (idle-robot) feed to salienceNetwork for learning.
+
+        The feeder is always the person the robot is gaze-tracking, and only
+        salienceNetwork knows its current attention target — so it (not us)
+        resolves who to credit. We just send the homeostatic reward (stomach
+        delta) and hunger context; salienceNetwork applies it to the tracked
+        person via its existing homeostatic-learning path.
+        """
+        if snap.level <= level_before:
+            return
+        payload_dict = {
+            "homeostatic_reward":   snap.level - level_before,
+            "hunger_drive_enabled": True,
+            "hunger_state_start":   hs_before,
+            "hunger_state_end":     snap.state,
+            "stomach_level_start":  level_before,
+            "stomach_level_end":    snap.level,
+            "meals_eaten_count":    1,
+            "last_meal_payload":    payload,
+            "n_turns":              0,
+            "trigger_mode":         "reactive",
+        }
+        try:
+            cmd = yarp.Bottle()
+            cmd.addString("ambient_feed")
+            cmd.addString(json.dumps(payload_dict, ensure_ascii=False))
+            reply = yarp.Bottle()
+            self._get_selector_rpc().write(cmd, reply)
+            ok = reply.size() > 0 and reply.get(0).asString() == "ok"
+            self._log("DEBUG" if ok else "WARNING",
+                      f"ambient_feed reply: {reply.toString()}")
+        except Exception as e:
+            self._log("WARNING", f"ambient_feed submit failed: {e}")
+            if self._selector_rpc:
+                self._selector_rpc.close()
+                self._selector_rpc = None
 
     # ── reactive greeting loop ────────────────────────────────────────────────
 
