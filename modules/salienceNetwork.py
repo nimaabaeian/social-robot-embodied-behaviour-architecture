@@ -2046,6 +2046,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 reason = "target_left_after_engagement"
             else:
                 reason = "neutral_delta"
+            # No affinity signal, but the event still counts toward
+            # "interactions" — chatBot's trust gate on the affinity value.
+            self._record_neutral_interaction(person_id, reward, result)
             self._log_homeostatic_delta(result, person_id, reward, "neutral", reason, a, a)
             self._log("INFO", f"affinity neutral: {person_id} reason={reason} (turns={n_turns} reward={reward:.1f})")
             return
@@ -2062,14 +2065,22 @@ class SalienceNetworkModule(yarp.RFModule):
 
         with self._memory_lock:
             profile = self.homeostatic_profiles.get(person_id, {})
-            interactions_prev = self._result_int(profile, "interactions", 0) if isinstance(profile, dict) else 0
+            if not isinstance(profile, dict):
+                profile = {}
+            interactions_prev = self._result_int(profile, "interactions", 0)
+            # "interactions" counts every scored event (incl. neutral ones);
+            # "affinity_updates" counts only affinity-changing events and gates
+            # the first-event overwrite. Older profiles lack the field — for
+            # them every counted interaction changed affinity, so fall back.
+            updates_prev = self._result_int(profile, "affinity_updates", interactions_prev)
             affinity_before = self._person_affinity(person_id)
             affinity_after = self._clamp_affinity(
-                r_norm if interactions_prev <= 0 and positive
+                r_norm if updates_prev <= 0 and positive
                 else affinity_before + alpha * (r_norm - affinity_before))
             self.homeostatic_profiles[person_id] = {
                 "affinity": affinity_after,
                 "interactions": interactions_prev + 1,
+                "affinity_updates": updates_prev + 1,
                 "last_reward": reward,
                 "last_outcome": outcome,
                 "last_trigger_mode": str(result.get("trigger_mode", "proactive")),
@@ -2082,6 +2093,25 @@ class SalienceNetworkModule(yarp.RFModule):
             "INFO",
             f"affinity: {person_id} {affinity_before:+.2f} -> {affinity_after:+.2f} "
             f"(reward={reward:.1f} r_norm={r_norm:+.2f} {outcome})")
+
+    def _record_neutral_interaction(self, person_id: str, reward: float, result: Dict[str, Any]) -> None:
+        """Count a neutral-outcome interaction in the person's profile, affinity untouched."""
+        with self._memory_lock:
+            profile = self.homeostatic_profiles.get(person_id)
+            if not isinstance(profile, dict):
+                profile = {}
+            interactions_prev = self._result_int(profile, "interactions", 0)
+            self.homeostatic_profiles[person_id] = {
+                **profile,
+                "affinity": self._person_affinity(person_id),
+                "interactions": interactions_prev + 1,
+                "affinity_updates": self._result_int(profile, "affinity_updates", interactions_prev),
+                "last_reward": reward,
+                "last_outcome": "neutral",
+                "last_trigger_mode": str(result.get("trigger_mode", "proactive")),
+                "updated_at": datetime.now(self.TIMEZONE).isoformat(),
+            }
+        self._enqueue_save("homeostatic_learning")
 
     # ==================== Last Greeted (fresh read) ====================
 
