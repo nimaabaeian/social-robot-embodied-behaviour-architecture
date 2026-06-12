@@ -19,6 +19,12 @@
     </module>
 
     <module>
+        <name>faceTracker</name>
+        <parameters>--context faceTracker --from faceTracker.ini --platform halfie</parameters>
+        <node>icubsrv</node>
+    </module>
+
+    <module>
         <name>alwayson_executiveControl</name>
         <parameters></parameters>
         <node>icubsrv</node>
@@ -27,12 +33,6 @@
     <module>
         <name>alwayson_salienceNetwork</name>
         <parameters></parameters>
-        <node>icubsrv</node>
-    </module>
-
-    <module>
-        <name>faceTracker</name>
-        <parameters>--context faceTracker --from faceTracker.ini --platform berry</parameters>
         <node>icubsrv</node>
     </module>
 

@@ -1006,6 +1006,11 @@ class ExecutiveControlModule(yarp.RFModule):
         self._interaction_abort_event = threading.Event()
         self._monitor_thread:   Optional[threading.Thread] = None
         self._current_track_id: Optional[int]              = None
+        # Identity the target monitor re-acquires by name. Updated live when a
+        # name is learned mid-interaction (SS1) so re-acquisition follows the
+        # newly-named person instead of the stale "unknown" placeholder.
+        self._monitor_lock          = threading.Lock()
+        self._monitor_expected_norm: str = ""
 
         self._interaction_state_lock    = threading.Lock()
         self._interaction_mode:  str    = "idle"   # idle | proactive | reactive
@@ -1768,6 +1773,10 @@ class ExecutiveControlModule(yarp.RFModule):
 
         result.extracted_name = name
         self._submit_face_name(track_id, name)
+        # The person is now enrolled under `name`; vision will report that identity
+        # instead of "unknown". Point the monitor at the real name so gaze/track
+        # re-acquisition follows this person even if their track id changes.
+        self._set_monitor_expected(name)
         self._write_last_greeted(track_id, face_id=face_id, code=name, person_key=name)
         if self._speak_wait(self._text("ss1_nice_to_meet")):
             self._charge_energy(self.GREETING_ENERGY_COST, result, "ss1_nice_to_meet")
@@ -2907,6 +2916,7 @@ class ExecutiveControlModule(yarp.RFModule):
         result:        InteractionResult,
         interaction_id: Optional[str] = None) -> None:
         self._current_track_id = track_id
+        self._set_monitor_expected(face_id)
         self._monitor_thread   = threading.Thread(
             target = self._monitor_loop,
             args   = (track_id, face_id, result, interaction_id),
@@ -2916,6 +2926,7 @@ class ExecutiveControlModule(yarp.RFModule):
     def _stop_monitor(self) -> None:
         self._interaction_abort_event.set()
         self._current_track_id = None
+        self._set_monitor_expected("")
 
     def _monitor_loop(
         self,
@@ -2926,9 +2937,9 @@ class ExecutiveControlModule(yarp.RFModule):
         prev_iid = self._get_iid()
         if interaction_id:
             self._set_iid(interaction_id)
-        expected_norm = ""
-        if self._face_resolved(expected_face):
-            expected_norm = self._norm_name(expected_face)
+        # expected_norm is read live each iteration: a name learned mid-interaction
+        # (SS1) updates it via _set_monitor_expected so re-acquisition follows the
+        # newly-named person rather than the stale "unknown" placeholder.
 
         last_seen   = time.monotonic()
         started_at  = time.monotonic()
@@ -2962,6 +2973,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     faces = []
 
                 found = any(int(f.get("track_id", -1)) == track_id for f in faces)
+                expected_norm = self._get_monitor_expected()
                 if not found and expected_norm:
                     # The same named person may have left the frame and returned
                     # under a NEW track id. Re-acquire by face name and re-bind the
@@ -2969,7 +2981,7 @@ class ExecutiveControlModule(yarp.RFModule):
                     new_tid = next(
                         (int(f.get("track_id", -1)) for f in faces
                          if int(f.get("track_id", -1)) >= 0
-                         and self._face_resolved(str(f.get("face_id", "")))
+                         and self._is_real_name(str(f.get("face_id", "")))
                          and self._norm_name(str(f.get("face_id", ""))) == expected_norm),
                         -1)
                     if new_tid >= 0:
@@ -2977,7 +2989,7 @@ class ExecutiveControlModule(yarp.RFModule):
                         if new_tid != track_id:
                             self._log(
                                 "INFO",
-                                f"Monitor: '{expected_face}' re-acquired under new "
+                                f"Monitor: '{expected_norm}' re-acquired under new "
                                 f"track {new_tid} (was {track_id})")
                             track_id = new_tid
                             self._current_track_id = new_tid
@@ -3008,6 +3020,29 @@ class ExecutiveControlModule(yarp.RFModule):
     @staticmethod
     def _face_resolved(face_id: str) -> bool:
         return face_id.lower() not in ("recognizing", "unmatched")
+
+    @staticmethod
+    def _is_real_name(face_id: str) -> bool:
+        """True only for a concrete enrolled identity (not a placeholder/track id).
+
+        Unlike _face_resolved, this rejects 'unknown' and bare track-id strings so
+        the monitor never re-acquires onto an arbitrary unidentified bystander.
+        """
+        fid = (face_id or "").strip()
+        return bool(
+            fid
+            and fid.lower() not in ("recognizing", "unmatched", "unknown")
+            and not fid.isdigit())
+
+    def _set_monitor_expected(self, face_id: str) -> None:
+        """Update the identity the monitor re-acquires by name (thread-safe)."""
+        norm = self._norm_name(face_id) if self._is_real_name(face_id) else ""
+        with self._monitor_lock:
+            self._monitor_expected_norm = norm
+
+    def _get_monitor_expected(self) -> str:
+        with self._monitor_lock:
+            return self._monitor_expected_norm
 
     def _wait_face_resolve(self, track_id: int, face_id: str, timeout: float) -> str:
         t0 = time.monotonic()
