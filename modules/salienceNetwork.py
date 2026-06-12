@@ -153,7 +153,10 @@ class SalienceNetworkModule(yarp.RFModule):
     # Per-person affinity in [-1,+1]: an EMA of normalized reward. >0 feeds the drive
     # (be more proactive), <0 is an energy sink (be more conservative).
     AFFINITY_ALPHA = 0.25             # EMA weight on the newest interaction
+    AFFINITY_ALPHA_NEG = 0.10         # slower EMA weight for penalties: being an
+                                      # energy sink must be shown repeatedly
     AFFINITY_REWARD_SCALE = 25.0      # reward mapped to |1.0| (~one medium meal)
+    AFFINITY_PENALTY_FLOOR = -0.3     # one ignored approach can cost at most this r_norm
     AFFINITY_NEUTRAL_BAND = 0.2       # |reward| within this carries no signal
     AFFINITY_THRESHOLD_GAIN = 0.15    # how far affinity shifts the eligibility threshold
     AFFINITY_THRESHOLD_FLOOR = 0.50   # floor so a feeder can't trip on noise
@@ -2021,28 +2024,49 @@ class SalienceNetworkModule(yarp.RFModule):
             return
 
         n_turns = self._result_int(result, "n_turns", 0)
+        meals_eaten = self._result_int(result, "meals_eaten_count", 0)
         band = self.AFFINITY_NEUTRAL_BAND
-        positive = reward > band
-        early_abandonment = reward < -band and n_turns < self.ENGAGED_MIN_TURNS
+
+        # Credit feeders on the meal's gross stomach gain (net reward plus the
+        # active energy the robot chose to spend), so chatting while feeding
+        # can't cancel the feed out and demote a feeder to neutral.
+        credit = reward
+        if meals_eaten > 0:
+            credit = reward + max(0.0, self._result_float(result, "active_energy_cost", 0.0))
+
+        positive = credit > band
+        early_abandonment = (reward < -band and n_turns < self.ENGAGED_MIN_TURNS
+                             and meals_eaten <= 0)
 
         if not positive and not early_abandonment:
             a = self._person_affinity(person_id)
-            reason = "target_left_after_engagement" if reward < -band else "neutral_delta"
+            if meals_eaten > 0:
+                reason = "fed_while_satiated"   # stomach near full: feed accepted, no signal
+            elif reward < -band:
+                reason = "target_left_after_engagement"
+            else:
+                reason = "neutral_delta"
             self._log_homeostatic_delta(result, person_id, reward, "neutral", reason, a, a)
             self._log("INFO", f"affinity neutral: {person_id} reason={reason} (turns={n_turns} reward={reward:.1f})")
             return
 
-        r_norm = self._clamp_affinity(reward / self.AFFINITY_REWARD_SCALE)
+        r_norm = self._clamp_affinity(credit / self.AFFINITY_REWARD_SCALE)
         outcome = "drive_reduced" if positive else "drive_depleted"
         reason = "food_received" if positive else "no_response"
+
+        if not positive:
+            # Penalty magnitude is set by the robot's energy cost, not by anything
+            # the person did, so cap it and learn slower than for rewards.
+            r_norm = max(r_norm, self.AFFINITY_PENALTY_FLOOR)
+        alpha = self.AFFINITY_ALPHA if positive else self.AFFINITY_ALPHA_NEG
 
         with self._memory_lock:
             profile = self.homeostatic_profiles.get(person_id, {})
             interactions_prev = self._result_int(profile, "interactions", 0) if isinstance(profile, dict) else 0
             affinity_before = self._person_affinity(person_id)
             affinity_after = self._clamp_affinity(
-                r_norm if interactions_prev <= 0
-                else affinity_before + self.AFFINITY_ALPHA * (r_norm - affinity_before))
+                r_norm if interactions_prev <= 0 and positive
+                else affinity_before + alpha * (r_norm - affinity_before))
             self.homeostatic_profiles[person_id] = {
                 "affinity": affinity_after,
                 "interactions": interactions_prev + 1,
