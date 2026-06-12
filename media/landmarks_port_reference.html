@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>landmarks:o — Port Reference · alwayson/vision</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #080b0e;
+    --surface:  #0e1216;
+    --raised:   #141a20;
+    --border:   #1c2228;
+    --border2:  #263038;
+    --text:     #d8dde3;
+    --muted:    #6b7885;
+    --faint:    #303a42;
+
+    --violet:   #9d8cff;
+    --violet-d: #1a163a;
+    --violet-b: #3d3480;
+
+    --emerald:  #34d399;
+    --emerald-d:#0b2218;
+    --emerald-b:#1a5c40;
+
+    --amber:    #fbbf24;
+    --amber-d:  #231a05;
+    --amber-b:  #6b4d0a;
+
+    --coral:    #fb7185;
+    --coral-d:  #2a0a10;
+    --coral-b:  #7a2030;
+
+    --blue:     #60a5fa;
+    --blue-d:   #080f22;
+    --blue-b:   #1a3570;
+
+    --gray-acc: #94a3b8;
+    --gray-d:   #111518;
+    --gray-b:   #2a3340;
+
+    --sidebar-w: 248px;
+    --radius: 6px;
+  }
+
+  html { font-size: 15px; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 400;
+    line-height: 1.65;
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ── SIDEBAR ─────────────────────────────────────── */
+  .sidebar {
+    width: var(--sidebar-w);
+    min-height: 100vh;
+    position: fixed;
+    top: 0; left: 0;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    z-index: 100;
+  }
+
+  .sidebar-brand {
+    padding: 24px 20px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-brand .module-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .sidebar-brand .port-name {
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--emerald);
+    display: block;
+    line-height: 1.3;
+  }
+
+  .sidebar-brand .port-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+    display: block;
+  }
+
+  .sidebar-nav {
+    padding: 16px 0;
+    flex: 1;
+    overflow-y: auto;
+  }
+
+  .nav-group-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--faint);
+    padding: 6px 20px 4px;
+    display: block;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 20px;
+    font-size: 12.5px;
+    color: var(--muted);
+    text-decoration: none;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+  }
+
+  .nav-item:hover { color: var(--text); background: var(--raised); }
+  .nav-item.active { color: var(--text); border-left-color: var(--emerald); background: rgba(52,211,153,0.06); }
+
+  .nav-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    opacity: 0.7;
+  }
+
+  .sidebar-footer {
+    padding: 14px 20px;
+    border-top: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--faint);
+    line-height: 1.7;
+  }
+
+  /* ── MAIN ─────────────────────────────────────────── */
+  .main {
+    margin-left: var(--sidebar-w);
+    flex: 1;
+    max-width: 900px;
+    padding: 48px 48px 80px;
+  }
+
+  /* ── PAGE HERO ────────────────────────────────────── */
+  .hero {
+    margin-bottom: 56px;
+    animation: fadeUp 0.5s ease both;
+  }
+
+  .hero-eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .hero-eyebrow::before {
+    content: '';
+    display: block;
+    width: 20px; height: 1px;
+    background: var(--muted);
+  }
+
+  .hero h1 {
+    font-family: 'Space Mono', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    color: #fff;
+    line-height: 1.2;
+    margin-bottom: 14px;
+  }
+
+  .hero h1 .accent { color: var(--emerald); }
+
+  .hero-desc {
+    font-size: 15px;
+    color: var(--muted);
+    max-width: 600px;
+    line-height: 1.7;
+  }
+
+  .hero-meta {
+    display: flex;
+    gap: 20px;
+    margin-top: 22px;
+    flex-wrap: wrap;
+  }
+
+  .meta-pill {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 99px;
+    padding: 4px 12px 4px 8px;
+    color: var(--muted);
+  }
+
+  .meta-pill .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--emerald);
+    flex-shrink: 0;
+  }
+
+  /* ── SECTIONS ─────────────────────────────────────── */
+  .section {
+    margin-bottom: 60px;
+    animation: fadeUp 0.5s ease both;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--faint);
+    flex-shrink: 0;
+  }
+
+  .section-title {
+    font-family: 'Space Mono', monospace;
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .section-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: var(--radius);
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+
+  p { color: var(--muted); font-size: 14px; line-height: 1.75; margin-bottom: 14px; }
+  p:last-child { margin-bottom: 0; }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: var(--text);
+  }
+
+  /* ── PIPELINE ─────────────────────────────────────── */
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    overflow-x: auto;
+    padding: 4px 0 12px;
+    margin-bottom: 20px;
+  }
+
+  .pipe-step {
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    min-width: 110px;
+    flex-shrink: 0;
+    position: relative;
+  }
+
+  .pipe-step-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  .pipe-step-name {
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+
+  .pipe-step-out {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 6px;
+    line-height: 1.4;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .pipe-arrow {
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    color: var(--faint);
+    font-size: 16px;
+    flex-shrink: 0;
+  }
+
+  /* ── BOTTLE TREE ──────────────────────────────────── */
+  .bottle-tree {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 2;
+    overflow-x: auto;
+    margin-bottom: 16px;
+  }
+
+  .tree-root { color: var(--gray-acc); font-weight: 500; }
+  .tree-child { color: var(--muted); }
+  .tree-leaf  { color: var(--text); }
+  .tree-key   { color: var(--blue); }
+  .tree-type  { color: var(--emerald); font-size: 10px; opacity: 0.8; margin-left: 6px; }
+  .tree-idx   { color: var(--faint); }
+  .tree-note  { color: var(--faint); font-size: 10px; margin-left: 8px; }
+
+  /* ── MATCH SCENARIOS ──────────────────────────────── */
+  .scenarios {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+
+  .scenario-card {
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    border-top: 2px solid;
+  }
+
+  .scenario-card h4 {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .scenario-card p {
+    font-size: 12px;
+    margin-bottom: 10px;
+    line-height: 1.6;
+  }
+
+  .scenario-fields { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+
+  .sf-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sf-row:last-child { border-bottom: none; }
+  .sf-name { color: var(--muted); }
+  .sf-val  { font-weight: 500; }
+  .v-real  { color: var(--emerald); }
+  .v-zero  { color: var(--faint); }
+  .v-def   { color: var(--amber); }
+
+  /* ── FIELD GROUP ──────────────────────────────────── */
+  .field-group {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+
+  .group-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .group-accent {
+    width: 3px; height: 20px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  .group-title {
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .group-count {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    margin-left: auto;
+  }
+
+  /* ── FIELD CARD ───────────────────────────────────── */
+  .field-card {
+    padding: 18px 20px;
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 16px;
+  }
+
+  .field-card:last-child { border-bottom: none; }
+
+  .field-left { }
+
+  .field-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 500;
+    color: #fff;
+    margin-bottom: 6px;
+  }
+
+  .field-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  .badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-weight: 500;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+
+  .b-str    { background: rgba(96,165,250,0.12);  color: var(--blue);   border-color: var(--blue-b);    }
+  .b-int32  { background: rgba(157,140,255,0.12); color: var(--violet); border-color: var(--violet-b);  }
+  .b-float  { background: rgba(251,191,36,0.12);  color: var(--amber);  border-color: var(--amber-b);   }
+  .b-list   { background: rgba(52,211,153,0.12);  color: var(--emerald);border-color: var(--emerald-b); }
+  .b-yolo   { background: rgba(251,113,133,0.10); color: var(--coral);  border-color: var(--coral-b);   }
+  .b-mp     { background: rgba(52,211,153,0.10);  color: var(--emerald);border-color: var(--emerald-b); }
+  .b-comp   { background: rgba(148,163,184,0.10); color: var(--gray-acc);border-color: var(--gray-b);   }
+
+  .field-yarp {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--faint);
+    line-height: 1.6;
+    background: var(--bg);
+    border-radius: 4px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    margin-top: 4px;
+    word-break: break-all;
+  }
+
+  .field-right { }
+
+  .field-desc {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.7;
+    margin-bottom: 10px;
+  }
+
+  .field-values {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+  }
+
+  .values-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-bottom: 6px;
+    display: block;
+  }
+
+  .value-rows { display: flex; flex-direction: column; gap: 4px; }
+
+  .value-row {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 12px;
+  }
+
+  .value-chip {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .value-explain { font-size: 11.5px; color: var(--muted); }
+
+  /* ── THRESHOLDS TABLE ─────────────────────────────── */
+  .params-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-top: 4px;
+  }
+
+  .params-table th {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--faint);
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .params-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+    vertical-align: top;
+  }
+
+  .params-table tr:last-child td { border-bottom: none; }
+
+  .params-table td:first-child {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: var(--blue);
+  }
+
+  .params-table td:nth-child(2) {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: var(--amber);
+  }
+
+  .params-table td:nth-child(3) {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .params-table tr:hover td { background: var(--raised); }
+
+  /* ── CALLOUT ──────────────────────────────────────── */
+  .callout {
+    border-left: 3px solid;
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 12px 16px;
+    margin: 14px 0;
+    font-size: 13px;
+  }
+
+  .callout-info    { border-color: var(--blue);   background: var(--blue-d);   color: var(--blue);   }
+  .callout-warning { border-color: var(--amber);  background: var(--amber-d);  color: var(--amber);  }
+  .callout-success { border-color: var(--emerald);background: var(--emerald-d);color: var(--emerald);}
+
+  .callout strong { font-weight: 500; display: block; margin-bottom: 3px; }
+  .callout span   { color: var(--muted); font-size: 12.5px; line-height: 1.6; display: block; }
+
+  /* ── ANIMATION ────────────────────────────────────── */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .section:nth-child(1) { animation-delay: 0.05s; }
+  .section:nth-child(2) { animation-delay: 0.10s; }
+  .section:nth-child(3) { animation-delay: 0.15s; }
+  .section:nth-child(4) { animation-delay: 0.20s; }
+  .section:nth-child(5) { animation-delay: 0.25s; }
+  .section:nth-child(6) { animation-delay: 0.30s; }
+
+  /* ── SCROLLBAR ────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--faint); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- ═══ SIDEBAR ═════════════════════════════════════════ -->
+<nav class="sidebar">
+  <div class="sidebar-brand">
+    <span class="module-label">alwayson / vision</span>
+    <span class="port-name">/alwayson/vision/<br>landmarks:o</span>
+    <span class="port-sub">yarp::Port · Bottle</span>
+  </div>
+
+  <div class="sidebar-nav">
+    <span class="nav-group-label">Contents</span>
+    <a class="nav-item active" href="#overview">
+      <span class="nav-dot" style="background:var(--gray-acc)"></span>Overview
+    </a>
+    <a class="nav-item" href="#pipeline">
+      <span class="nav-dot" style="background:var(--blue)"></span>Data Pipeline
+    </a>
+    <a class="nav-item" href="#structure">
+      <span class="nav-dot" style="background:var(--emerald)"></span>Bottle Structure
+    </a>
+    <a class="nav-item" href="#scenarios">
+      <span class="nav-dot" style="background:var(--amber)"></span>Match Scenarios
+    </a>
+
+    <span class="nav-group-label" style="margin-top:8px">Field Groups</span>
+    <a class="nav-item" href="#identity">
+      <span class="nav-dot" style="background:var(--violet)"></span>Identity &amp; Tracking
+    </a>
+    <a class="nav-item" href="#spatial">
+      <span class="nav-dot" style="background:var(--emerald)"></span>Spatial Position
+    </a>
+    <a class="nav-item" href="#pose">
+      <span class="nav-dot" style="background:var(--amber)"></span>Head Pose &amp; Gaze
+    </a>
+    <a class="nav-item" href="#behavioral">
+      <span class="nav-dot" style="background:var(--coral)"></span>Behavioral State
+    </a>
+
+    <span class="nav-group-label" style="margin-top:8px">Reference</span>
+    <a class="nav-item" href="#thresholds">
+      <span class="nav-dot" style="background:var(--blue)"></span>Thresholds &amp; Params
+    </a>
+  </div>
+
+  <div class="sidebar-footer">
+    Copyright © 2026 Nima Abaeian<br>
+    IIT — CONTACT Lab<br>
+    GNU GPL v3
+  </div>
+</nav>
+
+<!-- ═══ MAIN ═════════════════════════════════════════════ -->
+<main class="main">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="hero-eyebrow">YARP Port Documentation</div>
+    <h1>landmarks<span class="accent">:o</span></h1>
+    <p class="hero-desc">
+      Per-face detail port published by <code>VisionAnalyzer</code> every module tick (~50 ms).
+      Carries a structured bottle with 13 fields of identity, spatial, pose, and behavioral data
+      for every face detected in the current frame.
+    </p>
+    <div class="hero-meta">
+      <div class="meta-pill"><span class="dot"></span>yarp::Port (blocking write)</div>
+      <div class="meta-pill"><span class="dot" style="background:var(--blue)"></span>Bottle → list of face sub-bottles</div>
+      <div class="meta-pill"><span class="dot" style="background:var(--amber)"></span>50 ms default period</div>
+    </div>
+  </div>
+
+  <!-- ── SECTION 1: OVERVIEW ─────────────────────────── -->
+  <section class="section" id="overview">
+    <div class="section-header">
+      <span class="section-num">01</span>
+      <h2 class="section-title">Overview</h2>
+      <span class="section-tag" style="background:var(--gray-d);color:var(--gray-acc);border:1px solid var(--gray-b)">Context</span>
+    </div>
+
+    <p>
+      <code>landmarks:o</code> is one of four output ports on the <code>VisionAnalyzer</code> module
+      (<code>features:o</code>, <code>landmarks:o</code>, <code>targetBox:o</code>, <code>faces_view:o</code>).
+      While <code>features:o</code> publishes a single scene-level summary (total faces, motion, light, mutual-gaze count),
+      <code>landmarks:o</code> goes deeper: it publishes <em>one nested sub-bottle per individual face</em>, carrying every
+      computed attribute for that person.
+    </p>
+    <p>
+      The port is <strong>only written when at least one subscriber is connected</strong>. The module checks
+      <code>landmarks_port.getOutputCount() > 0</code> each tick and skips the entire perception pipeline if no port
+      is connected — saving significant CPU.
+    </p>
+
+    <div class="callout callout-info">
+      <strong>Reading the bottle downstream</strong>
+      <span>
+        Iterate over the top-level list. Each element is a nested bottle representing one face.
+        Fields are interleaved key-value pairs: a string key followed by its value (or a nested list for
+        <code>bbox</code> and <code>gaze_direction</code>). There is no face-count header; the number of
+        sub-bottles equals the number of tracked faces in the frame.
+      </span>
+    </div>
+  </section>
+
+  <!-- ── SECTION 2: PIPELINE ─────────────────────────── -->
+  <section class="section" id="pipeline">
+    <div class="section-header">
+      <span class="section-num">02</span>
+      <h2 class="section-title">Data Pipeline</h2>
+      <span class="section-tag" style="background:var(--blue-d);color:var(--blue);border:1px solid var(--blue-b)">Architecture</span>
+    </div>
+
+    <p>
+      Two completely independent detectors run each frame and their outputs are fused
+      via a one-to-one greedy matching step before the bottle is assembled.
+    </p>
+
+    <div class="pipeline">
+      <div class="pipe-step" style="border-top:2px solid var(--blue)">
+        <div class="pipe-step-label">Input</div>
+        <div class="pipe-step-name" style="color:var(--blue)">Camera Frame</div>
+        <div class="pipe-step-out">640×480 RGB<br>via img:i port</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--coral)">
+        <div class="pipe-step-label">Detector</div>
+        <div class="pipe-step-name" style="color:var(--coral)">YOLO v11</div>
+        <div class="pipe-step-out">face bboxes<br>conf > 0.7</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--coral)">
+        <div class="pipe-step-label">Tracker</div>
+        <div class="pipe-step-name" style="color:var(--coral)">ByteTrack</div>
+        <div class="pipe-step-out">track_id<br>lost buf=120f</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--violet)">
+        <div class="pipe-step-label">Identity</div>
+        <div class="pipe-step-name" style="color:var(--violet)">face_recognition</div>
+        <div class="pipe-step-out">face_id<br>sticky 1.5s</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--emerald)">
+        <div class="pipe-step-label">Landmarks</div>
+        <div class="pipe-step-name" style="color:var(--emerald)">MediaPipe</div>
+        <div class="pipe-step-out">478 pts<br>up to 10 faces</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--amber)">
+        <div class="pipe-step-label">Pose Solve</div>
+        <div class="pipe-step-name" style="color:var(--amber)">solvePnP</div>
+        <div class="pipe-step-out">6 anchors<br>R, t vectors</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+
+      <div class="pipe-step" style="border-top:2px solid var(--emerald)">
+        <div class="pipe-step-label">Output</div>
+        <div class="pipe-step-name" style="color:var(--emerald)">landmarks:o</div>
+        <div class="pipe-step-out">N×face_btl<br>per frame</div>
+      </div>
+    </div>
+
+    <div class="callout callout-success">
+      <strong>Association step</strong>
+      <span>
+        <code>_associate_face_observations()</code> performs one-to-one greedy matching between MediaPipe faces
+        and YOLO-tracked bboxes using a score = (normalised centre-distance) − (bbox overlap ratio × 0.5),
+        with a 0.75 penalty if the MediaPipe centroid falls outside the YOLO box.
+        Match is rejected if: centroid is outside the box AND distance exceeds
+        <code>max(max_face_match_distance=100px, 0.6 × max(w,h))</code> AND overlap ratio &lt; 0.15.
+      </span>
+    </div>
+
+    <p>
+      The six anatomical anchor points used for <code>solvePnP</code> are MediaPipe landmark IDs:
+      <code>1</code> (nose tip), <code>199</code> (chin), <code>33</code> (left eye outer),
+      <code>263</code> (right eye outer), <code>61</code> (left mouth corner), <code>291</code> (right mouth corner).
+      The corresponding 3-D reference coordinates are a generic face model in millimetres (nose tip at origin).
+      The camera matrix is constructed assuming <code>focal_length = image_width</code> (no lens calibration).
+    </p>
+  </section>
+
+  <!-- ── SECTION 3: BOTTLE STRUCTURE ────────────────── -->
+  <section class="section" id="structure">
+    <div class="section-header">
+      <span class="section-num">03</span>
+      <h2 class="section-title">Bottle Structure</h2>
+      <span class="section-tag" style="background:var(--emerald-d);color:var(--emerald);border:1px solid var(--emerald-b)">Schema</span>
+    </div>
+
+    <p>
+      The top-level <code>landmarks_btl</code> is a flat YARP <code>Bottle</code>. Each face is appended as a nested
+      sub-bottle via <code>landmarks_btl.addList().read(face_btl)</code>. Fields within each sub-bottle are
+      sequential key-value pairs (string key, typed value).
+    </p>
+
+    <div class="bottle-tree">
+<span class="tree-root">landmarks_btl</span>  <span class="tree-note">// top-level Bottle, one element per face</span>
+│
+├─ <span class="tree-idx">[face 0]</span> <span class="tree-child">face_btl</span>  <span class="tree-note">// nested list sub-bottle</span>
+│   ├─ <span class="tree-key">"face_id"</span>        <span class="tree-leaf">→ string</span>             <span class="tree-note">// identity name or "unknown"</span>
+│   ├─ <span class="tree-key">"track_id"</span>       <span class="tree-leaf">→ int32</span>              <span class="tree-note">// ByteTrack persistent ID</span>
+│   ├─ <span class="tree-key">["bbox"</span>          <span class="tree-leaf">x  y  w  h]</span>         <span class="tree-note">// nested list, float64, pixels</span>
+│   ├─ <span class="tree-key">"zone"</span>           <span class="tree-leaf">→ string</span>             <span class="tree-note">// horizontal zone enum</span>
+│   ├─ <span class="tree-key">"distance"</span>       <span class="tree-leaf">→ string</span>             <span class="tree-note">// proximity enum</span>
+│   ├─ <span class="tree-key">["gaze_direction"</span> <span class="tree-leaf">dx  dy  dz]</span>         <span class="tree-note">// nested list, float64, unit vector</span>
+│   ├─ <span class="tree-key">"pitch"</span>          <span class="tree-leaf">→ float64</span>            <span class="tree-note">// degrees, up/down</span>
+│   ├─ <span class="tree-key">"yaw"</span>            <span class="tree-leaf">→ float64</span>            <span class="tree-note">// degrees, left/right</span>
+│   ├─ <span class="tree-key">"roll"</span>           <span class="tree-leaf">→ float64</span>            <span class="tree-note">// degrees, lateral tilt</span>
+│   ├─ <span class="tree-key">"cos_angle"</span>      <span class="tree-leaf">→ float64</span>            <span class="tree-note">// −1 (away) → 1 (facing cam)</span>
+│   ├─ <span class="tree-key">"attention"</span>      <span class="tree-leaf">→ string</span>             <span class="tree-note">// gaze state label</span>
+│   ├─ <span class="tree-key">"is_talking"</span>     <span class="tree-leaf">→ int32</span>              <span class="tree-note">// 0 or 1</span>
+│   └─ <span class="tree-key">"time_in_view"</span>   <span class="tree-leaf">→ float64</span>            <span class="tree-note">// seconds since first seen</span>
+│
+├─ <span class="tree-idx">[face 1]</span> <span class="tree-child">face_btl</span>  <span class="tree-note">// same schema …</span>
+│
+└─ <span class="tree-idx">[face N-1]</span> <span class="tree-child">face_btl</span>
+    </div>
+
+    <div class="callout callout-warning">
+      <strong>Nested list encoding note</strong>
+      <span>
+        <code>bbox</code> and <code>gaze_direction</code> are both written as nested <code>Bottle</code>s via
+        <code>face_btl.addList()</code>. The first element of each nested list is a string key
+        (<code>"bbox"</code> / <code>"gaze_direction"</code>), followed by the numeric values.
+        Do not confuse these with the flat string-then-scalar pairs used for all other fields.
+      </span>
+    </div>
+  </section>
+
+  <!-- ── SECTION 4: MATCH SCENARIOS ─────────────────── -->
+  <section class="section" id="scenarios">
+    <div class="section-header">
+      <span class="section-num">04</span>
+      <h2 class="section-title">Match Scenarios</h2>
+      <span class="section-tag" style="background:var(--amber-d);color:var(--amber);border:1px solid var(--amber-b)">Fallback Logic</span>
+    </div>
+
+    <p>
+      Three distinct outcomes determine what gets populated in any given face sub-bottle.
+      Fully matched faces carry complete data; the two fallback cases substitute sentinel values.
+    </p>
+
+    <div class="scenarios">
+
+      <div class="scenario-card" style="border-top-color:var(--emerald)">
+        <h4 style="color:var(--emerald)">✓ Fully Matched</h4>
+        <p style="font-size:12px;color:var(--muted)">
+          YOLO bbox + ByteTrack ID successfully associated with a MediaPipe face detection.
+          All 13 fields carry real computed values.
+        </p>
+        <div class="scenario-fields">
+          <div class="sf-row"><span class="sf-name">face_id</span><span class="sf-val v-real">name / "unknown"</span></div>
+          <div class="sf-row"><span class="sf-name">track_id</span><span class="sf-val v-real">≥ 0</span></div>
+          <div class="sf-row"><span class="sf-name">bbox</span><span class="sf-val v-real">x y w h (px)</span></div>
+          <div class="sf-row"><span class="sf-name">zone</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">distance</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">gaze_direction</span><span class="sf-val v-real">dx dy dz</span></div>
+          <div class="sf-row"><span class="sf-name">pitch / yaw / roll</span><span class="sf-val v-real">degrees</span></div>
+          <div class="sf-row"><span class="sf-name">cos_angle</span><span class="sf-val v-real">−1 … 1</span></div>
+          <div class="sf-row"><span class="sf-name">attention</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">is_talking</span><span class="sf-val v-real">0 or 1</span></div>
+          <div class="sf-row"><span class="sf-name">time_in_view</span><span class="sf-val v-real">seconds</span></div>
+        </div>
+      </div>
+
+      <div class="scenario-card" style="border-top-color:var(--amber)">
+        <h4 style="color:var(--amber)">⚠ MediaPipe-only</h4>
+        <p style="font-size:12px;color:var(--muted)">
+          MediaPipe detected a face but no YOLO bbox could be matched (e.g. face at edge of frame, occluded).
+          Pose fields are real; identity/spatial fields are sentinel defaults.
+        </p>
+        <div class="scenario-fields">
+          <div class="sf-row"><span class="sf-name">face_id</span><span class="sf-val v-def">"unmatched"</span></div>
+          <div class="sf-row"><span class="sf-name">track_id</span><span class="sf-val v-def">−1</span></div>
+          <div class="sf-row"><span class="sf-name">bbox</span><span class="sf-val v-def">0 0 0 0</span></div>
+          <div class="sf-row"><span class="sf-name">zone</span><span class="sf-val v-def">"UNKNOWN"</span></div>
+          <div class="sf-row"><span class="sf-name">distance</span><span class="sf-val v-def">"UNKNOWN"</span></div>
+          <div class="sf-row"><span class="sf-name">gaze_direction</span><span class="sf-val v-real">dx dy dz</span></div>
+          <div class="sf-row"><span class="sf-name">pitch / yaw / roll</span><span class="sf-val v-real">degrees</span></div>
+          <div class="sf-row"><span class="sf-name">cos_angle</span><span class="sf-val v-real">−1 … 1</span></div>
+          <div class="sf-row"><span class="sf-name">attention</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">is_talking</span><span class="sf-val v-real">0 or 1</span></div>
+          <div class="sf-row"><span class="sf-name">time_in_view</span><span class="sf-val v-def">0.0</span></div>
+        </div>
+      </div>
+
+      <div class="scenario-card" style="border-top-color:var(--coral)">
+        <h4 style="color:var(--coral)">✗ YOLO-only</h4>
+        <p style="font-size:12px;color:var(--muted)">
+          YOLO tracked a face but MediaPipe produced no matching landmark result (e.g. face too small, at extreme angle).
+          Identity/spatial fields are real; pose fields are zeroed.
+        </p>
+        <div class="scenario-fields">
+          <div class="sf-row"><span class="sf-name">face_id</span><span class="sf-val v-real">name / "unknown"</span></div>
+          <div class="sf-row"><span class="sf-name">track_id</span><span class="sf-val v-real">≥ 0</span></div>
+          <div class="sf-row"><span class="sf-name">bbox</span><span class="sf-val v-real">x y w h (px)</span></div>
+          <div class="sf-row"><span class="sf-name">zone</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">distance</span><span class="sf-val v-real">enum</span></div>
+          <div class="sf-row"><span class="sf-name">gaze_direction</span><span class="sf-val v-zero">0 0 0</span></div>
+          <div class="sf-row"><span class="sf-name">pitch / yaw / roll</span><span class="sf-val v-zero">0.0</span></div>
+          <div class="sf-row"><span class="sf-name">cos_angle</span><span class="sf-val v-zero">0.0</span></div>
+          <div class="sf-row"><span class="sf-name">attention</span><span class="sf-val v-zero">"UNKNOWN"</span></div>
+          <div class="sf-row"><span class="sf-name">is_talking</span><span class="sf-val v-zero">0</span></div>
+          <div class="sf-row"><span class="sf-name">time_in_view</span><span class="sf-val v-real">seconds</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SECTION 5a: IDENTITY ────────────────────────── -->
+  <section class="section" id="identity">
+    <div class="section-header">
+      <span class="section-num">05a</span>
+      <h2 class="section-title">Identity &amp; Tracking</h2>
+      <span class="section-tag" style="background:var(--violet-d);color:var(--violet);border:1px solid var(--violet-b)">2 fields</span>
+    </div>
+
+    <p>Who is this face and how consistently is it tracked across frames?</p>
+
+    <div class="field-group">
+      <div class="group-header">
+        <div class="group-accent" style="background:var(--violet)"></div>
+        <span class="group-title" style="color:var(--violet)">Identity &amp; Tracking</span>
+        <span class="group-count">2 fields</span>
+      </div>
+
+      <!-- face_id -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">face_id</div>
+          <div class="field-badges">
+            <span class="badge b-str">string</span>
+            <span class="badge b-yolo">YOLO crop</span>
+          </div>
+          <div class="field-yarp">addString("face_id")<br>addString(face_data['face_id'])</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Identity label produced by the <code>face_recognition</code> library, which compares a 128-D
+            embedding of the YOLO-cropped face against a database of known encodings loaded from
+            <code>faces/</code> at startup. Uses a cosine-distance tolerance of <code>id_tolerance=0.62</code>.
+            <br><br>
+            A <strong>sticky mechanism</strong> caches the last confirmed identity for up to
+            <code>identity_sticky_sec</code> seconds (default 1.5 s). If a face drops to <em>unknown</em>
+            after being identified, the cached name is re-used while up to <code>unknown_retry_max_attempts</code>
+            (default 3) background retries fire at intervals of <code>unknown_retry_interval_sec</code> (default 1–2 s).
+            Thread-safe: all writes use <code>_face_identity_lock</code>.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Possible values</span>
+            <div class="value-rows">
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">"alice"</span>
+                <span class="value-explain">any name matching a file in the <code>faces/</code> folder</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--amber)">"unknown"</span>
+                <span class="value-explain">face detected but no match within tolerance; retries in progress</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--coral)">"unmatched"</span>
+                <span class="value-explain">MediaPipe saw a face but no YOLO bbox was associated (scenario 2)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- track_id -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">track_id</div>
+          <div class="field-badges">
+            <span class="badge b-int32">int32</span>
+            <span class="badge b-yolo">ByteTrack</span>
+          </div>
+          <div class="field-yarp">addString("track_id")<br>addInt32(face_data['track_id'])</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Persistent integer identifier assigned by <code>supervision.ByteTrack</code>. Survives brief occlusions
+            up to a <code>lost_track_buffer=120</code> frame window (~6 s at 20 Hz). Once lost beyond that buffer,
+            the face reappears with a new ID.
+            <br><br>
+            All per-face state (mouth history, first-seen timestamps, identity cache) is keyed by this ID.
+            Downstream modules should use <code>track_id</code> as the primary key for any per-person state machine.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Possible values</span>
+            <div class="value-rows">
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">≥ 0</span>
+                <span class="value-explain">valid persistent tracker ID (monotonically increasing)</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--coral)">−1</span>
+                <span class="value-explain">MediaPipe-only face (no YOLO/ByteTrack match; scenario 2)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SECTION 5b: SPATIAL ─────────────────────────── -->
+  <section class="section" id="spatial">
+    <div class="section-header">
+      <span class="section-num">05b</span>
+      <h2 class="section-title">Spatial Position</h2>
+      <span class="section-tag" style="background:var(--emerald-d);color:var(--emerald);border:1px solid var(--emerald-b)">3 fields</span>
+    </div>
+
+    <p>Where in the image is this face, and how close is the person?</p>
+
+    <div class="field-group">
+      <div class="group-header">
+        <div class="group-accent" style="background:var(--emerald)"></div>
+        <span class="group-title" style="color:var(--emerald)">Spatial Position</span>
+        <span class="group-count">3 fields</span>
+      </div>
+
+      <!-- bbox -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">bbox</div>
+          <div class="field-badges">
+            <span class="badge b-list">nested list</span>
+            <span class="badge b-yolo">YOLO</span>
+          </div>
+          <div class="field-yarp">bbox_btl = addList()<br>addString("bbox")<br>addFloat64(x) y w h</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Bounding box of the detected face in pixel coordinates, using a top-left origin
+            (image convention). Packed as a <em>nested Bottle list</em>: first element is the string key
+            <code>"bbox"</code>, followed by four <code>float64</code> values.
+            <br><br>
+            The box has been <strong>expanded 10% per side</strong> from YOLO's raw output to give downstream
+            face-crop operations better context (forehead, chin margins). Clamped to image boundaries after
+            expansion. Resolves to <code>0 0 0 0</code> in the MediaPipe-only fallback scenario.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Encoding</span>
+            <div class="value-rows">
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">x</span>
+                <span class="value-explain">left edge of box in pixels (float64)</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">y</span>
+                <span class="value-explain">top edge of box in pixels (float64)</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">w</span>
+                <span class="value-explain">width in pixels (float64)</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">h</span>
+                <span class="value-explain">height in pixels (float64)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- zone -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">zone</div>
+          <div class="field-badges">
+            <span class="badge b-str">string</span>
+            <span class="badge b-comp">computed</span>
+          </div>
+          <div class="field-yarp">addString("zone")<br>addString(zone)</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Horizontal zone of the face within the frame. Computed from the bounding-box centre
+            (<code>cx = x + w/2</code>), normalised to <code>[0, 1]</code> over
+            <code>default_width = 640 px</code>. Useful for coarse spatial attention commands
+            (e.g. "face is on the left side, turn camera right").
+          </div>
+          <div class="field-values">
+            <span class="values-label">Thresholds (cx_n = cx / 640)</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"FAR_LEFT"</span><span class="value-explain">cx_n &lt; 0.20</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"LEFT"</span><span class="value-explain">0.20 ≤ cx_n &lt; 0.40</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"CENTER"</span><span class="value-explain">0.40 ≤ cx_n &lt; 0.60</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"RIGHT"</span><span class="value-explain">0.60 ≤ cx_n &lt; 0.80</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"FAR_RIGHT"</span><span class="value-explain">cx_n ≥ 0.80</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">"UNKNOWN"</span><span class="value-explain">no YOLO match (scenario 2 or 3)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- distance -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">distance</div>
+          <div class="field-badges">
+            <span class="badge b-str">string</span>
+            <span class="badge b-comp">computed</span>
+          </div>
+          <div class="field-yarp">addString("distance")<br>addString(distance)</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Proximity estimate based on the height of the bounding box relative to the frame height
+            (<code>h_norm = h / 480</code>). No metric calibration is performed — this is a pure
+            image-space heuristic that assumes a fixed camera focal length and typical face size.
+            Works reasonably for front-facing HRI scenarios but will degrade with wide-angle optics
+            or unusually sized subjects.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Thresholds (h_norm = h / 480)</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"SO_CLOSE"</span><span class="value-explain">h_norm &gt; 0.40 — face fills &gt;40% of frame height</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"CLOSE"</span><span class="value-explain">0.20 &lt; h_norm ≤ 0.40</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"FAR"</span><span class="value-explain">0.10 &lt; h_norm ≤ 0.20</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">"VERY_FAR"</span><span class="value-explain">h_norm ≤ 0.10 — face fills &lt;10% of frame height</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">"UNKNOWN"</span><span class="value-explain">no YOLO bbox available</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SECTION 5c: POSE ────────────────────────────── -->
+  <section class="section" id="pose">
+    <div class="section-header">
+      <span class="section-num">05c</span>
+      <h2 class="section-title">Head Pose &amp; Gaze Direction</h2>
+      <span class="section-tag" style="background:var(--amber-d);color:var(--amber);border:1px solid var(--amber-b)">5 fields</span>
+    </div>
+
+    <p>
+      Where is the face pointing in 3-D camera space? All five fields are derived from the same
+      PnP solve on MediaPipe landmarks.
+    </p>
+
+    <div class="field-group">
+      <div class="group-header">
+        <div class="group-accent" style="background:var(--amber)"></div>
+        <span class="group-title" style="color:var(--amber)">Head Pose &amp; Gaze</span>
+        <span class="group-count">5 fields</span>
+      </div>
+
+      <!-- gaze_direction -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">gaze_direction</div>
+          <div class="field-badges">
+            <span class="badge b-list">nested list</span>
+            <span class="badge b-mp">MediaPipe</span>
+          </div>
+          <div class="field-yarp">gaze_btl = addList()<br>addString("gaze_direction")<br>addFloat64(dx) dy dz</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            The face's nose-forward unit vector expressed in <strong>camera coordinates</strong>.
+            Computed as <code>R @ [0, 0, −1]</code>, where <code>R</code> is the 3×3 rotation matrix
+            from <code>cv2.Rodrigues(rvec)</code> (output of <code>solvePnP</code>).
+            <br><br>
+            Camera convention: +X right, +Y down, +Z into the scene (away from camera).
+            A face looking directly at the camera therefore yields approximately <code>[0, 0, 1]</code>
+            (before sign flip of the face-forward axis).
+            Packed as a nested Bottle list: key <code>"gaze_direction"</code> followed by three float64 values.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Components</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">dx</span><span class="value-explain">rightward component (float64)</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">dy</span><span class="value-explain">downward component (float64)</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">dz</span><span class="value-explain">into-scene component (float64)</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">[0,0,0]</span><span class="value-explain">sentinel — no MediaPipe match for this face</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- pitch -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">pitch</div>
+          <div class="field-badges">
+            <span class="badge b-float">float64</span>
+            <span class="badge b-mp">MediaPipe</span>
+          </div>
+          <div class="field-yarp">addString("pitch")<br>addFloat64(float(pitch))</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Vertical head tilt angle in degrees. Extracted as <code>angles[0]</code> from
+            <code>cv2.RQDecomp3x3(rmat)</code>. Positive pitch = head tilted upward;
+            negative = tilted downward.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Range &amp; meaning</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">&gt; 0°</span><span class="value-explain">chin up / looking upward</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">≈ 0°</span><span class="value-explain">level gaze</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">&lt; 0°</span><span class="value-explain">chin down / looking downward</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">0.0</span><span class="value-explain">sentinel — no MediaPipe match</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- yaw -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">yaw</div>
+          <div class="field-badges">
+            <span class="badge b-float">float64</span>
+            <span class="badge b-mp">MediaPipe</span>
+          </div>
+          <div class="field-yarp">addString("yaw")<br>addFloat64(float(yaw))</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Horizontal head turn angle in degrees. Extracted as <code>angles[1]</code> from
+            <code>cv2.RQDecomp3x3</code>. In OpenCV camera convention, positive yaw means the face is
+            turned to the right (from the camera's perspective).
+          </div>
+          <div class="field-values">
+            <span class="values-label">Range &amp; meaning</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">&gt; 0°</span><span class="value-explain">face turned right (camera perspective)</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">≈ 0°</span><span class="value-explain">face forward</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">&lt; 0°</span><span class="value-explain">face turned left</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">0.0</span><span class="value-explain">sentinel — no MediaPipe match</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- roll -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">roll</div>
+          <div class="field-badges">
+            <span class="badge b-float">float64</span>
+            <span class="badge b-mp">MediaPipe</span>
+          </div>
+          <div class="field-yarp">addString("roll")<br>addFloat64(float(roll))</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Lateral head tilt (in-plane rotation) in degrees. Extracted as <code>angles[2]</code>.
+            Non-zero when the person tilts their head sideways — common in listening posture or
+            expressions of curiosity. Useful for affect recognition.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Range &amp; meaning</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">&gt; 0°</span><span class="value-explain">head tilted to one side</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">≈ 0°</span><span class="value-explain">head upright</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">0.0</span><span class="value-explain">sentinel — no MediaPipe match</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- cos_angle -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">cos_angle</div>
+          <div class="field-badges">
+            <span class="badge b-float">float64</span>
+            <span class="badge b-comp">computed</span>
+          </div>
+          <div class="field-yarp">addString("cos_angle")<br>addFloat64(float(cos_angle))</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Cosine similarity between the face's forward vector (<code>gaze_direction</code>) and the
+            camera's look-at axis <code>[0, 0, 1]</code>. This is the primary scalar driving the
+            <code>attention</code> classification and the global <code>MutualGaze</code> counter
+            published on <code>features:o</code>.
+            <br><br>
+            A value of <strong>1.0</strong> means the face is pointing exactly at the camera.
+            A value of <strong>0.0</strong> means the face is perpendicular to the camera axis.
+            Negative values indicate the back of the head is facing the camera.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Range &amp; decision thresholds</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">&gt; 0.90</span><span class="value-explain">→ MUTUAL_GAZE; increments MutualGaze counter</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--amber)">0.70 – 0.90</span><span class="value-explain">→ NEAR_GAZE; near eye contact</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">≤ 0.70</span><span class="value-explain">→ AWAY; not looking at camera</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--faint)">0.0</span><span class="value-explain">sentinel — no MediaPipe match</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SECTION 5d: BEHAVIORAL ─────────────────────── -->
+  <section class="section" id="behavioral">
+    <div class="section-header">
+      <span class="section-num">05d</span>
+      <h2 class="section-title">Behavioral State</h2>
+      <span class="section-tag" style="background:var(--coral-d);color:var(--coral);border:1px solid var(--coral-b)">3 fields</span>
+    </div>
+
+    <p>What is the person doing? These are the highest-level semantic outputs of the module.</p>
+
+    <div class="field-group">
+      <div class="group-header">
+        <div class="group-accent" style="background:var(--coral)"></div>
+        <span class="group-title" style="color:var(--coral)">Behavioral State</span>
+        <span class="group-count">3 fields</span>
+      </div>
+
+      <!-- attention -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">attention</div>
+          <div class="field-badges">
+            <span class="badge b-str">string</span>
+            <span class="badge b-comp">computed</span>
+          </div>
+          <div class="field-yarp">addString("attention")<br>addString(attention)</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Gaze-state classification derived entirely from <code>cos_angle</code> using two fixed thresholds.
+            When a face is classified as <code>MUTUAL_GAZE</code>, the module also increments the
+            <code>env_dict["MutualGaze"]</code> counter, which is published separately on <code>features:o</code>
+            as a scene-level count of how many people are simultaneously engaged in eye contact.
+          </div>
+          <div class="field-values">
+            <span class="values-label">States</span>
+            <div class="value-rows">
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--emerald)">"MUTUAL_GAZE"</span>
+                <span class="value-explain">cos_angle &gt; 0.90 — direct eye contact</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--amber)">"NEAR_GAZE"</span>
+                <span class="value-explain">cos_angle &gt; 0.70 — face directed near camera</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--coral)">"AWAY"</span>
+                <span class="value-explain">cos_angle ≤ 0.70 — not looking at camera</span>
+              </div>
+              <div class="value-row">
+                <span class="value-chip" style="color:var(--faint)">"UNKNOWN"</span>
+                <span class="value-explain">YOLO-only face — no MediaPipe landmarks available</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- is_talking -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">is_talking</div>
+          <div class="field-badges">
+            <span class="badge b-int32">int32</span>
+            <span class="badge b-mp">MediaPipe</span>
+          </div>
+          <div class="field-yarp">addString("is_talking")<br>addInt32(is_talking)</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Binary lip-motion detector. Tracks the distance between MediaPipe landmark
+            <code>13</code> (upper inner lip) and <code>14</code> (lower inner lip) across a rolling
+            buffer of the last <code>mouth_buffer_size = 10</code> frames.
+            <br><br>
+            The raw distance is <strong>scale-normalised</strong> by the matched face's bbox height
+            (<code>mouth_open = raw / (h / 480)</code>), making detection robust to varying face sizes.
+            When at least 3 frames are in the buffer, talking is flagged if
+            <code>std(buffer) &gt; talking_threshold</code> (default <code>0.012</code>).
+            The standard deviation (not mean) is used — this detects <em>motion</em>, not mouth
+            openness, preventing false positives from people who speak with a wide-open mouth.
+            <br><br>
+            The buffer is keyed by <code>track_id</code> and cleared when a track is absent for
+            more than 1 second. Requires at least 3 frames of history before it can fire (~150 ms lag).
+          </div>
+          <div class="field-values">
+            <span class="values-label">Values</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">1</span><span class="value-explain">talking detected — mouth motion std &gt; 0.012</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">0</span><span class="value-explain">silent / insufficient history / no MediaPipe match</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- time_in_view -->
+      <div class="field-card">
+        <div class="field-left">
+          <div class="field-name">time_in_view</div>
+          <div class="field-badges">
+            <span class="badge b-float">float64</span>
+            <span class="badge b-comp">computed</span>
+          </div>
+          <div class="field-yarp">addString("time_in_view")<br>addFloat64(float(time_in_view))</div>
+        </div>
+        <div class="field-right">
+          <div class="field-desc">
+            Wall-clock elapsed time in seconds from when this <code>track_id</code> was first seen
+            (<code>first_seen_track[track_id]</code>) to the current frame. Set using
+            <code>time.time()</code>, so it is real-world seconds, not frame count.
+            <br><br>
+            The timer resets when a <code>track_id</code> has been absent for more than 1 second
+            (cleanup runs at end of each <code>detect_mutual_gaze</code> call). If a face briefly
+            disappears and is re-assigned the same <code>track_id</code> by ByteTrack (within the
+            lost-track buffer), the timer keeps running.
+            <br><br>
+            Useful for salience scoring — a face that has been present for 60 seconds likely warrants
+            more attention than one that just appeared. Also useful for engagement metrics in HRI logs.
+          </div>
+          <div class="field-values">
+            <span class="values-label">Range</span>
+            <div class="value-rows">
+              <div class="value-row"><span class="value-chip" style="color:var(--emerald)">0.0 → ∞</span><span class="value-explain">seconds since first detection of this track_id</span></div>
+              <div class="value-row"><span class="value-chip" style="color:var(--coral)">0.0</span><span class="value-explain">unmatched face (MediaPipe-only scenario)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SECTION 6: THRESHOLDS ───────────────────────── -->
+  <section class="section" id="thresholds">
+    <div class="section-header">
+      <span class="section-num">06</span>
+      <h2 class="section-title">Thresholds &amp; Configuration</h2>
+      <span class="section-tag" style="background:var(--blue-d);color:var(--blue);border:1px solid var(--blue-b)">Tunable</span>
+    </div>
+
+    <p>
+      All parameters below can be set via the YARP <code>ResourceFinder</code> configuration file
+      or command-line flags passed to the module. Defaults are the in-code values.
+    </p>
+
+    <div class="field-group" style="overflow-x:auto">
+      <table class="params-table">
+        <thead>
+          <tr>
+            <th>RF Parameter</th>
+            <th>Default</th>
+            <th>Effect on landmarks:o</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>conf_threshold</td>
+            <td>0.7</td>
+            <td>Minimum YOLO detection confidence. Faces below this are dropped before ByteTrack. Affects number of sub-bottles published.</td>
+          </tr>
+          <tr>
+            <td>id_tolerance</td>
+            <td>0.62</td>
+            <td>Cosine distance threshold for face_recognition match. Lower = stricter matching; more "unknown" results. Higher = more false positives.</td>
+          </tr>
+          <tr>
+            <td>identity_sticky_sec</td>
+            <td>1.5</td>
+            <td>How long a confirmed identity is cached in face_id after the face goes unrecognised again.</td>
+          </tr>
+          <tr>
+            <td>unknown_retry_interval_sec</td>
+            <td>1.0 – 2.0</td>
+            <td>Gap between face_recognition retry attempts for an "unknown" face before giving up.</td>
+          </tr>
+          <tr>
+            <td>unknown_retry_max_attempts</td>
+            <td>3</td>
+            <td>Maximum number of retries before a face is permanently labelled "unknown" this session.</td>
+          </tr>
+          <tr>
+            <td>talking_threshold</td>
+            <td>0.012</td>
+            <td>Std-dev threshold for is_talking. Increase to reduce false positives (less sensitive). Decrease to catch subtle lip movements.</td>
+          </tr>
+          <tr>
+            <td>mouth_buffer_size</td>
+            <td>10 frames</td>
+            <td>Rolling window size for is_talking. Larger = more stable but higher latency. At 20 Hz: 10 frames ≈ 500 ms lag.</td>
+          </tr>
+          <tr>
+            <td>max_face_match_distance</td>
+            <td>100 px</td>
+            <td>Hard limit for MediaPipe↔YOLO centroid matching. Faces whose centroids are farther apart than this (and have &lt;15% overlap) are not matched.</td>
+          </tr>
+          <tr>
+            <td>mutual_gaze_threshold</td>
+            <td>10°</td>
+            <td>Defined in code but not directly used in landmarks:o; the active decision uses cos_angle thresholds (0.90 / 0.70) from detect_mutual_gaze().</td>
+          </tr>
+          <tr>
+            <td>rate</td>
+            <td>0.05 s</td>
+            <td>Module update period (getPeriod). Directly controls publication frequency of the landmarks bottle.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout callout-warning" style="margin-top:16px">
+      <strong>Camera matrix approximation</strong>
+      <span>
+        The PnP solve uses <code>focal_length = image_width</code> (640 px by default) as both fx and fy,
+        with principal point at the image centre. No lens distortion is modelled (<code>dist_coeffs = zeros(4,1)</code>).
+        This means pitch / yaw / roll and gaze_direction are computed under a simplified pin-hole model.
+        For precise head-pose estimation, replace with a calibrated camera matrix via a configuration parameter.
+      </span>
+    </div>
+  </section>
+
+</main>
+
+<script>
+  const navItems = document.querySelectorAll('.nav-item');
+  const sections = document.querySelectorAll('section[id]');
+
+  function updateActive() {
+    let current = '';
+    sections.forEach(s => {
+      if (window.scrollY >= s.offsetTop - 120) current = s.id;
+    });
+    navItems.forEach(a => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  }
+
+  window.addEventListener('scroll', updateActive, { passive: true });
+  updateActive();
+
+  navItems.forEach(item => {
+    item.addEventListener('click', e => {
+      e.preventDefault();
+      const target = document.querySelector(item.getAttribute('href'));
+      if (target) target.scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+</script>
+</body>
+</html>
