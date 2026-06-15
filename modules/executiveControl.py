@@ -913,7 +913,7 @@ class ExecutiveControlModule(yarp.RFModule):
 
     # Target monitor
     MONITOR_HZ               = 15.0
-    TARGET_LOST_TIMEOUT      = 12.0
+    TARGET_LOST_TIMEOUT      = 5.0
     MONITOR_PACKET_STALE_SEC = 5.0
     MONITOR_WARMUP_SEC       = 2.0
 
