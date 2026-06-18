@@ -3790,6 +3790,22 @@ class ExecutiveControlModule(yarp.RFModule):
         except Exception as e:
             self._log("ERROR", f"write_last_greeted failed: {e}")
 
+    def _prune_greeted_to_today(self, entries: Dict[str, str]) -> Dict[str, str]:
+        """Keep only entries timestamped today (Europe/Rome); drop stale days.
+
+        Mirrors salienceNetwork's pruned greeted save so the shared greeted_today.json
+        stays clean across the daily reset regardless of which process writes it.
+        """
+        today = datetime.now(self.TIMEZONE).date()
+        out: Dict[str, str] = {}
+        for k, ts in entries.items():
+            try:
+                if datetime.fromisoformat(ts).astimezone(self.TIMEZONE).date() == today:
+                    out[k] = ts
+            except Exception:
+                pass
+        return out
+
     def _mark_greeted_today(self, name: str) -> None:
         key = (name or "").strip()
         if not key:
@@ -3802,7 +3818,8 @@ class ExecutiveControlModule(yarp.RFModule):
                 try:
                     raw     = self._load_json(path, {})
                     entries = raw if isinstance(raw, dict) else {}
-                    entries[key] = datetime.now().astimezone().isoformat()
+                    entries[key] = datetime.now(self.TIMEZONE).isoformat()
+                    entries = self._prune_greeted_to_today(entries)
                     self._save_json_atomic(path, entries)
                 finally:
                     fcntl.flock(lf, fcntl.LOCK_UN)

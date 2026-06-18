@@ -2244,14 +2244,17 @@ class SalienceNetworkModule(yarp.RFModule):
         # Snapshot in-process state first (no I/O under _memory_lock).
         with self._memory_lock:
             in_memory = dict(self.greeted_today)
-        # Cross-process exclusive lock: read → merge → write atomically so that
-        # entries written by executiveControl's responsive path are never lost.
+        # Cross-process exclusive lock: read → merge → prune → write atomically so that
+        # entries written by executiveControl's responsive path are never lost, while
+        # stale entries from previous days are dropped (keeps the daily reset clean and
+        # the file from growing unbounded — mirrors _save_talked_json).
         lock_path = str(self.greeted_path) + ".lock"
         with open(lock_path, "w") as _lf:
             fcntl.flock(_lf, fcntl.LOCK_EX)
             try:
                 on_disk = self._load_json(self.greeted_path, {})
                 merged = {**(on_disk if isinstance(on_disk, dict) else {}), **in_memory}
+                merged = self._prune_to_today(merged)
                 self._save_json_atomic(self.greeted_path, merged)
             finally:
                 fcntl.flock(_lf, fcntl.LOCK_UN)
