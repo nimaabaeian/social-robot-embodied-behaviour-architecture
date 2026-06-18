@@ -104,8 +104,6 @@ class ChatBotModule(yarp.RFModule):
     MAX_USER_CHARS: int = 500
     MAX_REPLY_CHARS: int = 4096  # Telegram limit
 
-    HS3_PROACTIVE_COOLDOWN_SEC: int = 15 * 60  # per-subscriber cooldown
-
     JOKE_CANDIDATE_TTL_SEC: int = 30 * 24 * 3600  # expire unconfirmed joke candidates after 30 days
     JOKE_CANDIDATE_MAX: int = 20  # max pending candidates per user
 
@@ -190,7 +188,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_api_version: str = ""
         self._llm_max_tokens: int = 1024
         self._llm_reply_max_tokens: int = 400
-        self._llm_hs3_proactive_max_tokens: int = 200
+        self._llm_proactive_max_tokens: int = 512
         self._llm_summary_max_tokens: int = 600
         self._llm_reasoning_effort: str = "medium"
         self._llm_verbosity: str = "low"
@@ -222,8 +220,10 @@ class ChatBotModule(yarp.RFModule):
                 self._prompts_path = rf.find("prompts").asString()
             self._load_prompts()
 
-            # Priority-based proactive messaging config (safe defaults)
-            default_learning = os.path.join(self._alwayson_dir, "memory", self.LEARNING_FILENAME)
+            # Priority-based proactive messaging config (safe defaults).
+            # Lives under modules/memory (next to this file), where salienceNetwork
+            # writes it — not the repo-root memory dir.
+            default_learning = os.path.join(self._script_dir, "memory", self.LEARNING_FILENAME)
             if rf.check("homeostatic_learning_path"):
                 self._learning_path = rf.find("homeostatic_learning_path").asString()
             else:
@@ -1254,14 +1254,34 @@ class ChatBotModule(yarp.RFModule):
         except Exception:  # noqa: BLE001
             return None
 
+    def _resolve_person_id(self, rec: Dict[str, Any]) -> str:
+        """Best-effort map a subscriber record to a learned person_id for priority scoring.
+
+        Prefers a confirmed link, then a pending candidate, then an unambiguous on-the-fly
+        match of the subscriber's display name against the learning file. This lets HS2
+        prioritise the best feeders even before the yes/no link flow has completed. Returns
+        ``""`` when no confident match exists.
+        """
+        if rec.get("link_status") == "confirmed":
+            pid = (rec.get("person_id") or "").strip()
+            if pid:
+                return pid
+        cand = (rec.get("person_id_candidate") or "").strip()
+        if cand:
+            return cand
+        return self._match_person_id_by_name(rec.get("name") or "") or ""
+
     def _rank_proactive_targets(self, all_subs: List[int], mode: str) -> List[int]:
         """Order/filter subscribers for a proactive event according to learned priority.
 
-        ``mode`` is one of ``hs3_enter``, ``hs3_cooldown``, ``hs2_entry``, ``hs3_recovery``.
+        ``mode`` is one of ``hs3_enter``, ``hs2_entry``, ``hs3_recovery``.
         In ``broadcast`` proactive mode (or for unknown modes) this is a no-op that returns
         every subscriber. HS3 messages reach all subscribers (scored by affinity + unknowns).
-        HS2 messages are sent only to confirmed-link subscribers whose affinity exceeds
-        ``PRIORITY_THRESHOLD_HS2``; unknowns and low-affinity users are skipped.
+        HS2 messages are sent only to subscribers whose learned affinity exceeds
+        ``PRIORITY_THRESHOLD_HS2`` — i.e. the people most likely to feed the robot.
+        Identity is resolved via :meth:`_resolve_person_id` (confirmed link, pending
+        candidate, or an unambiguous name match), so a confirmed link is not required;
+        unknowns and low-affinity users are skipped.
         """
         if self._proactive_mode == "broadcast":
             return list(all_subs)
@@ -1273,7 +1293,7 @@ class ChatBotModule(yarp.RFModule):
 
         for chat_id in all_subs:
             rec = self._get_user_record(chat_id)
-            pid = (rec.get("person_id") or "").strip() if rec.get("link_status") == "confirmed" else ""
+            pid = self._resolve_person_id(rec)
             prio = self._person_priority(pid) if pid else None
             if prio is None:
                 unknown.append(chat_id)
@@ -1285,7 +1305,7 @@ class ChatBotModule(yarp.RFModule):
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        if mode in ("hs3_enter", "hs3_cooldown", "hs3_recovery"):
+        if mode in ("hs3_enter", "hs3_recovery"):
             return [cid for _, cid in scored] + unknown
 
         if mode == "hs2_entry":
@@ -1295,24 +1315,15 @@ class ChatBotModule(yarp.RFModule):
 
     # ------------------------- HS3 Broadcast -------------------------
     def _maybe_hs3_proactive(self) -> None:
-        if self._stable_hs != "HS3":
+        # Fire exactly once, on the confirmed transition into HS3. The robot does not
+        # keep nagging on a timer while it stays starving — one plea per episode.
+        if self._stable_hs != "HS3" or self._prev_stable_hs == "HS3":
             return
 
-        entering = self._prev_stable_hs != "HS3"
-        now = int(time.time())
-
-        # on entry send to all; otherwise apply per-user cooldown
-        if entering:
-            all_subs = self._db_list_subscribers()
-            candidates = self._rank_proactive_targets(all_subs, "hs3_enter")
-            if len(candidates) < self.HS3_PRIORITY_FLOOR and len(all_subs) > len(candidates):
-                candidates = list(all_subs)  # safety: never under-message HS3
-        else:
-            all_subs = self._db_proactive_candidates(now - self.HS3_PROACTIVE_COOLDOWN_SEC)
-            candidates = self._rank_proactive_targets(all_subs, "hs3_cooldown")
-            if len(candidates) < self.HS3_PRIORITY_FLOOR and len(all_subs) > len(candidates):
-                candidates = list(all_subs)
-
+        all_subs = self._db_list_subscribers()
+        candidates = self._rank_proactive_targets(all_subs, "hs3_enter")
+        if len(candidates) < self.HS3_PRIORITY_FLOOR and len(all_subs) > len(candidates):
+            candidates = list(all_subs)  # safety: never under-message HS3
         if not candidates:
             return
 
@@ -1321,7 +1332,7 @@ class ChatBotModule(yarp.RFModule):
             hs="HS3",
             proactive_mode=self._proactive_mode,
             note=json.dumps({
-                "mode": ("hs3_enter" if entering else "hs3_cooldown"),
+                "mode": "hs3_enter",
                 "proactive_mode": self._proactive_mode,
                 "selected_count": len(candidates),
                 "total_subs": len(all_subs),
@@ -1333,6 +1344,7 @@ class ChatBotModule(yarp.RFModule):
         if not llm_text:
             self._log("WARN", "hs3_proactive: LLM returned empty — using fallback text")
         text = llm_text or self._prompts.get("hs3_proactive_fallback", "pls come feed me in person i'm so hungry 😭 i really need food RIGHT NOW")
+        is_fallback = 0 if llm_text else 1
 
         sent_any = False
         for chat_id in candidates:
@@ -1344,7 +1356,8 @@ class ChatBotModule(yarp.RFModule):
                 hs="HS3",
                 assistant_chars=len(text),
                 hunger_mentioned=1,
-                proactive_mode=("enter" if entering else "cooldown"),
+                llm_fallback=is_fallback,
+                proactive_mode="enter",
                 note="proactive_sent",
                 commit=False)
             self._db_log_message(
@@ -1355,11 +1368,11 @@ class ChatBotModule(yarp.RFModule):
                 hs="HS3",
                 text=text,
                 hunger_mentioned=1,
-                proactive_mode=("enter" if entering else "cooldown"),
+                proactive_mode="enter",
                 note="hs3_proactive",
                 commit=False)
             sent_any = True
-            self._log("INFO", f"HS3 proactive -> {chat_id} ({'enter' if entering else 'cooldown'})")
+            self._log("INFO", f"HS3 proactive -> {chat_id} (enter)")
 
         if sent_any:
             self._db_commit()
@@ -1421,10 +1434,11 @@ class ChatBotModule(yarp.RFModule):
                 "hs2_entry_trigger",
                 "text your friends a very short casual message — you've started feeling a little peckish. offhand, not dramatic. one sentence max.")},
         ]
-        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
-        if not text:
+        llm_text = self._llm_chat(msgs, max_tokens=self._llm_proactive_max_tokens)
+        if not llm_text:
             self._log("WARN", "hs2_entry: LLM returned empty — using fallback text")
-        text = text or self._prompts.get("hs2_entry_fallback", "hm. starting to feel a lil hungry ngl")
+        text = llm_text or self._prompts.get("hs2_entry_fallback", "hm. starting to feel a lil hungry ngl")
+        is_fallback = 0 if llm_text else 1
         sent_any = False
         for chat_id in candidates:
             self._tg_send(chat_id, text)
@@ -1434,6 +1448,7 @@ class ChatBotModule(yarp.RFModule):
                 hs="HS2",
                 assistant_chars=len(text),
                 hunger_mentioned=1,
+                llm_fallback=is_fallback,
                 proactive_mode="hs1_to_hs2",
                 note="hs2_entry_proactive_sent",
                 commit=False)
@@ -1476,12 +1491,13 @@ class ChatBotModule(yarp.RFModule):
                 "hs3_recovery_trigger",
                 "send a short message to your friends about how you're feeling right now")},
         ]
-        text = self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
-        if not text:
+        llm_text = self._llm_chat(msgs, max_tokens=self._llm_proactive_max_tokens)
+        if not llm_text:
             self._log("WARN", "hs3_recovery: LLM returned empty — using fallback text")
-        text = text or self._prompts.get(
+        text = llm_text or self._prompts.get(
             "hs3_recovery_fallback",
             "omg they just fed me!! 😭❤️ feeling SO much better now, thank you")
+        is_fallback = 0 if llm_text else 1
         sent_any = False
         for chat_id in candidates:
             self._tg_send(chat_id, text)
@@ -1491,6 +1507,7 @@ class ChatBotModule(yarp.RFModule):
                 hs=new_hs,
                 assistant_chars=len(text),
                 hunger_mentioned=0,
+                llm_fallback=is_fallback,
                 proactive_mode="hs3_exit",
                 note="hs3_recovery_proactive_sent",
                 commit=False)
@@ -1554,8 +1571,15 @@ class ChatBotModule(yarp.RFModule):
         self._llm_reply_max_tokens = int(
             self._get_env("TELEGRAM_LLM_REPLY_MAX_TOKENS") or "400"
         )
-        self._llm_hs3_proactive_max_tokens = int(
-            self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS") or "200"
+        # Budget shared by every proactive plea (HS2 entry, HS3 entry, HS3 recovery).
+        # Reasoning models spend hidden tokens before any visible text, so a tight cap
+        # can be fully consumed by reasoning and return empty, forcing the fallback;
+        # give the short message enough headroom to actually be LLM-generated.
+        # TELEGRAM_LLM_HS3_MAX_TOKENS is kept as a backward-compatible alias.
+        self._llm_proactive_max_tokens = int(
+            self._get_env("TELEGRAM_LLM_PROACTIVE_MAX_TOKENS")
+            or self._get_env("TELEGRAM_LLM_HS3_MAX_TOKENS")
+            or "512"
         )
         self._llm_summary_max_tokens = int(
             self._get_env("TELEGRAM_LLM_SUMMARY_MAX_TOKENS") or "600"
@@ -1566,7 +1590,7 @@ class ChatBotModule(yarp.RFModule):
         self._llm_verbosity = "" if verbosity in {"", "none", "off"} else verbosity
 
         self._llm_reply_max_tokens = max(64, min(self._llm_reply_max_tokens, self._llm_max_tokens))
-        self._llm_hs3_proactive_max_tokens = max(64, min(self._llm_hs3_proactive_max_tokens, self._llm_max_tokens))
+        self._llm_proactive_max_tokens = max(64, min(self._llm_proactive_max_tokens, self._llm_max_tokens))
         self._llm_summary_max_tokens = max(128, min(self._llm_summary_max_tokens, self._llm_max_tokens))
 
         if self._llm_summary_max_tokens <= self._llm_reply_max_tokens:
@@ -1579,7 +1603,7 @@ class ChatBotModule(yarp.RFModule):
             "LLM token caps: "
             f"global={self._llm_max_tokens}, "
             f"reply={self._llm_reply_max_tokens}, "
-            f"hs3_proactive={self._llm_hs3_proactive_max_tokens}, "
+            f"proactive={self._llm_proactive_max_tokens}, "
             f"summary={self._llm_summary_max_tokens}, "
             f"reasoning_effort={self._llm_reasoning_effort or 'off'}, "
             f"verbosity={self._llm_verbosity or 'off'}")
@@ -1712,7 +1736,7 @@ class ChatBotModule(yarp.RFModule):
         if not sys_p or not usr_p:
             return ""
         msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}]
-        return self._llm_chat(msgs, max_tokens=self._llm_hs3_proactive_max_tokens)
+        return self._llm_chat(msgs, max_tokens=self._llm_proactive_max_tokens)
 
     def _fallback(self, hs: str) -> str:
         if hs == "HS3":
@@ -2667,14 +2691,6 @@ class ChatBotModule(yarp.RFModule):
         if not self._db:
             return []
         rows = self._db.execute("SELECT chat_id FROM subscribers").fetchall()
-        return [int(r[0]) for r in rows]
-
-    def _db_proactive_candidates(self, cutoff_ts: int) -> List[int]:
-        if not self._db:
-            return []
-        rows = self._db.execute(
-            "SELECT chat_id FROM subscribers WHERE last_proactive_at<=?",
-            (int(cutoff_ts),)).fetchall()
         return [int(r[0]) for r in rows]
 
     def _db_mark_proactive(self, chat_id: int, commit: bool = True) -> None:
