@@ -138,7 +138,7 @@ class SalienceNetworkModule(yarp.RFModule):
 
     # ==================== Adaptive IPS Constants ====================
     # Baseline IPS weights
-    BASELINE_WEIGHTS = {"prox": 0.5, "cent": 0.15, "vel": 0.3, "gaze": 0.5}
+    BASELINE_WEIGHTS = {"prox": 0.5, "cent": 0.15, "gaze": 0.5}
 
     # Minimum IPS by social state
     SS_THRESHOLDS = {
@@ -216,7 +216,6 @@ class SalienceNetworkModule(yarp.RFModule):
         self.interaction_busy = False
         self.interaction_thread: Optional[threading.Thread] = None
 
-        self.area_history: Dict[int, float] = {}  # Maps track_id to previous bbox area
         self.current_target_track_id: int = -1  # For applying Hysteresis
         self._attention_target_since: float = 0.0  # When current_target_track_id last changed
         self._target_decay_track_id: int = -1
@@ -1040,11 +1039,9 @@ class SalienceNetworkModule(yarp.RFModule):
                     "context_label": self.current_context_label,
                     "prox_score": vars_norm["prox"],
                     "cent_score": vars_norm["cent"],
-                    "vel_score": vars_norm["vel"],
                     "gaze_score": vars_norm["gaze"],
                     "weight_prox": weights["prox"],
                     "weight_cent": weights["cent"],
-                    "weight_vel": weights["vel"],
                     "weight_gaze": weights["gaze"],
                 })
 
@@ -1169,8 +1166,6 @@ class SalienceNetworkModule(yarp.RFModule):
 
     def _compute_face_states(self, faces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         today = self._get_today_date()
-        new_area_history = {}
-
         for face in faces:
             face_id = face["face_id"]
             track_id = face["track_id"]
@@ -1202,9 +1197,6 @@ class SalienceNetworkModule(yarp.RFModule):
             face["habituation_elapsed_sec"] = 0.0
             face["ips_before_habituation"] = float(face.get("ips", 0.0))
             face["habituation_ips_delta"] = 0.0
-
-            new_area_history[track_id] = self._bbox_area(face)
-
         # Apply habituation decay only when:
         # 1) no interaction is ongoing,
         # 2) there is more than one face visible.
@@ -1280,7 +1272,6 @@ class SalienceNetworkModule(yarp.RFModule):
         self._last_face_ips_log = {
             key: val for key, val in self._last_face_ips_log.items() if key[0] in active
         }
-        self.area_history = new_area_history
         return faces
 
     def _can_attempt_interaction(self, face: Dict[str, Any], now_ts: float) -> bool:
@@ -1379,12 +1370,9 @@ class SalienceNetworkModule(yarp.RFModule):
     def _calculate_ips_variables(self, face: Dict[str, Any]) -> Dict[str, float]:
         """Converts raw landmark data into normalized 0.0-1.0 scoring variables."""
         IMG_W, IMG_H = 640.0, 480.0
-        MAX_AREA = IMG_W * IMG_H
         MAX_DIST = math.hypot(IMG_W / 2, IMG_H / 2)
-        VEL_SENSITIVITY = 10.0
 
-        x, y, w, h = face.get("bbox", (0, 0, 0, 0))
-        track_id = face.get("track_id", -1)
+        x, y, _, h = face.get("bbox", (0, 0, 0, 0))
         cos_angle = face.get("cos_angle", 0.0)
 
         # 1. Proximity (Face Height Ratio)
@@ -1395,16 +1383,10 @@ class SalienceNetworkModule(yarp.RFModule):
         dist_to_center = math.hypot(cx - (IMG_W / 2), cy - (IMG_H / 2))
         s_cent = max(0.0, 1.0 - (dist_to_center / MAX_DIST)) if MAX_DIST > 0 else 0.0
 
-        # 3. Approach Velocity (Change in area)
-        current_area = w * h
-        prev_area = self.area_history.get(track_id, current_area)
-        raw_vel = (current_area - prev_area) / MAX_AREA if MAX_AREA > 0 else 0.0
-        s_vel = min(1.0, max(0.0, raw_vel * VEL_SENSITIVITY))
-
-        # 4. Gaze
+        # 3. Gaze
         s_gaze = max(0.0, cos_angle)
 
-        return {"prox": s_prox, "cent": s_cent, "vel": s_vel, "gaze": s_gaze}
+        return {"prox": s_prox, "cent": s_cent, "gaze": s_gaze}
 
     def _calculate_ips(
         self, face: Dict[str, Any], person_id: str, apply_habituation: bool = True
@@ -1421,7 +1403,6 @@ class SalienceNetworkModule(yarp.RFModule):
         base_ips = (
             weights["prox"] * vars_norm["prox"]
             + weights["cent"] * vars_norm["cent"]
-            + weights["vel"] * vars_norm["vel"]
             + weights["gaze"] * vars_norm["gaze"]
         )
 
@@ -2387,11 +2368,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 context_label INTEGER,
                 prox_score REAL,
                 cent_score REAL,
-                vel_score REAL,
                 gaze_score REAL,
                 weight_prox REAL,
                 weight_cent REAL,
-                weight_vel REAL,
                 weight_gaze REAL
             )""")
 
@@ -2653,11 +2632,9 @@ class SalienceNetworkModule(yarp.RFModule):
                 context_label,
                 prox_score,
                 cent_score,
-                vel_score,
                 gaze_score,
                 weight_prox,
                 weight_cent,
-                weight_vel,
                 weight_gaze
             FROM face_ips_events
             """
@@ -2889,9 +2866,9 @@ class SalienceNetworkModule(yarp.RFModule):
                          is_active_target,bbox_area,ips,ips_before_habituation,
                          habituation_applied,habituation_multiplier,habituation_elapsed_sec,
                          habituation_ips_delta,stimulus_type,context_label,
-                         prox_score,cent_score,vel_score,gaze_score,
-                         weight_prox,weight_cent,weight_vel,weight_gaze)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         prox_score,cent_score,gaze_score,
+                         weight_prox,weight_cent,weight_gaze)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             data["timestamp_utc"],
                             data["timestamp_local"],
@@ -2921,11 +2898,9 @@ class SalienceNetworkModule(yarp.RFModule):
                             data.get("context_label"),
                             data.get("prox_score"),
                             data.get("cent_score"),
-                            data.get("vel_score"),
                             data.get("gaze_score"),
                             data.get("weight_prox"),
                             data.get("weight_cent"),
-                            data.get("weight_vel"),
                             data.get("weight_gaze")))
                 elif table == "ss_change":
                     c.execute(
