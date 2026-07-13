@@ -58,7 +58,6 @@ T O O L S &nbsp;&amp;&nbsp; S T O R A G E
 - [speech2text]
 - [acapelaSpeak]
 - [faceTracker]
-- [faceTracker]
 - [faceExpressions]
 
 ### Interaction Flow (High Level)
